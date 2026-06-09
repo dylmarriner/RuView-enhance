@@ -26,7 +26,7 @@
 //! `wifi-densepose-sensing-server/src/csi.rs` exactly (same magic, same layout).
 
 use anyhow::{bail, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use ndarray::Array2;
 use num_complex::Complex64;
 use std::time::{Duration, Instant};
@@ -37,6 +37,44 @@ use wifi_densepose_core::types::{
 use wifi_densepose_signal::{
     BaselineCalibration, CalibrationConfig, CalibrationDeviationScore, CalibrationRecorder,
 };
+
+// ---------------------------------------------------------------------------
+// CSI source format (shared across all CSI-consuming subcommands)
+// ---------------------------------------------------------------------------
+
+/// Supported CSI UDP wire formats for the ingest socket. Shared by every
+/// CSI-consuming subcommand (`calibrate`, `calibrate-serve`, `enroll`,
+/// `room-watch`) so the whole per-room pipeline can run on either source.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceFormat {
+    /// ESP32 `0xC5110001` frames (default — original behaviour).
+    #[default]
+    Esp32,
+    /// ADR-018 v6 `0xC5110006` frames, as emitted by the Cognitum V0
+    /// appliance's `cog-csi-nexmon-adapter`. Lets the appliance's own nexmon
+    /// CSI stream drive the pipeline directly, without an external transcoder.
+    Adr018v6,
+}
+
+impl SourceFormat {
+    /// Dispatch to the parser for this wire format. Both parsers return the
+    /// same `CsiFrame` shape so every downstream path is identical regardless
+    /// of source format.
+    pub(crate) fn parse(self, buf: &[u8], tier: &str) -> Option<CsiFrame> {
+        match self {
+            SourceFormat::Esp32 => parse_csi_packet(buf, tier),
+            SourceFormat::Adr018v6 => parse_csi_packet_adr018v6(buf, tier),
+        }
+    }
+}
+
+/// One DRY dispatch helper used by every subcommand: parse `buf` under the
+/// selected wire `format` at the given PHY `tier`. Returns `None` on any parse
+/// failure (wrong magic, truncated, malformed). Both formats yield the same
+/// `CsiFrame` shape.
+pub(crate) fn parse_for(format: SourceFormat, buf: &[u8], tier: &str) -> Option<CsiFrame> {
+    format.parse(buf, tier)
+}
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -69,6 +107,14 @@ pub struct CalibrateArgs {
     /// Valid: ht20 / ht40 / he20 / he40.
     #[arg(long, default_value = "ht20")]
     pub tier: String,
+
+    /// CSI UDP wire format on the ingest socket. `esp32` (default) parses
+    /// `0xC5110001` ESP32 frames; `adr018v6` parses `0xC5110006` ADR-018 v6
+    /// frames as emitted by the Cognitum V0 appliance's
+    /// `cog-csi-nexmon-adapter` — letting the appliance's own nexmon stream
+    /// drive baseline calibration directly.
+    #[arg(long, value_enum, default_value_t = SourceFormat::Esp32)]
+    pub source_format: SourceFormat,
 
     /// Print a deviation banner to stderr every N frames during capture.
     /// 0 disables banners. Default 20 = once per second at 20 Hz.
@@ -121,7 +167,7 @@ pub async fn execute(args: CalibrateArgs) -> Result<()> {
     let socket = UdpSocket::bind(&addr).await
         .map_err(|e| anyhow::anyhow!("cannot bind UDP socket on {addr}: {e}"))?;
 
-    eprintln!("[calibrate] listening on udp://{addr}");
+    eprintln!("[calibrate] listening on udp://{addr} (source-format={:?})", args.source_format);
     eprintln!(
         "[calibrate] capturing {} frames (~{} s, tier={}) — ensure room is empty",
         target_frames, args.duration_s, args.tier
@@ -147,7 +193,7 @@ pub async fn execute(args: CalibrateArgs) -> Result<()> {
             Err(_) => continue, // timeout — recheck deadline
         };
 
-        let Some(csi_frame) = parse_csi_packet(&buf[..n], &args.tier) else {
+        let Some(csi_frame) = parse_for(args.source_format, &buf[..n], &args.tier) else {
             continue;
         };
 
@@ -590,9 +636,32 @@ mod tests {
             duration_s: 30,
             output: "./baseline.bin".into(),
             tier: "ht20".into(),
+            source_format: SourceFormat::Esp32,
             banner_every: 20,
             abort_z_threshold: 2.0,
             min_frames: 0,
         }
+    }
+
+    #[test]
+    fn parse_for_dispatches_by_format() {
+        // ESP32 frame (0xC5110001): only the esp32 format accepts it.
+        let mut esp = vec![0u8; 24];
+        esp[0] = 0x01; esp[1] = 0x00; esp[2] = 0x11; esp[3] = 0xC5;
+        esp[5] = 1; esp[6] = 2; // 1 antenna, 2 subcarriers
+        assert!(parse_for(SourceFormat::Esp32, &esp, "ht20").is_some());
+        assert!(parse_for(SourceFormat::Adr018v6, &esp, "ht20").is_none());
+
+        // ADR-018 v6 frame (0xC5110006): only the adr018v6 format accepts it.
+        let mut v6 = vec![0u8; 24];
+        v6[0] = 0x06; v6[1] = 0x00; v6[2] = 0x11; v6[3] = 0xC5;
+        v6[5] = 1; v6[6] = 2; v6[7] = 0; // 1 antenna, n_subcarriers=2 (LE u16)
+        assert!(parse_for(SourceFormat::Adr018v6, &v6, "ht20").is_some());
+        assert!(parse_for(SourceFormat::Esp32, &v6, "ht20").is_none());
+    }
+
+    #[test]
+    fn source_format_default_is_esp32() {
+        assert_eq!(SourceFormat::default(), SourceFormat::Esp32);
     }
 }

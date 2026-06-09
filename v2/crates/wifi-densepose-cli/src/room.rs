@@ -17,7 +17,7 @@ use wifi_densepose_calibration::extract::{AnchorFeature, Features};
 use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::BaselineCalibration;
 
-use crate::calibrate::parse_csi_packet;
+use crate::calibrate::{parse_for, SourceFormat};
 
 const RECV_BUF: usize = 2048;
 
@@ -82,6 +82,11 @@ pub struct EnrollArgs {
     /// PHY tier (ht20 / ht40 / he20 / he40).
     #[arg(long, default_value = "ht20")]
     pub tier: String,
+    /// CSI UDP wire format on the ingest socket. `esp32` (default) parses
+    /// `0xC5110001` ESP32 frames; `adr018v6` parses `0xC5110006` ADR-018 v6
+    /// frames from the Cognitum V0 appliance's `cog-csi-nexmon-adapter`.
+    #[arg(long, value_enum, default_value_t = SourceFormat::Esp32)]
+    pub source_format: SourceFormat,
     /// Room label.
     #[arg(long, default_value = "default")]
     pub room_id: String,
@@ -103,6 +108,7 @@ async fn capture_anchor(
     gate: &AnchorQualityGate,
     label: AnchorLabel,
     tier: &str,
+    source_format: SourceFormat,
     fs_hz: f32,
     room_id: &str,
 ) -> Result<(Option<AnchorFeature>, Anchor, Option<String>)> {
@@ -121,7 +127,7 @@ async fn capture_anchor(
     while Instant::now() < deadline {
         let timeout = Duration::from_millis(500);
         if let Ok(Ok(n)) = tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
-            if let Some(frame) = parse_csi_packet(&buf[..n], tier) {
+            if let Some(frame) = parse_for(source_format, &buf[..n], tier) {
                 recorder.record_frame(baseline, &frame);
                 series.push(frame_scalar(&frame));
             }
@@ -147,7 +153,10 @@ pub async fn enroll(args: EnrollArgs) -> Result<()> {
     let socket = UdpSocket::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    eprintln!("[enroll] room='{}' baseline={} on udp://{addr}", args.room_id, &baseline_id[..8]);
+    eprintln!(
+        "[enroll] room='{}' baseline={} on udp://{addr} (source-format={:?})",
+        args.room_id, &baseline_id[..8], args.source_format
+    );
     eprintln!("[enroll] follow each prompt; bad captures are re-prompted.");
 
     let mut session = EnrollmentSession::new(&args.room_id, &baseline_id, now_unix());
@@ -156,9 +165,17 @@ pub async fn enroll(args: EnrollArgs) -> Result<()> {
     for label in AnchorLabel::SEQUENCE {
         let mut accepted = false;
         for attempt in 1..=args.attempts {
-            let (feat, anchor, reason) =
-                capture_anchor(&socket, &baseline, &gate, label, &args.tier, args.fs_hz, &args.room_id)
-                    .await?;
+            let (feat, anchor, reason) = capture_anchor(
+                &socket,
+                &baseline,
+                &gate,
+                label,
+                &args.tier,
+                args.source_format,
+                args.fs_hz,
+                &args.room_id,
+            )
+            .await?;
             if anchor.quality.accepted {
                 eprintln!(
                     "[enroll]   ✓ accepted (presence_z={:.2} motion={:.0}% frames={})",
@@ -304,6 +321,11 @@ pub struct RoomWatchArgs {
     /// PHY tier.
     #[arg(long, default_value = "ht20")]
     pub tier: String,
+    /// CSI UDP wire format on the ingest socket. `esp32` (default) parses
+    /// `0xC5110001` ESP32 frames; `adr018v6` parses `0xC5110006` ADR-018 v6
+    /// frames from the Cognitum V0 appliance's `cog-csi-nexmon-adapter`.
+    #[arg(long, value_enum, default_value_t = SourceFormat::Esp32)]
+    pub source_format: SourceFormat,
     /// CSI sample rate (Hz).
     #[arg(long, default_value_t = 15.0)]
     pub fs_hz: f32,
@@ -330,7 +352,10 @@ pub async fn room_watch(args: RoomWatchArgs) -> Result<()> {
     let socket = UdpSocket::bind(&addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind {addr}: {e}"))?;
-    eprintln!("[room-watch] inferring on udp://{addr} (window={} frames)", args.window);
+    eprintln!(
+        "[room-watch] inferring on udp://{addr} (window={} frames, source-format={:?})",
+        args.window, args.source_format
+    );
 
     let mut buf = vec![0u8; RECV_BUF];
     let mut win: std::collections::VecDeque<f32> = std::collections::VecDeque::new();
@@ -342,7 +367,7 @@ pub async fn room_watch(args: RoomWatchArgs) -> Result<()> {
             break;
         }
         if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf)).await {
-            if let Some(frame) = parse_csi_packet(&buf[..n], &args.tier) {
+            if let Some(frame) = parse_for(args.source_format, &buf[..n], &args.tier) {
                 win.push_back(frame_scalar(&frame));
                 while win.len() > args.window {
                     win.pop_front();
@@ -419,7 +444,7 @@ async fn room_watch_multi(args: RoomWatchArgs) -> Result<()> {
             if !node_ids.contains(&node_id) {
                 continue;
             }
-            if let Some(frame) = parse_csi_packet(&buf[..n], &args.tier) {
+            if let Some(frame) = parse_for(args.source_format, &buf[..n], &args.tier) {
                 let w = wins.entry(node_id).or_default();
                 w.push_back(frame_scalar(&frame));
                 while w.len() > args.window {

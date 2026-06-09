@@ -31,40 +31,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::CorsLayer;
-use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::{BaselineCalibration, CalibrationRecorder};
 
-use crate::calibrate::{parse_csi_packet, parse_csi_packet_adr018v6, tier_config};
+use crate::calibrate::{parse_for, tier_config, SourceFormat};
 
 const RECV_BUF: usize = 2048;
-
-/// Supported CSI UDP wire formats for the ingest socket.
-#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SourceFormat {
-    /// ESP32 `0xC5110001` frames (default — original behaviour).
-    #[default]
-    Esp32,
-    /// ADR-018 v6 `0xC5110006` frames, as emitted by the Cognitum V0
-    /// appliance's `cog-csi-nexmon-adapter`. Lets the appliance's own nexmon
-    /// CSI stream drive calibration directly, without an external transcoder.
-    Adr018v6,
-}
-
-impl SourceFormat {
-    /// Dispatch to the parser for this wire format. Both parsers return the
-    /// same `CsiFrame` shape so the recorder path is identical.
-    fn parse(self, buf: &[u8], tier: &str) -> Option<CsiFrame> {
-        match self {
-            SourceFormat::Esp32 => parse_csi_packet(buf, tier),
-            SourceFormat::Adr018v6 => parse_csi_packet_adr018v6(buf, tier),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -403,7 +379,7 @@ async fn ingest_loop(
                 last_frame_ms = unix_ms();
                 if let Some(sess) = active.as_mut() {
                     let tier = sess.tier.clone();
-                    if let Some(frame) = source_format.parse(&buf[..n], &tier) {
+                    if let Some(frame) = parse_for(source_format, &buf[..n], &tier) {
                         if let Ok(score) = sess.recorder.record(&frame) {
                             sess.z_median = score.amplitude_z_median;
                             sess.z_max = score.amplitude_z_max;
@@ -706,15 +682,15 @@ mod tests {
         let mut esp = vec![0u8; 24];
         esp[0] = 0x01; esp[1] = 0x00; esp[2] = 0x11; esp[3] = 0xC5;
         esp[5] = 1; esp[6] = 2; // 1 antenna, 2 subcarriers
-        assert!(SourceFormat::Esp32.parse(&esp, "ht20").is_some());
-        assert!(SourceFormat::Adr018v6.parse(&esp, "ht20").is_none());
+        assert!(parse_for(SourceFormat::Esp32, &esp, "ht20").is_some());
+        assert!(parse_for(SourceFormat::Adr018v6, &esp, "ht20").is_none());
 
         // ADR-018 v6 frame (0xC5110006): only the adr018v6 parser accepts it.
         let mut v6 = vec![0u8; 24];
         v6[0] = 0x06; v6[1] = 0x00; v6[2] = 0x11; v6[3] = 0xC5;
         v6[5] = 1; v6[6] = 2; v6[7] = 0; // 1 antenna, n_subcarriers=2 (LE u16)
-        assert!(SourceFormat::Adr018v6.parse(&v6, "ht20").is_some());
-        assert!(SourceFormat::Esp32.parse(&v6, "ht20").is_none());
+        assert!(parse_for(SourceFormat::Adr018v6, &v6, "ht20").is_some());
+        assert!(parse_for(SourceFormat::Esp32, &v6, "ht20").is_none());
     }
 
     #[test]
