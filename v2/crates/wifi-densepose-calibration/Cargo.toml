@@ -19,3 +19,11 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 [dev-dependencies]
 ndarray = { workspace = true }
 num-complex = { workspace = true }
+criterion = { workspace = true }
+
+# ADR-151: per-window calibration hot-path benchmarks (mixture inference +
+# feature extraction). Runnable on a Pi 5 (aarch64) to validate the
+# "specialists run in microseconds on a Pi CPU" claim.
+[[bench]]
+name = "specialist_bench"
+harness = false
