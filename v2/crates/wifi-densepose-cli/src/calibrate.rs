@@ -309,6 +309,96 @@ pub(crate) fn parse_csi_packet(buf: &[u8], tier: &str) -> Option<CsiFrame> {
     Some(CsiFrame::new(meta, data))
 }
 
+/// Parse a single UDP datagram in ADR-018 v6 (`0xC511_0006`) wire format and
+/// return a `CsiFrame` ready for `CalibrationRecorder::record()`. Same return
+/// shape as [`parse_csi_packet`], so the recorder path is identical regardless
+/// of source format. Returns `None` on any parse failure (no panic on
+/// truncated or malformed input).
+///
+/// This is the format emitted by the Cognitum V0 appliance's
+/// `cog-csi-nexmon-adapter`, letting the appliance's own nexmon CSI stream
+/// drive calibration without an external transcoder.
+///
+/// Layout (little-endian, `<IBBHBbb5sI`): 20-byte header then IQ.
+///
+/// Offset  Size  Field
+/// ──────  ────  ─────────────────────────────────────────────────────────────
+///  0      4     Magic: 0xC511_0006 (LE u32)
+///  4      1     node_id (u8)
+///  5      1     n_antennas (u8)
+///  6      2     n_subcarriers (LE u16)
+///  8      1     channel (u8)
+///  9      1     rssi (i8)
+/// 10      1     noise_floor (i8)
+/// 11      5     (reserved)
+/// 16      4     ts_us (LE u32)
+/// 20      2 × n_subcarriers   IQ pairs: I-high (i8), Q-high (i8)
+///
+/// The IQ bytes are the high byte of an i16, so they are sign-extended ×256 to
+/// recover magnitude — matching the cognitum reference parser.
+pub(crate) fn parse_csi_packet_adr018v6(buf: &[u8], tier: &str) -> Option<CsiFrame> {
+    if buf.len() < 20 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != 0xC511_0006 {
+        return None;
+    }
+
+    let node_id       = buf[4];
+    let n_antennas    = buf[5] as usize;
+    let n_subcarriers = u16::from_le_bytes([buf[6], buf[7]]) as usize;
+    let channel       = buf[8];
+    let rssi          = buf[9] as i8;
+    let noise_floor   = buf[10] as i8;
+    let _ts_us        = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+
+    // v6 carries n_subcarriers*2 IQ bytes (single antenna's worth on the wire).
+    let iq_start = 20usize;
+    if buf.len() < iq_start + n_subcarriers * 2 {
+        return None;
+    }
+
+    // Build an ndarray Array2<Complex64> shaped [n_antennas, n_subcarriers].
+    // The single on-wire IQ row is replicated across the declared antennas so
+    // the recorder sees a consistent [n_ant, n_sub] frame.
+    let mut data = Array2::<Complex64>::zeros((n_antennas.max(1), n_subcarriers.max(1)));
+    for k in 0..n_subcarriers {
+        // i8 high byte of an i16 → sign-extend ×256 to recover magnitude.
+        let i_val = (buf[iq_start + k * 2]     as i8 as f64) * 256.0;
+        let q_val = (buf[iq_start + k * 2 + 1] as i8 as f64) * 256.0;
+        for s in 0..n_antennas.max(1) {
+            data[[s, k]] = Complex64::new(i_val, q_val);
+        }
+    }
+
+    // v6 carries a channel number, not a centre frequency. Infer the band from
+    // the channel (1..=14 → 2.4 GHz, otherwise 5 GHz).
+    let band = if channel <= 14 {
+        FrequencyBand::Band2_4GHz
+    } else {
+        FrequencyBand::Band5GHz
+    };
+    let bw = tier_to_bw_mhz(tier);
+
+    let mut meta = CsiMetadata::new(
+        DeviceId::new(format!("nexmon-node{}", node_id)),
+        band,
+        channel,
+    );
+    meta.bandwidth_mhz = bw;
+    meta.rssi_dbm = rssi;
+    meta.noise_floor_dbm = noise_floor;
+    meta.antenna_config = AntennaConfig {
+        tx_antennas: 1,
+        rx_antennas: n_antennas.max(1) as u8,
+        spacing_mm: None,
+    };
+    meta.timestamp = Timestamp::now();
+
+    Some(CsiFrame::new(meta, data))
+}
+
 /// Map a tier string to a bandwidth in MHz.
 fn tier_to_bw_mhz(tier: &str) -> u16 {
     match tier.to_ascii_lowercase().as_str() {
@@ -428,6 +518,55 @@ mod tests {
         buf[22] = (-5i8) as u8; buf[23] = 15i8 as u8;
 
         let frame = parse_csi_packet(&buf, "ht20");
+        assert!(frame.is_some());
+        let f = frame.unwrap();
+        assert_eq!(f.num_spatial_streams(), 1);
+        assert_eq!(f.num_subcarriers(), 2);
+    }
+
+    #[test]
+    fn test_parse_csi_packet_adr018v6_bad_magic() {
+        // A v1-magic frame must NOT parse as v6.
+        let mut buf = vec![0u8; 24];
+        buf[0] = 0x01; buf[1] = 0x00; buf[2] = 0x11; buf[3] = 0xC5; // 0xC5110001
+        assert!(parse_csi_packet_adr018v6(&buf, "ht20").is_none());
+    }
+
+    #[test]
+    fn test_parse_csi_packet_adr018v6_too_short() {
+        let buf = vec![0u8; 10];
+        assert!(parse_csi_packet_adr018v6(&buf, "ht20").is_none());
+    }
+
+    #[test]
+    fn test_parse_csi_packet_adr018v6_truncated_payload() {
+        // Header claims 4 subcarriers (=> 8 IQ bytes) but only 4 are present.
+        let mut buf = vec![0u8; 24]; // 20-byte header + 4 IQ bytes
+        buf[0] = 0x06; buf[1] = 0x00; buf[2] = 0x11; buf[3] = 0xC5; // 0xC5110006
+        buf[5] = 1; // n_antennas
+        buf[6] = 4; buf[7] = 0; // n_subcarriers = 4 (LE u16) → needs 8 IQ bytes
+        assert!(parse_csi_packet_adr018v6(&buf, "ht20").is_none());
+    }
+
+    #[test]
+    fn test_parse_csi_packet_adr018v6_valid() {
+        // 20-byte header + 2 IQ pairs (1 antenna, 2 subcarriers).
+        let mut buf = vec![0u8; 24];
+        // Magic 0xC511_0006 LE
+        buf[0] = 0x06; buf[1] = 0x00; buf[2] = 0x11; buf[3] = 0xC5;
+        buf[4] = 7;  // node_id
+        buf[5] = 1;  // n_antennas
+        buf[6] = 2; buf[7] = 0; // n_subcarriers = 2 (LE u16)
+        buf[8] = 6;  // channel 6 (2.4 GHz)
+        buf[9]  = (-42i8) as u8; // rssi
+        buf[10] = (-90i8) as u8; // noise_floor
+        // ts_us at offset 16
+        buf[16] = 0x01;
+        // IQ high bytes at offset 20: (10, 20), (−5, 15)
+        buf[20] = 10i8 as u8;   buf[21] = 20i8 as u8;
+        buf[22] = (-5i8) as u8; buf[23] = 15i8 as u8;
+
+        let frame = parse_csi_packet_adr018v6(&buf, "ht20");
         assert!(frame.is_some());
         let f = frame.unwrap();
         assert_eq!(f.num_spatial_streams(), 1);

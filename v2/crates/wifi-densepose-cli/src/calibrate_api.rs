@@ -31,16 +31,40 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tower_http::cors::CorsLayer;
+use wifi_densepose_core::types::CsiFrame;
 use wifi_densepose_signal::{BaselineCalibration, CalibrationRecorder};
 
-use crate::calibrate::{parse_csi_packet, tier_config};
+use crate::calibrate::{parse_csi_packet, parse_csi_packet_adr018v6, tier_config};
 
 const RECV_BUF: usize = 2048;
+
+/// Supported CSI UDP wire formats for the ingest socket.
+#[derive(ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceFormat {
+    /// ESP32 `0xC5110001` frames (default — original behaviour).
+    #[default]
+    Esp32,
+    /// ADR-018 v6 `0xC5110006` frames, as emitted by the Cognitum V0
+    /// appliance's `cog-csi-nexmon-adapter`. Lets the appliance's own nexmon
+    /// CSI stream drive calibration directly, without an external transcoder.
+    Adr018v6,
+}
+
+impl SourceFormat {
+    /// Dispatch to the parser for this wire format. Both parsers return the
+    /// same `CsiFrame` shape so the recorder path is identical.
+    fn parse(self, buf: &[u8], tier: &str) -> Option<CsiFrame> {
+        match self {
+            SourceFormat::Esp32 => parse_csi_packet(buf, tier),
+            SourceFormat::Adr018v6 => parse_csi_packet_adr018v6(buf, tier),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -65,6 +89,14 @@ pub struct CalibrateServeArgs {
     /// Bind address for the UDP CSI socket.
     #[arg(long, default_value = "0.0.0.0")]
     pub udp_bind: String,
+
+    /// CSI UDP wire format on the ingest socket. `esp32` (default) parses
+    /// `0xC5110001` ESP32 frames; `adr018v6` parses `0xC5110006` ADR-018 v6
+    /// frames as emitted by the Cognitum V0 appliance's
+    /// `cog-csi-nexmon-adapter` — letting the appliance's own nexmon stream
+    /// drive calibration directly.
+    #[arg(long, value_enum, default_value_t = SourceFormat::Esp32)]
+    pub source_format: SourceFormat,
 
     /// Default PHY tier when a start request omits one (ht20 / ht40 / he20 / he40).
     #[arg(long, default_value = "ht20")]
@@ -219,7 +251,10 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
     let socket = UdpSocket::bind(&udp_addr)
         .await
         .map_err(|e| anyhow::anyhow!("cannot bind UDP socket on {udp_addr}: {e}"))?;
-    eprintln!("[calibrate-serve] CSI ingest on udp://{udp_addr}");
+    eprintln!(
+        "[calibrate-serve] CSI ingest on udp://{udp_addr} (source-format={:?})",
+        args.source_format
+    );
 
     let status = Arc::new(RwLock::new(SharedStatus {
         udp_port: args.udp_port,
@@ -235,8 +270,9 @@ pub async fn execute(args: CalibrateServeArgs) -> Result<()> {
         let status = status.clone();
         let default_tier = args.tier.clone();
         let output_dir = args.output_dir.clone();
+        let source_format = args.source_format;
         tokio::spawn(async move {
-            ingest_loop(socket, cmd_rx, status, default_tier, output_dir).await;
+            ingest_loop(socket, cmd_rx, status, default_tier, output_dir, source_format).await;
         });
     }
 
@@ -297,6 +333,7 @@ async fn ingest_loop(
     status: Arc<RwLock<SharedStatus>>,
     default_tier: String,
     output_dir: String,
+    source_format: SourceFormat,
 ) {
     let mut buf = vec![0u8; RECV_BUF];
     let mut active: Option<ActiveSession> = None;
@@ -366,7 +403,7 @@ async fn ingest_loop(
                 last_frame_ms = unix_ms();
                 if let Some(sess) = active.as_mut() {
                     let tier = sess.tier.clone();
-                    if let Some(frame) = parse_csi_packet(&buf[..n], &tier) {
+                    if let Some(frame) = source_format.parse(&buf[..n], &tier) {
                         if let Ok(score) = sess.recorder.record(&frame) {
                             sess.z_median = score.amplitude_z_median;
                             sess.z_max = score.amplitude_z_max;
@@ -656,9 +693,28 @@ mod tests {
             tier: "ht20".into(),
             output_dir: "./baselines".into(),
             token: None,
+            source_format: SourceFormat::Esp32,
         };
         assert_eq!(a.http_port, 8090);
         assert_eq!(a.udp_port, 5005);
+        assert_eq!(a.source_format, SourceFormat::Esp32);
+    }
+
+    #[test]
+    fn source_format_dispatch() {
+        // ESP32 frame (0xC5110001): only the esp32 parser accepts it.
+        let mut esp = vec![0u8; 24];
+        esp[0] = 0x01; esp[1] = 0x00; esp[2] = 0x11; esp[3] = 0xC5;
+        esp[5] = 1; esp[6] = 2; // 1 antenna, 2 subcarriers
+        assert!(SourceFormat::Esp32.parse(&esp, "ht20").is_some());
+        assert!(SourceFormat::Adr018v6.parse(&esp, "ht20").is_none());
+
+        // ADR-018 v6 frame (0xC5110006): only the adr018v6 parser accepts it.
+        let mut v6 = vec![0u8; 24];
+        v6[0] = 0x06; v6[1] = 0x00; v6[2] = 0x11; v6[3] = 0xC5;
+        v6[5] = 1; v6[6] = 2; v6[7] = 0; // 1 antenna, n_subcarriers=2 (LE u16)
+        assert!(SourceFormat::Adr018v6.parse(&v6, "ht20").is_some());
+        assert!(SourceFormat::Esp32.parse(&v6, "ht20").is_none());
     }
 
     #[test]
