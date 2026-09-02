@@ -1,12 +1,28 @@
 //! ADR-351: near-real-time generative room visualization from live RuView
-//! sensing state via fal.ai `fast-sdxl`.
+//! sensing state via fal.ai.
+//!
+//! Two-stage generation: a still-image model (`fal-ai/fast-sdxl`) composes
+//! each style's scene (arbitrary text-to-image, or image-to-image against a
+//! fixed reference for `Branded`), then a real image-to-video model
+//! (`minimax/h3`) animates that still into a temporally coherent short clip.
+//! This replaced an earlier version that called `fast-sdxl` independently on
+//! every poll and stitched the unrelated stills into a 1fps "video" -- with
+//! no continuity between frames, that read as flicker/slideshow, not real
+//! motion. `minimax/h3` produces genuine coherent motion within one clip,
+//! confirmed working elsewhere this session, so the fix is real
+//! image-to-video generation, not just a quality tweak.
+//!
+//! Generation is triggered on scene-state CHANGE, not on every poll: a real
+//! ~5s clip costs real money and takes real wall-clock time, so this session
+//! bounds the number of clips generated per run (`--max-clips`) and simply
+//! holds/repeats the current clip while the sensed state is unchanged.
 //!
 //! Deliberate, explicitly-authorized exception to this project's default
 //! local-data-only posture: real presence/motion classification derived
 //! from a live household's WiFi sensing feed is sent to a third-party
-//! hosted generative-image API. See docs/adr/ADR-351-*.md for the full
+//! hosted generative API. See docs/adr/ADR-351-*.md for the full
 //! privacy/consent rationale. This binary does not transmit raw CSI or any
-//! biometric time series — only the already-classified, coarse scene state
+//! biometric time series -- only the already-classified, coarse scene state
 //! (`presence`, `motion_level`, `estimated_persons`) crosses the boundary.
 
 use std::path::PathBuf;
@@ -18,7 +34,7 @@ use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 
 /// Selectable visual style preset. Each produces a genuinely distinct,
-/// hand-crafted prompt template — not a shared base prompt with a style
+/// hand-crafted prompt template -- not a shared base prompt with a style
 /// suffix appended. See docs/adr/ADR-351-*.md for the full rationale.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Style {
@@ -26,7 +42,7 @@ enum Style {
     Architectural,
     /// Dramatic film-still aesthetic. Literal room depiction.
     Cinematic,
-    /// Generative light/form art. Never depicts a literal human figure —
+    /// Generative light/form art. Never depicts a literal human figure --
     /// a real, deliberate privacy property, not just an aesthetic choice.
     Abstract,
     /// Clean technical/dashboard line-art. Literal room depiction, abstracted
@@ -45,7 +61,7 @@ enum Style {
     Branded,
 }
 
-/// Coarse, shared scene-state abstraction. All four styles consume this
+/// Coarse, shared scene-state abstraction. All five styles consume this
 /// same struct; only the per-style prompt wording differs. This keeps the
 /// sensing-to-meaning mapping honest and in one place, auditable
 /// independent of any single style's prose.
@@ -56,7 +72,7 @@ enum Activity {
     OccupiedMoving,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SceneState {
     activity: Activity,
     multiple_occupants: bool,
@@ -96,9 +112,10 @@ fn map_scene_state(latest: &SensingLatest) -> SceneState {
 const NEGATIVE_PROMPT: &str =
     "blurry, low quality, distorted anatomy, extra limbs, watermark, text, oversaturated, cartoon, deformed";
 
-/// Real, hand-crafted prompt templates per style. Each style's language is
-/// genuinely distinct in composition, lighting vocabulary, and color
-/// language — not a shared base string with a style tag appended.
+/// Real, hand-crafted STILL-IMAGE prompt templates per style -- these
+/// compose the base frame that `minimax/h3` then animates. Each style's
+/// language is genuinely distinct in composition, lighting vocabulary, and
+/// color language -- not a shared base string with a style tag appended.
 fn build_prompt(style: Style, scene: SceneState) -> String {
     match style {
         Style::Architectural => {
@@ -161,7 +178,7 @@ fn build_prompt(style: Style, scene: SceneState) -> String {
             )
         }
         Style::Abstract => {
-            // Deliberately never depicts a literal human figure — a real
+            // Deliberately never depicts a literal human figure -- a real
             // privacy property of this preset, not only an aesthetic one.
             let (presence_desc, form_desc) = match (scene.activity, scene.multiple_occupants) {
                 (Activity::Vacant, _) => (
@@ -261,19 +278,137 @@ fn build_prompt(style: Style, scene: SceneState) -> String {
     }
 }
 
+/// Real, hand-crafted MOTION prompt templates per style, paired with the
+/// still `build_prompt` composes. Each describes concrete, physically
+/// specific movement appropriate to that style's visual language and the
+/// current `Activity` -- not a generic "add some motion" suffix. `Branded`
+/// reuses the exact realistic-running-biomechanics and correct-heartbeat
+/// language validated against this same reference image earlier this
+/// session (see the RuView hero-image animation work).
+fn build_motion_prompt(style: Style, scene: SceneState) -> String {
+    let occupants = if scene.multiple_occupants { "Both people" } else { "The person" };
+    match style {
+        Style::Architectural => match scene.activity {
+            Activity::Vacant => "The room stays completely still. Only the faintest drift of \
+                dust motes in a sunbeam and a barely perceptible sway of sheer curtain fabric \
+                suggest gentle ambient air movement. Camera remains perfectly static throughout, \
+                suitable for a seamless loop."
+                .to_string(),
+            Activity::OccupiedStill => format!(
+                "{occupants} sit calmly with a slow, natural breathing motion in the shoulders \
+                 and an occasional small, unhurried gesture -- turning a page, a slight shift of \
+                 posture -- otherwise still. Warm ambient light drifts almost imperceptibly. \
+                 Camera remains static, suitable for a seamless loop."
+            ),
+            Activity::OccupiedMoving => format!(
+                "{occupants} move through the room with genuine, anatomically realistic walking \
+                 motion: natural stride, weight transfer between steps, and relaxed arm swing. \
+                 Motion is smooth and unhurried, like slow observational documentary footage. \
+                 Camera remains static, capturing the motion within frame, suitable for a \
+                 seamless loop."
+            ),
+        },
+        Style::Cinematic => match scene.activity {
+            Activity::Vacant => "A single warm lamp flickers subtly, casting a slow, shifting \
+                shadow across the empty room; a faint drift of dust in the light beam is the \
+                only other movement. Static, moody camera, suitable for a seamless loop."
+                .to_string(),
+            Activity::OccupiedStill => format!(
+                "{occupants} sit motionless in shadow, only a slow, deliberate breathing motion \
+                 and the faint flicker of the warm key light moving across the silhouette. \
+                 Static camera, dramatic mood held throughout, suitable for a seamless loop."
+            ),
+            Activity::OccupiedMoving => format!(
+                "{occupants} move with fluid, anatomically realistic motion -- natural weight \
+                 shift and stride -- with soft motion blur trailing, as the dramatic side light \
+                 sweeps subtly across the scene. Static camera, suitable for a seamless loop."
+            ),
+        },
+        Style::Abstract => match scene.activity {
+            Activity::Vacant => "The single dim ember of light pulses with a slow, calm rhythm, \
+                barely brightening and dimming, otherwise motionless in the void. Suitable for a \
+                seamless loop."
+                .to_string(),
+            Activity::OccupiedStill => "The warm glowing orb(s) pulse gently and rhythmically, \
+                like a slow heartbeat of light, holding a steady position with only soft breathing \
+                motion in the glow's intensity. Suitable for a seamless loop."
+                .to_string(),
+            Activity::OccupiedMoving => "The glowing form(s) flow and drift smoothly with \
+                trailing streaks of light, warm color gradients shifting fluidly as the light \
+                moves through the space in a continuous, unhurried current. Suitable for a \
+                seamless loop."
+                .to_string(),
+        },
+        Style::Minimal => match scene.activity {
+            Activity::Vacant => "All zone indicators remain fully static and inactive; no motion \
+                anywhere in the diagram. Suitable for a seamless loop."
+                .to_string(),
+            Activity::OccupiedStill => "The occupancy indicator(s) pulse with a slow, steady \
+                rhythmic glow -- brightening and softening on a gentle cycle -- otherwise holding \
+                position. Suitable for a seamless loop."
+                .to_string(),
+            Activity::OccupiedMoving => "The occupancy indicator(s) glow steadily while the \
+                directional motion trail visibly animates and extends outward, redrawing smoothly \
+                to show real movement across the floor plan. Suitable for a seamless loop."
+                .to_string(),
+        },
+        Style::Branded => {
+            let heartbeat = "The floating heart-rate readout pulses with a correct, realistic \
+                heartbeat rhythm: the ECG-style waveform line animates as a real heartbeat trace, \
+                with a distinct sharp beat spike timed to a steady resting pulse of about 72 beats \
+                per minute, not a generic glow. WiFi signal arcs pulse gently and slowly.";
+            match scene.activity {
+                Activity::Vacant => format!(
+                    "No human pose-skeleton figure is present. {heartbeat} The room, furniture, \
+                     and all text labels remain completely static. Suitable for a seamless loop."
+                ),
+                Activity::OccupiedStill => format!(
+                    "The glowing cyan pose-skeleton figure sways gently and shifts weight slightly \
+                     with slow, natural micro-movements -- a calm idle stance, not exaggerated. \
+                     Pose-overlay joint markers shimmer softly. {heartbeat} The room, furniture, \
+                     and all text labels remain completely static. Suitable for a seamless loop."
+                ),
+                Activity::OccupiedMoving => format!(
+                    "Anatomically realistic human running biomechanics for the glowing \
+                     pose-overlay figure, running in place without traveling across the room. \
+                     Proper natural running form: opposite arm-and-leg coordination, genuine \
+                     knee-drive, natural foot-strike and push-off mechanics, a slight forward \
+                     torso lean, and fluid continuous weight transfer between strides -- reads as \
+                     a real runner's gait, not a stiff sway. Overall pace stays slow and smooth, \
+                     like slow-motion footage of a real run. Pose-overlay joint markers shimmer \
+                     softly and track the running limbs accurately. {heartbeat} The room, \
+                     furniture, and all text labels remain completely static -- only the figure \
+                     and the sensor overlays move. Suitable for a seamless loop."
+                ),
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "room-viz", about = "ADR-351 near-real-time RuView -> fal.ai room visualization")]
 struct Cli {
     /// Visual style preset.
     #[arg(long, value_enum)]
     style: Style,
-    /// Number of frames to capture.
-    #[arg(long, default_value_t = 12)]
-    frames: u32,
+    /// Maximum number of sensing polls in this capture session (a bound on
+    /// total session length, independent of how many distinct clips get
+    /// generated).
+    #[arg(long, default_value_t = 30)]
+    max_polls: u32,
+    /// Maximum number of real H3 video clips to generate in this session --
+    /// a real, hard spend bound. Once reached, further scene-state changes
+    /// are logged but do not trigger new generation; the last clip keeps
+    /// representing the session.
+    #[arg(long, default_value_t = 3)]
+    max_clips: u32,
     /// Seconds between polls of the live sensing feed.
     #[arg(long, default_value_t = 2)]
     interval_secs: u64,
-    /// Output directory for frames and the assembled video.
+    /// Duration in seconds of each generated H3 video clip.
+    #[arg(long, default_value_t = 5)]
+    clip_duration_secs: u32,
+    /// Output directory for generated clips and the assembled video.
     #[arg(long)]
     out_dir: PathBuf,
     /// SSH host that can reach the live sensing server on its own loopback.
@@ -281,7 +416,7 @@ struct Cli {
     sensing_ssh_host: String,
     /// Fixed seed for visual consistency across a capture session. If unset,
     /// a session-specific seed is required via this flag (no `SystemTime`
-    /// use inside this binary's hot path — pass one explicitly).
+    /// use inside this binary's hot path -- pass one explicitly).
     #[arg(long)]
     seed: i64,
     /// Path to a local reference image for image-to-image style matching.
@@ -295,7 +430,7 @@ struct Cli {
 }
 
 /// Poll the real live sensing endpoint via SSH loopback (the server is not
-/// reachable directly over Tailscale from this host — confirmed this
+/// reachable directly over Tailscale from this host -- confirmed this
 /// session). This shells out per-poll rather than holding a tunnel open,
 /// matching how this whole project session has interacted with that host.
 fn poll_sensing_latest(ssh_host: &str) -> Result<SensingLatest> {
@@ -329,14 +464,28 @@ struct FalImage {
     url: String,
 }
 
-async fn generate_frame(
+#[derive(Debug, Deserialize)]
+struct FalVideoResponse {
+    video: FalVideo,
+}
+
+#[derive(Debug, Deserialize)]
+struct FalVideo {
+    url: String,
+}
+
+/// Stage 1: compose the base still frame for this style + scene state via
+/// `fast-sdxl`. Returns the fal.ai CDN URL of the generated image (not the
+/// bytes) -- `minimax/h3` accepts that URL directly as its `image_url`, so
+/// there is no need to download and re-upload the still locally.
+async fn generate_base_image_url(
     client: &reqwest::Client,
     fal_key: &str,
     prompt: &str,
     seed: i64,
     reference_image_data_uri: Option<&str>,
     reference_strength: f32,
-) -> Result<Vec<u8>> {
+) -> Result<String> {
     let (endpoint, request_body) = match reference_image_data_uri {
         // Style::Branded: image-to-image against RuView's own hero graphic.
         // A base64 data: URI is accepted directly in `image_url` -- no
@@ -359,7 +508,7 @@ async fn generate_frame(
             serde_json::json!({
                 "prompt": prompt,
                 "negative_prompt": NEGATIVE_PROMPT,
-                "num_inference_steps": 6,
+                "num_inference_steps": 8,
                 "image_size": "landscape_16_9",
                 "seed": seed,
                 "format": "jpeg",
@@ -376,24 +525,56 @@ async fn generate_frame(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        bail!("fal.ai returned {status}: {body}");
+        bail!("fal.ai fast-sdxl returned {status}: {body}");
     }
-    let parsed: FalImageResponse = response.json().await.context("parsing fal.ai response")?;
+    let parsed: FalImageResponse = response.json().await.context("parsing fast-sdxl response")?;
     let image_url = parsed
         .images
         .first()
-        .context("fal.ai response had no images")?
+        .context("fast-sdxl response had no images")?
         .url
         .clone();
-    let image_bytes = client
-        .get(&image_url)
+    Ok(image_url)
+}
+
+/// Stage 2: animate the base still into a real, temporally coherent video
+/// clip via `minimax/h3` -- NOT under the `fal-ai/` namespace, confirmed
+/// real endpoint this session. Returns the downloaded real MP4 bytes.
+async fn generate_video_clip(
+    client: &reqwest::Client,
+    fal_key: &str,
+    motion_prompt: &str,
+    base_image_url: &str,
+    duration_secs: u32,
+) -> Result<Vec<u8>> {
+    let request_body = serde_json::json!({
+        "prompt": motion_prompt,
+        "image_url": base_image_url,
+        "duration": duration_secs,
+        "resolution": "768P",
+    });
+    let response = client
+        .post("https://fal.run/minimax/h3/image-to-video")
+        .header("Authorization", format!("Key {fal_key}"))
+        .json(&request_body)
         .send()
         .await
-        .context("downloading generated frame")?
+        .context("calling fal.ai minimax/h3")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("fal.ai minimax/h3 returned {status}: {body}");
+    }
+    let parsed: FalVideoResponse = response.json().await.context("parsing minimax/h3 response")?;
+    let video_bytes = client
+        .get(&parsed.video.url)
+        .send()
+        .await
+        .context("downloading generated clip")?
         .bytes()
         .await
-        .context("reading generated frame bytes")?;
-    Ok(image_bytes.to_vec())
+        .context("reading generated clip bytes")?;
+    Ok(video_bytes.to_vec())
 }
 
 #[tokio::main]
@@ -421,60 +602,92 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut previous_activity: Option<Activity> = None;
-    for frame_index in 0..cli.frames {
+    let mut clip_paths: Vec<PathBuf> = Vec::new();
+    let mut last_generated_state: Option<SceneState> = None;
+
+    for poll_index in 0..cli.max_polls {
         let latest = poll_sensing_latest(&cli.sensing_ssh_host)?;
         let scene = map_scene_state(&latest);
-        if Some(scene.activity) != previous_activity {
-            tracing::info!(frame = frame_index, activity = ?scene.activity, "scene state changed");
+
+        let state_changed = Some(scene) != last_generated_state;
+        if !state_changed {
+            tracing::info!(poll = poll_index, activity = ?scene.activity, "state unchanged, holding current clip");
+        } else if clip_paths.len() as u32 >= cli.max_clips {
+            tracing::info!(
+                poll = poll_index,
+                activity = ?scene.activity,
+                "state changed but max_clips reached, holding last clip"
+            );
+        } else {
+            tracing::info!(poll = poll_index, activity = ?scene.activity, "scene state changed, generating new clip");
+
+            let base_prompt = build_prompt(cli.style, scene);
+            let base_image_url = generate_base_image_url(
+                &client,
+                &fal_key,
+                &base_prompt,
+                cli.seed,
+                reference_image_data_uri.as_deref(),
+                cli.style_ref_strength,
+            )
+            .await?;
+            tracing::info!(%base_image_url, "base image composed");
+
+            let motion_prompt = build_motion_prompt(cli.style, scene);
+            let clip_bytes = generate_video_clip(
+                &client,
+                &fal_key,
+                &motion_prompt,
+                &base_image_url,
+                cli.clip_duration_secs,
+            )
+            .await?;
+
+            let clip_path = cli.out_dir.join(format!("clip_{:03}.mp4", clip_paths.len()));
+            std::fs::write(&clip_path, &clip_bytes)
+                .with_context(|| format!("writing {}", clip_path.display()))?;
+            tracing::info!(path = %clip_path.display(), bytes = clip_bytes.len(), "clip saved");
+            clip_paths.push(clip_path);
+            last_generated_state = Some(scene);
         }
-        previous_activity = Some(scene.activity);
 
-        let prompt = build_prompt(cli.style, scene);
-        tracing::info!(frame = frame_index, %prompt, "generating frame");
-
-        let frame_bytes = generate_frame(
-            &client,
-            &fal_key,
-            &prompt,
-            cli.seed,
-            reference_image_data_uri.as_deref(),
-            cli.style_ref_strength,
-        )
-        .await?;
-        let frame_path = cli.out_dir.join(format!("frame_{frame_index:04}.jpg"));
-        std::fs::write(&frame_path, &frame_bytes)
-            .with_context(|| format!("writing {}", frame_path.display()))?;
-        tracing::info!(frame = frame_index, path = %frame_path.display(), bytes = frame_bytes.len(), "frame saved");
-
-        if frame_index + 1 < cli.frames {
+        if poll_index + 1 < cli.max_polls {
             tokio::time::sleep(Duration::from_secs(cli.interval_secs)).await;
         }
     }
 
-    let video_path = cli.out_dir.join("room-viz.mp4");
-    let status = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-framerate",
-            "1",
-            "-i",
-        ])
-        .arg(cli.out_dir.join("frame_%04d.jpg"))
-        .args([
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-vf",
-            "scale=1024:-2",
-        ])
-        .arg(&video_path)
-        .status()
-        .context("spawning ffmpeg")?;
-    if !status.success() {
-        bail!("ffmpeg exited with {status}");
+    if clip_paths.is_empty() {
+        bail!("no clips were generated during this capture session");
     }
-    println!("wrote {}", video_path.display());
+
+    let video_path = cli.out_dir.join("room-viz.mp4");
+    if clip_paths.len() == 1 {
+        std::fs::copy(&clip_paths[0], &video_path).context("copying single clip to final output")?;
+    } else {
+        let concat_list_path = cli.out_dir.join("concat_list.txt");
+        let concat_list = clip_paths
+            .iter()
+            .map(|p| format!("file '{}'", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&concat_list_path, concat_list).context("writing ffmpeg concat list")?;
+
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+            .arg(&concat_list_path)
+            .args(["-c", "copy"])
+            .arg(&video_path)
+            .status()
+            .context("spawning ffmpeg concat")?;
+        if !status.success() {
+            bail!("ffmpeg concat exited with {status}");
+        }
+    }
+
+    println!(
+        "wrote {} ({} real clip(s) generated)",
+        video_path.display(),
+        clip_paths.len()
+    );
     Ok(())
 }
