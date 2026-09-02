@@ -52,6 +52,16 @@ struct Args {
 
     #[arg(long, default_value_t = 4)]
     steps: u32,
+
+    /// Real LoRA weights URL (e.g. the trained ruforecast-visual-teacher
+    /// model) to merge in. Only meaningful when --sensing-url's paired
+    /// FAL_MODEL_ENDPOINT points at a FLUX-family endpoint that accepts a
+    /// `loras` array (e.g. fal-ai/flux-lora/image-to-image).
+    #[arg(long)]
+    lora_path: Option<String>,
+
+    #[arg(long, default_value_t = 1.0)]
+    lora_scale: f32,
 }
 
 fn main() {
@@ -65,7 +75,10 @@ fn main() {
     fs::create_dir_all(&layer2_dir).expect("create layer2 dir");
 
     let fal = match FalClient::from_env() {
-        Ok(c) => c,
+        Ok(c) => match &args.lora_path {
+            Some(path) => c.with_lora(path.clone(), args.lora_scale),
+            None => c,
+        },
         Err(e) => {
             eprintln!("cannot run Layer 2 without a real FAL_KEY: {e}");
             std::process::exit(1);

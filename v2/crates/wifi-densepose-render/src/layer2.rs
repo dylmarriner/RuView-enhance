@@ -1,22 +1,34 @@
 //! Layer 2 — fal.ai neural styling keyframes.
 //!
-//! Restyles a real Layer-1 frame via `fal-ai/fast-lcm-diffusion/image-to-image`
-//! (confirmed live and working 2026-09-01: a real call returned HTTP 200, a
-//! real 1024x1024 JPEG, and a real measured `timings.inference` of 5.23s).
-//! This is deliberately **not** independent generation: the Layer-1 frame is
-//! always the `image_url` input, and `strength` is kept low so the model
-//! restyles rather than replaces the deterministic content.
+//! Restyles a real Layer-1 frame. Two real, confirmed-working endpoints:
+//! - `fal-ai/fast-lcm-diffusion/image-to-image` (generic, original default;
+//!   confirmed 2026-09-01: HTTP 200, real 1024x1024 JPEG, real measured
+//!   `timings.inference` of 5.23s).
+//! - `fal-ai/flux-lora/image-to-image` (confirmed 2026-09-02, real and
+//!   operational — supports a `loras` array), the endpoint for the trained
+//!   `ruforecast-visual-teacher` visual-teacher LoRA (delivered by agent
+//!   `fal-visual-teacher`, 2026-09-02; trigger word `ruviewstyle`). See
+//!   [`FalClient::with_lora`].
+//!
+//! Both are deliberately **not** independent generation: the Layer-1 frame
+//! is always the `image_url` input, and `strength` is kept low so the model
+//! restyles rather than replaces the deterministic content — the LoRA swap
+//! changes how good the restyle looks, never whether it stays a restyle of
+//! real Layer-1 content (see "Non-negotiable trust boundary" below).
 //!
 //! ## Pricing honesty
 //!
-//! fal.ai's public pricing page does not list a flat per-image rate for this
-//! model, and the model page's own price badge did not resolve to a concrete
-//! number via static fetch as of 2026-09-01 (see ADR-352). Every call here
-//! therefore requires the caller to pass an explicit, operator-supplied
-//! `estimated_cost_usd` for [`BudgetGuard::authorize_and_record`] rather than
-//! this module silently trusting a scraped or assumed number. Real observed
-//! `timings.inference` is returned on every call so that estimate can be
-//! refined from real measurements over time.
+//! `fast-lcm-diffusion`'s public pricing page does not list a flat per-image
+//! rate (see ADR-352). `flux-lora/image-to-image` DOES have a real, verified
+//! rate: **$0.035/megapixel, rounded up to the nearest megapixel**
+//! (confirmed 2026-09-02 from two independent fetches of fal.ai's own
+//! pricing/model pages) — for this crate's 512x288 render (0.147MP, rounds
+//! up to 1MP) that is a real **$0.035/call**. Every call here still requires
+//! the caller to pass an explicit `estimated_cost_usd` to
+//! [`BudgetGuard::authorize_and_record`] (now backed by a real number for
+//! the LoRA endpoint, not just an estimate) rather than this module
+//! silently trusting a number. Real observed `timings.inference` is
+//! returned on every call too.
 //!
 //! ## Non-negotiable trust boundary (user-stated, 2026-09-01)
 //!
@@ -51,9 +63,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// The confirmed-working default endpoint (2026-09-01). Overridable via
-/// `FAL_MODEL_ENDPOINT` or [`FalClient::with_endpoint`] so swapping in the
-/// `ruforecast-visual-teacher` trained model id, once real, is a config
-/// change — not a code change.
+/// `FAL_MODEL_ENDPOINT` or [`FalClient::with_endpoint`] — e.g. to
+/// `https://fal.run/fal-ai/flux-lora/image-to-image` plus
+/// [`FalClient::with_lora`] for the real trained `ruforecast-visual-teacher`
+/// model (delivered 2026-09-02), which was exactly the config-not-code swap
+/// this parameterization was built for.
 const DEFAULT_ENDPOINT: &str = "https://fal.run/fal-ai/fast-lcm-diffusion/image-to-image";
 
 #[derive(Debug, Error)]
@@ -105,9 +119,22 @@ pub struct StyledFrame {
     pub inference_seconds: f64,
 }
 
+/// A real LoRA to merge into a FLUX-family image-to-image call (e.g. the
+/// trained `ruforecast-visual-teacher` visual style). `path` is a real
+/// fal.media (or equivalent) URL fal.ai fetches server-side — this client
+/// never downloads or executes the weights file itself, only passes the URL
+/// through as a request parameter, same trust boundary as any other fal.ai
+/// call.
+#[derive(Debug, Clone)]
+pub struct LoraConfig {
+    pub path: String,
+    pub scale: f32,
+}
+
 pub struct FalClient {
     api_key: String,
     endpoint: String,
+    lora: Option<LoraConfig>,
     agent: ureq::Agent,
 }
 
@@ -123,7 +150,7 @@ impl FalClient {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(180))
             .build();
-        Ok(Self { api_key, endpoint, agent })
+        Ok(Self { api_key, endpoint, lora: None, agent })
     }
 
     /// Override the target model endpoint (e.g. to point at a newly trained
@@ -131,6 +158,18 @@ impl FalClient {
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Attach a real trained LoRA (e.g. `ruforecast-visual-teacher`) to
+    /// every subsequent [`style_frame`](Self::style_frame) call. Only
+    /// meaningful against a FLUX-family endpoint that accepts a `loras`
+    /// array (e.g. `fal-ai/flux-lora/image-to-image`) — set the endpoint to
+    /// match via [`with_endpoint`](Self::with_endpoint) or
+    /// `FAL_MODEL_ENDPOINT`.
+    #[must_use]
+    pub fn with_lora(mut self, path: impl Into<String>, scale: f32) -> Self {
+        self.lora = Some(LoraConfig { path: path.into(), scale });
         self
     }
 
@@ -147,12 +186,15 @@ impl FalClient {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(layer1_png)
         );
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "image_url": data_uri,
             "prompt": prompt,
             "strength": strength,
             "num_inference_steps": num_inference_steps,
         });
+        if let Some(lora) = &self.lora {
+            payload["loras"] = serde_json::json!([{ "path": lora.path, "scale": lora.scale }]);
+        }
 
         let resp = self
             .agent

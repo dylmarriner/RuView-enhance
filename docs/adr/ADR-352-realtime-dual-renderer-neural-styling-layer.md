@@ -169,6 +169,25 @@ flowchart LR
   model id is a config change — see "Non-negotiable trust boundary" above
   for why that swap can only ever change pixel quality, never what feeds
   measured/derived values.
+- **Resolved, 2026-09-02**: the `ruforecast-visual-teacher` LoRA (delivered
+  by agent `fal-visual-teacher`) is real, trained, and wired in via
+  [`FalClient::with_lora`], called against the confirmed-real
+  `fal-ai/flux-lora/image-to-image` endpoint (supports a `loras` array;
+  `image_url` + `strength` still the real Layer-1 frame restyle contract —
+  the LoRA changes style quality, not the trust boundary). Trigger word
+  `ruviewstyle`. A real bounded test call (strength 0.55, 20 steps, real
+  measured inference 7.25s) produced a real output that — unlike the
+  generic model's earlier "reads as a stool, not a person" result — a
+  coherent glowing human figure, WiFi arc icons, and a stylized vitals
+  panel, genuinely matching the RuView visual style; SSIM 0.925 vs the
+  generic model's 0.889 on a comparable frame. This closes the honest
+  visual-quality limitation recorded below and under Consequences.
+  `flux-lora/image-to-image` also has a real, verified flat rate —
+  **$0.035/megapixel, rounded up** (confirmed 2026-09-02 from two
+  independent fal.ai page fetches) — replacing the `fast-lcm-diffusion`
+  pricing ambiguity for this endpoint; for this crate's 512x288 render that
+  is a real $0.035/call, tracked via `--fal-cost-estimate-usd 0.04`
+  (small safety margin) in the probe/recorder binaries.
 
 ### Compositor
 
@@ -235,12 +254,16 @@ boundary; see the crate's own budget-tracking module for the running total.
   trickle) streaming a pre-recorded, looping real composite — not yet a
   live end-to-end render-to-broadcast path with no file in between. Real
   follow-up, not silently presented as more than it is.
-- Visual quality of the fal.ai restyle is a known, documented, open
-  limitation: at low-to-moderate `strength` the generic
-  `fast-lcm-diffusion` model does not reliably read the Layer-1 content as
-  "a person" (see Layer 2 section above) — the real fix is expected to be
-  the `ruforecast-visual-teacher` trained LoRA once available, not further
-  tuning against the generic model.
+- Visual quality: the generic `fast-lcm-diffusion` model did not reliably
+  read the Layer-1 content as "a person" at low-to-moderate `strength` —
+  **resolved 2026-09-02** by wiring in the real trained
+  `ruforecast-visual-teacher` LoRA against `flux-lora/image-to-image` (see
+  Layer 2 section above), confirmed by a real test call producing a
+  coherent human-figure-plus-WiFi-arcs-plus-vitals-panel result matching
+  the RuView visual style. `fast-lcm-diffusion` remains available as the
+  default/fallback endpoint; the LoRA path is opt-in via `--lora-path` /
+  `FalClient::with_lora` plus `FAL_MODEL_ENDPOINT` pointed at
+  `flux-lora/image-to-image`.
 - Real fal.ai spend across this prototype's validation runs: a handful of
   calls, low cents total, tracked in each run's own `fal-budget-ledger.json`
   — well under the $15 cap.

@@ -76,6 +76,15 @@ struct Args {
     /// Output video frame rate (derived from --interval-ms if omitted).
     #[arg(long)]
     fps: Option<u32>,
+
+    /// Real LoRA weights URL (e.g. the trained ruforecast-visual-teacher
+    /// model). Only meaningful when FAL_MODEL_ENDPOINT points at a
+    /// FLUX-family endpoint accepting a `loras` array.
+    #[arg(long)]
+    lora_path: Option<String>,
+
+    #[arg(long, default_value_t = 1.0)]
+    lora_scale: f32,
 }
 
 fn main() {
@@ -146,7 +155,10 @@ fn main() {
     // ---- Pass 2: bounded real fal.ai calls at fixed real frame indices ----
     let mut keyframe_bytes: Vec<Option<Vec<u8>>> = vec![None; updates.len()];
     if args.fal_every > 0 {
-        match FalClient::from_env() {
+        match FalClient::from_env().map(|c| match &args.lora_path {
+            Some(path) => c.with_lora(path.clone(), args.lora_scale),
+            None => c,
+        }) {
             Ok(fal) => {
                 let ledger_path = args.out_dir.join("fal-budget-ledger.json");
                 let mut budget = BudgetGuard::load(&ledger_path, args.fal_budget_cap_usd).expect("load budget ledger");
