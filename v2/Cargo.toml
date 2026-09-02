@@ -21,6 +21,7 @@ members = [
     "crates/wifi-densepose-mat",
     "crates/wifi-densepose-train",
     "crates/wifi-densepose-sensing-server",
+    "crates/wifi-densepose-render",   # ADR-352 — real-time dual-renderer (Layer 1 deterministic + Layer 2 fal.ai neural styling)
     "crates/wifi-densepose-aether",    # ADR-185 §13 — AETHER pure-compute leaf (std-only)
     "crates/wifi-densepose-privshield", # ADR-291 — VEIL privacy shield (compliant-waveform anti-sensing; std-only leaf)
     "crates/wifi-densepose-wifiscan",

@@ -1,0 +1,30 @@
+[package]
+name = "wifi-densepose-render"
+description = "ADR-352 real-time dual-renderer: local deterministic Layer-1 renderer + fal.ai neural-styling Layer-2, compositor, and broadcast, built on the real streaming-engine/sensing-server substrate"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "render-probe"
+path = "src/bin/render_probe.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+# Sensing-server subscriber over HTTP — kept minimal, mirrors
+# cog-pose-estimation's choice of ureq over full reqwest.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Layer-1 CPU rasterizer: deterministic, no GPU/display server dependency,
+# so it runs headless on ruvultra today. wgpu offscreen rendering is the
+# stated follow-up (see ADR-352 "Consequences").
+tiny-skia = "0.11"
+
+[lints.rust]
+unsafe_code = "forbid"
