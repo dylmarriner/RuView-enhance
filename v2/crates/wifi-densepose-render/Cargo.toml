@@ -11,6 +11,10 @@ repository.workspace = true
 name = "render-probe"
 path = "src/bin/render_probe.rs"
 
+[[bin]]
+name = "layer2-probe"
+path = "src/bin/layer2_probe.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +29,9 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # so it runs headless on ruvultra today. wgpu offscreen rendering is the
 # stated follow-up (see ADR-352 "Consequences").
 tiny-skia = "0.11"
+# fal.ai payload encoding (Layer 2) and SSIM frame decode (the gate).
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [lints.rust]
 unsafe_code = "forbid"
