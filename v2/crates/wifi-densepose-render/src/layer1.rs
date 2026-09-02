@@ -17,7 +17,12 @@
 
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
+use crate::heatfield;
 use crate::sensing_client::{NodeInfo, Person, SensingUpdate};
+
+/// How strongly the real `signal_field` heat overlay shows through the
+/// `room-style-1.png` backdrop. See `heatfield.rs`.
+const HEATFIELD_OVERLAY_STRENGTH: f32 = 0.85;
 
 /// Fixed COCO-17-style skeleton bone list, matched by keypoint `name`. Bones
 /// whose endpoint names are absent from a given `Person`'s keypoints (a
@@ -79,13 +84,39 @@ fn presence_color(motion_level: &str) -> Color {
 #[must_use]
 pub fn render_frame(update: &SensingUpdate, cfg: RenderConfig) -> Pixmap {
     let mut pixmap = Pixmap::new(cfg.width, cfg.height).expect("nonzero render dimensions");
-    pixmap.fill(Color::from_rgba8(12, 14, 18, 255));
+    let has_heatfield = update.signal_field.is_some();
 
-    draw_room_bounds(&mut pixmap, &update.nodes, cfg);
-    draw_nodes(&mut pixmap, &update.nodes, &update.classification.motion_level, cfg);
-    for person in &update.persons {
-        draw_skeleton(&mut pixmap, person, cfg);
+    match &update.signal_field {
+        // Confirmed direction (ADR-352): the real per-frame signal_field
+        // grid, screen-blended onto the room-style-1.png backdrop, is
+        // Layer 1's real animated target — not the flat schematic below.
+        Some(field) => {
+            let composited = heatfield::composite(cfg.width, cfg.height, field, HEATFIELD_OVERLAY_STRENGTH);
+            pixmap.data_mut().copy_from_slice(composited.as_raw());
+        }
+        // No real signal_field this frame (older server contract, or a
+        // transient gap) — fall back to the flat schematic rather than
+        // fabricating a heat pattern that wasn't actually measured.
+        None => pixmap.fill(Color::from_rgba8(12, 14, 18, 255)),
     }
+
+    // room-style-1.png already depicts its OWN illustrated person — a
+    // decorative anchor, not real pose data (see heatfield.rs docs). Drawing
+    // the schematic stick-figure/room-bounds rectangle on top of it in a
+    // different, unrelated position risks a viewer mistaking one figure for
+    // the other, or the schematic rectangle for the real room bounds. So on
+    // the heatfield backdrop we draw only the elements that are real,
+    // additive signal (per-node dots, vitals) and skip the two elements that
+    // would visually compete with the backdrop's own decorative figure and
+    // walls. On the flat schematic fallback (no signal_field), the
+    // stick-figure/room-bounds are the only visualization, so they stay.
+    if !has_heatfield {
+        draw_room_bounds(&mut pixmap, &update.nodes, cfg);
+        for person in &update.persons {
+            draw_skeleton(&mut pixmap, person, cfg);
+        }
+    }
+    draw_nodes(&mut pixmap, &update.nodes, &update.classification.motion_level, cfg);
     if let Some(vitals) = &update.vital_signs {
         draw_vitals_bars(&mut pixmap, vitals, cfg);
     }

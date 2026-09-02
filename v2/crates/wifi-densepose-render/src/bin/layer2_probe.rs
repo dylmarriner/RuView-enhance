@@ -7,6 +7,11 @@
 //! cap, using an operator-supplied `--fal-cost-estimate-usd` per call —
 //! see `src/layer2.rs` for why that number isn't hardcoded from a scraped
 //! price page.
+//!
+//! Team-lead direction (2026-09-01): keep initial validation passes to a
+//! small fixed `--frames` count (recommended: on the order of 50) before
+//! anything sustained/extended, to confirm the pessimistic per-call
+//! estimate roughly holds against real measured spend before scaling up.
 
 use std::fs;
 use std::path::PathBuf;
@@ -32,9 +37,11 @@ struct Args {
 
     /// Operator-supplied per-call cost estimate — fal.ai does not publish a
     /// flat rate for this model; see ADR-352 for the reasoning behind this
-    /// default. Deliberately conservative (padded well above the ~$0.003-
-    /// 0.01 order-of-magnitude estimate from one real measured call).
-    #[arg(long, default_value_t = 0.02)]
+    /// default. Pinned to the pessimistic end ($0.01) of the $0.003-0.01
+    /// order-of-magnitude range estimated from real measured calls
+    /// (team-lead direction, 2026-09-01): biased high so BudgetGuard fails
+    /// safe rather than undercounting real spend.
+    #[arg(long, default_value_t = 0.01)]
     fal_cost_estimate_usd: f64,
 
     #[arg(long, default_value = "a real indoor room, photorealistic, natural lighting")]

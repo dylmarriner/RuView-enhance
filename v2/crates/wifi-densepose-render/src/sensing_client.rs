@@ -8,8 +8,8 @@
 //! 17-keypoint skeletons and `room_inference`, which the checked-out
 //! `SensingUpdate` struct does not declare). This client deserializes only
 //! the fields Layer 1 renders; unknown fields (`features`, `node_features`,
-//! `signal_field`, per-node `amplitude`/`sync`) are ignored, not dropped
-//! silently from a stricter contract — `serde` simply never asked for them.
+//! per-node `amplitude`/`sync`) are ignored, not dropped silently from a
+//! stricter contract — `serde` simply never asked for them.
 
 use serde::Deserialize;
 use std::time::Duration;
@@ -83,6 +83,18 @@ pub struct RoomInference {
     pub contributing_nodes: u32,
 }
 
+/// Real spatial-intensity field: a flattened `[x, y, z]`-shaped grid
+/// (observed live as `[20, 1, 20]` — a 20x20 top-down floor grid with a
+/// singleton height axis). `values` is row-major over that shape, length
+/// `grid_size[0] * grid_size[1] * grid_size[2]`. This is the real per-frame
+/// signal the animated Layer-1 heatfield (see `heatfield.rs`) renders — never
+/// a static/precomputed image.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignalField {
+    pub grid_size: [usize; 3],
+    pub values: Vec<f64>,
+}
+
 /// The subset of the live `GET /api/v1/sensing/latest` response Layer 1
 /// consumes. Real data, real field names, captured from a running instance —
 /// not fabricated.
@@ -93,7 +105,9 @@ pub struct SensingUpdate {
     pub timestamp: f64,
     pub source: String,
     pub tick: u64,
+    #[serde(default)]
     pub estimated_persons: u32,
+    #[serde(default)]
     pub signal_quality_score: f64,
     pub classification: ClassificationInfo,
     #[serde(default)]
@@ -104,6 +118,8 @@ pub struct SensingUpdate {
     pub nodes: Vec<NodeInfo>,
     #[serde(default)]
     pub room_inference: Option<RoomInference>,
+    #[serde(default)]
+    pub signal_field: Option<SignalField>,
 }
 
 #[derive(Debug, Error)]

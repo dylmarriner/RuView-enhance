@@ -34,6 +34,41 @@ re-styles that deterministic frame (image-to-image, low strength) at a low
 refresh rate, and every neurally-styled frame is validated against the
 deterministic frame it was derived from before it is allowed on screen.
 
+## Non-negotiable trust boundary (user-stated, 2026-09-01)
+
+> "The implementation boundary is now clear: fal.ai will train an optional
+> synthetic visual teacher, while RuView's measured RF, pose, vitals,
+> identity, and confidence remain local and authoritative."
+
+fal.ai — whether a generic off-the-shelf image-to-image model or the
+purpose-trained `ruforecast-visual-teacher` visual-teacher LoRA (in training,
+separate agent/worktree, as of 2026-09-01) — may **only ever** produce
+supplementary *synthetic pixels* for display/broadcast. It must never be a
+source of, or be allowed to influence in any way, a measured or derived
+value: RF/CSI measurements, pose estimates, vitals (heart rate/breathing
+rate), identity, or confidence/quality scores. Those always come from, and
+stay authoritative in, the local deterministic pipeline
+(`wifi-densepose-engine` / `ruview-twin` / `ruview-witness`). This is this
+ADR's restatement, made explicit and non-negotiable, of this repo's
+CLAUDE.md rule *"Never present WiFi sensing as camera-grade"* — a neural
+restyle of the room is not, and must never be treated as, a sensing result.
+
+Enforced at the type level in `wifi-densepose-render`, not just by
+convention: the fal.ai client's return type (`StyledFrame`) can only ever
+carry opaque `image_bytes` plus call-latency telemetry. It has no field, and
+must never gain one, that could be mistaken for or fed into the
+measurement/pose/vitals/identity/confidence pipeline. Any future change that
+would need such a field is a sign Layer 2 is being asked to do more than
+restyle pixels, which is out of scope by design and must be rejected.
+
+The `ruforecast-visual-teacher` LoRA, once it has a real trained model id,
+is expected to become Layer 2's model endpoint (swapping the current
+`fal-ai/fast-lcm-diffusion/image-to-image` default) — this changes *how good
+the synthetic pixels look*, never what data source is allowed to feed
+measured/derived values. `FalClient` is deliberately parameterized
+(`FAL_MODEL_ENDPOINT` env var / `with_endpoint`) so that swap is a config
+change, not a code change.
+
 ## Decision
 
 Build a two-layer real-time rendering pipeline as a new crate,
@@ -71,8 +106,8 @@ flowchart LR
 ### Layer 1 — local deterministic renderer ("sensor truth")
 
 - Consumes real `SensingUpdate` frames (pose keypoints, vitals, per-node
-  classification) polled from the live sensing-server, plus room/sensor
-  layout.
+  classification, and the real `signal_field` spatial-intensity grid) polled
+  from the live sensing-server, plus room/sensor layout.
 - Renders deterministically: no model inference, no randomness beyond what
   the upstream data already carries. Same input frame -> same pixels.
 - Initial implementation target: a CPU software rasterizer (`tiny-skia` /
@@ -85,6 +120,27 @@ flowchart LR
   than what was asked for.
 - Runs at 30-60 fps target against locally available data (no network call in
   the render hot path).
+- **Confirmed concrete driving case (user, 2026-09-01):** the real
+  `signal_field` grid (observed live as a 20x20 spatial-intensity grid),
+  screen-blended each frame onto `assets/room-style-1.png` as an illustrated
+  stylistic backdrop — continuously animated from real per-frame data, not
+  the one-off static `assets/room_csi_composite.png` experiment it grew out
+  of. Implemented in `wifi-densepose-render/src/heatfield.rs` and validated
+  against live data (real per-frame pixel-level variation confirmed, not a
+  frozen composite).
+  - `room-style-1.png` is an AI-illustrated generic bedroom scene — a
+    decorative anchor, not a photo or geometric model of any real
+    deployment's actual room. Only the heat overlay is driven by real
+    per-frame sensor data; the backdrop's own baked-in illustrated person is
+    decorative, not a rendering of a detected person.
+  - Because that backdrop already depicts its own illustrated figure, the
+    schematic stick-figure skeleton and schematic room-bounds rectangle are
+    suppressed on the heatfield backdrop (they would visually compete with,
+    or risk being mistaken for, the backdrop's decorative figure/walls) —
+    real per-node position dots and real vitals bars are kept, since those
+    don't have that ambiguity. The schematic stick-figure/room-bounds remain
+    the full visualization on the flat-background fallback path (no
+    `signal_field` this frame).
 
 ### Layer 2 — fal.ai neural styling keyframes
 
@@ -97,10 +153,19 @@ flowchart LR
   kept low (photoreal restyle, not independent generation), output is a
   candidate keyframe.
 - fal.ai's public pricing page does not list a flat per-image rate for this
-  model (billed by GPU-second, architecture-dependent); the real per-call cost
-  used for the budget guard is measured directly from a real minimal API call
-  rather than trusted from a scraped price page — see Budget section for the
-  measured number.
+  model (billed by GPU-second, architecture-dependent); the model page's own
+  price badge did not resolve to a concrete number via static fetch either.
+  `BudgetGuard` requires an explicit, operator-supplied per-call cost
+  estimate rather than trusting a scraped number — pinned to $0.01/call
+  (team-lead direction, 2026-09-01: the pessimistic end of the $0.003-0.01
+  order-of-magnitude range measured from real calls), so the guard fails
+  safe against an underestimate rather than risking the $15 cap.
+- The model endpoint is parameterized (`FAL_MODEL_ENDPOINT` env var /
+  `FalClient::with_endpoint`), not hardcoded, so swapping in the
+  `ruforecast-visual-teacher` trained visual-teacher LoRA once it has a real
+  model id is a config change — see "Non-negotiable trust boundary" above
+  for why that swap can only ever change pixel quality, never what feeds
+  measured/derived values.
 
 ### Compositor
 
