@@ -1,6 +1,9 @@
 # ADR-352: Real-time dual-renderer neural styling layer
 
-- **Status**: Proposed
+- **Status**: Implemented (prototype) — Layer 1, Layer 2, SSIM gate,
+  compositor, three-stream recorder, and WebRTC broadcast are all real and
+  validated against live data as of 2026-09-02; known limitations recorded
+  under Consequences.
 - **Date**: 2026-09-01
 - **Deciders**: ruv
 - **Tags**: rendering, visualization, fal-ai, neural-styling, webrtc, honesty-discipline, phase-4
@@ -204,14 +207,43 @@ boundary; see the crate's own budget-tracking module for the running total.
 - New crate `wifi-densepose-render` depends on the engine/twin/witness crates
   for types, and on the sensing-server's HTTP JSON contract for live data —
   it does not reimplement scene-state extraction.
-- First real milestone renders live local frames only (Layer 1); Layer 2
-  neural styling, compositor, WebRTC broadcast, and the three-stream
-  recording land in subsequent phases of this ADR's implementation, each
-  committed independently so partial progress is never lost.
-- A CPU rasterizer, not `wgpu`, is the real Layer-1 renderer for this first
-  milestone; upgrading to `wgpu` offscreen rendering is tracked as follow-up
-  work under this same ADR, not silently substituted without recording it
-  here.
+- All six pieces of the pipeline are real and validated against live data:
+  Layer 1 (animated `signal_field` heatfield composite), Layer 2 (real
+  fal.ai calls), the SSIM gate, the compositor, the three-stream evidence
+  recorder, and WebRTC broadcast (verified rendering real, advancing video
+  in an actual Chrome tab via browser automation — screenshots two seconds
+  apart show real motion and the real burned-in SYNTHETIC label, not a
+  frozen frame).
+- A CPU rasterizer, not `wgpu`, is the real Layer-1 renderer; upgrading to
+  `wgpu` offscreen rendering remains tracked follow-up work under this same
+  ADR, not silently substituted without recording it here.
+- The compositor does **global** (single-translation) motion compensation,
+  not dense per-pixel optical flow — a real, working, but coarser
+  approximation; documented in `compositor.rs`. It will not track multiple
+  people's independent motion separately.
+- The burned-in SYNTHETIC label is a self-contained 5x7 bitmap font
+  (`text.rs`), not a font-rendering dependency — deliberately minimal scope
+  for a short fixed label string.
+- The three-stream recorder decouples real-time Layer-1 capture from
+  fal.ai's variable (~5-90s+, cold-start-dependent) call latency: Layer 1
+  captures at a fixed real interval first, bounded real fal.ai calls happen
+  second at fixed frame indices, composition happens third in real frame
+  order. Real `tick`/`timestamp` fields in `raw.jsonl` are the actual
+  synchronization proof across the three streams, not wall-clock adjacency
+  of file writes. A fully inline live pipeline is real follow-up work.
+- WebRTC broadcast is a bare same-host/LAN handshake (no STUN/TURN, no ICE
+  trickle) streaming a pre-recorded, looping real composite — not yet a
+  live end-to-end render-to-broadcast path with no file in between. Real
+  follow-up, not silently presented as more than it is.
+- Visual quality of the fal.ai restyle is a known, documented, open
+  limitation: at low-to-moderate `strength` the generic
+  `fast-lcm-diffusion` model does not reliably read the Layer-1 content as
+  "a person" (see Layer 2 section above) — the real fix is expected to be
+  the `ruforecast-visual-teacher` trained LoRA once available, not further
+  tuning against the generic model.
+- Real fal.ai spend across this prototype's validation runs: a handful of
+  calls, low cents total, tracked in each run's own `fal-budget-ledger.json`
+  — well under the $15 cap.
 
 ## References
 
