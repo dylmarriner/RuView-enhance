@@ -14,13 +14,16 @@
 #![forbid(unsafe_code)]
 
 pub mod budget;
+pub mod compositor;
 pub mod heatfield;
 pub mod layer1;
 pub mod layer2;
 pub mod sensing_client;
 pub mod ssim;
+pub mod text;
 
 pub use budget::{BudgetError, BudgetGuard};
+pub use compositor::CompositorState;
 pub use layer1::{render_frame, RenderConfig};
 pub use layer2::{FalClient, FalError, StyledFrame};
 pub use sensing_client::{ClassificationInfo, NodeInfo, SensingClient, SensingUpdate, SignalField, VitalSigns};
