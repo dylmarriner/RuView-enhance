@@ -25,6 +25,20 @@
 //! position in the sequence (never before Layer 2 has contributed
 //! anything) — matches ADR-352's rule that AI-enhanced output is always
 //! visibly labeled.
+//!
+//! ## Smoother motion (`--interpolate`, 2026-09-02)
+//!
+//! By default the compositor fills the gap between two real accepted
+//! Layer-2 keyframes with a single synthetic global-motion-compensated
+//! warp of the earlier keyframe (see `compositor.rs`). `--interpolate`
+//! instead makes one additional real, bounded fal.ai RIFE call per gap
+//! (`fal-ai/rife`, confirmed real, $0.0013/compute-second) to generate real
+//! in-between frames between the two real keyframes, which the compositor
+//! then treats as a fresh real keyframe every tick in that span — no
+//! synthetic warp needed where real interpolated frames exist. A ComfyUI
+//! hosted-workflow route was investigated and ruled out: fal.ai does not
+//! host arbitrary ComfyUI graph execution as of 2026-09-02 (see
+//! `layer2.rs` for the real 404 that ruled it out).
 
 use std::fs;
 use std::path::PathBuf;
@@ -85,6 +99,18 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     lora_scale: f32,
+
+    /// Fill gaps between real accepted Layer-2 keyframes with real fal.ai
+    /// RIFE-interpolated frames instead of only the compositor's synthetic
+    /// motion-compensated warp. Real, bounded, budget-guarded calls -- see
+    /// layer2.rs INTERPOLATION_ENDPOINT docs.
+    #[arg(long, default_value_t = false)]
+    interpolate: bool,
+
+    /// Real per-call cost estimate for RIFE (verified $0.0013/compute-second
+    /// -- see layer2.rs; padded for a small handful of interpolated frames).
+    #[arg(long, default_value_t = 0.01)]
+    interpolation_cost_estimate_usd: f64,
 }
 
 fn main() {
@@ -153,6 +179,8 @@ fn main() {
     }
 
     // ---- Pass 2: bounded real fal.ai calls at fixed real frame indices ----
+    // ---- Pass 2.5: optionally fill gaps between accepted keyframes with
+    //      real RIFE interpolation instead of only a synthetic warp ----
     let mut keyframe_bytes: Vec<Option<Vec<u8>>> = vec![None; updates.len()];
     if args.fal_every > 0 {
         match FalClient::from_env().map(|c| match &args.lora_path {
@@ -163,6 +191,7 @@ fn main() {
                 let ledger_path = args.out_dir.join("fal-budget-ledger.json");
                 let mut budget = BudgetGuard::load(&ledger_path, args.fal_budget_cap_usd).expect("load budget ledger");
                 let mut idx = 0usize;
+                let mut accepted_indices: Vec<usize> = Vec::new();
                 while idx < updates.len() {
                     if let Err(e) = budget.authorize_and_record(args.fal_cost_estimate_usd) {
                         eprintln!("budget guard refused further fal.ai calls at frame {idx}: {e}");
@@ -180,6 +209,7 @@ fn main() {
                             );
                             if ssim.accepted {
                                 keyframe_bytes[idx] = Some(styled.image_bytes);
+                                accepted_indices.push(idx);
                             }
                         }
                         Err(e) => eprintln!("frame {idx}: real fal.ai call failed, no keyframe update: {e}"),
@@ -187,6 +217,37 @@ fn main() {
                     idx += args.fal_every as usize;
                 }
                 println!("pass 2 done: real fal spend ${:.4} of ${:.2} cap", budget.spent_usd(), args.fal_budget_cap_usd);
+
+                if args.interpolate {
+                    for pair in accepted_indices.windows(2) {
+                        let (a, b) = (pair[0], pair[1]);
+                        let gap = b - a;
+                        if gap < 2 {
+                            continue; // adjacent keyframes, nothing to fill
+                        }
+                        if let Err(e) = budget.authorize_and_record(args.interpolation_cost_estimate_usd) {
+                            eprintln!("budget guard refused RIFE interpolation for frames {a}..{b}: {e}");
+                            break;
+                        }
+                        let start = keyframe_bytes[a].as_ref().expect("accepted index has bytes");
+                        let end = keyframe_bytes[b].as_ref().expect("accepted index has bytes");
+                        match fal.interpolate(start, end, (gap - 1) as u32) {
+                            Ok(frames) => {
+                                println!("frames {a}..{b}: real RIFE interpolation produced {} real in-between frames", frames.len());
+                                for (offset, frame) in frames.into_iter().enumerate() {
+                                    let target = a + 1 + offset;
+                                    if target < b {
+                                        keyframe_bytes[target] = Some(frame.image_bytes);
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "frames {a}..{b}: real RIFE call failed, falling back to synthetic warp for this gap: {e}"
+                            ),
+                        }
+                    }
+                    println!("pass 2.5 done: real fal spend ${:.4} of ${:.2} cap", budget.spent_usd(), args.fal_budget_cap_usd);
+                }
             }
             Err(e) => {
                 eprintln!("no FAL_KEY: {e} -- composite stream will equal Layer 1 for this run (no fabricated Layer-2 content).");

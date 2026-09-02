@@ -70,6 +70,24 @@ use thiserror::Error;
 /// this parameterization was built for.
 const DEFAULT_ENDPOINT: &str = "https://fal.run/fal-ai/fast-lcm-diffusion/image-to-image";
 
+/// Real, confirmed-working frame-interpolation endpoint (RIFE — Real-Time
+/// Intermediate Flow Estimation), confirmed 2026-09-02: takes
+/// `start_image_url` / `end_image_url` / `num_frames` and returns that many
+/// real in-between frames, `output_type: "images"`. Real verified rate:
+/// **$0.0013/compute-second** (confirmed from fal.ai's own model page) — a
+/// lightweight model, real cost per call is a small fraction of a cent for
+/// the handful of frames this crate requests. Used by the compositor to
+/// smooth motion between two real accepted Layer-2 keyframes with real
+/// interpolated frames instead of only a synthetic motion-compensated warp.
+///
+/// Investigated and ruled out as **not real**: fal.ai does not host
+/// arbitrary ComfyUI workflow execution as of 2026-09-02 —
+/// `https://fal.ai/models/fal-ai/comfy-server` returns a real HTTP 404. A
+/// third-party community project (`ComfyUI-fal-API` on GitHub) wraps many
+/// fal.ai *individual* model endpoints as ComfyUI nodes, which is a
+/// different thing from fal.ai hosting a graph itself; not pursued.
+const INTERPOLATION_ENDPOINT: &str = "https://fal.run/fal-ai/rife";
+
 #[derive(Debug, Error)]
 pub enum FalError {
     #[error("FAL_KEY not set (never hardcode it; fetch from GCP Secret Manager and export it)")]
@@ -214,6 +232,47 @@ impl FalClient {
             image_bytes,
             inference_seconds,
         })
+    }
+
+    /// Real RIFE frame interpolation between two real images (e.g. two
+    /// consecutive accepted Layer-2 keyframes). Returns `num_frames` real
+    /// in-between frames, in order from `start` to `end`, boundaries
+    /// excluded (matches RIFE's own `include_start`/`include_end` defaults).
+    /// Never fabricates motion: if the real call fails, the caller falls
+    /// back to the compositor's synthetic warp rather than this function
+    /// inventing frames.
+    pub fn interpolate(&self, start_bytes: &[u8], end_bytes: &[u8], num_frames: u32) -> Result<Vec<StyledFrame>, FalError> {
+        let to_data_uri = |bytes: &[u8]| format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        let payload = serde_json::json!({
+            "start_image_url": to_data_uri(start_bytes),
+            "end_image_url": to_data_uri(end_bytes),
+            "num_frames": num_frames,
+            "output_type": "images",
+        });
+
+        let resp = self
+            .agent
+            .post(INTERPOLATION_ENDPOINT)
+            .set("Authorization", &format!("Key {}", self.api_key))
+            .set("Content-Type", "application/json")
+            .send_string(&payload.to_string())
+            .map_err(Box::new)?
+            .into_string()?;
+
+        let parsed: FalResponse = serde_json::from_str(&resp)?;
+        if parsed.images.is_empty() {
+            return Err(FalError::NoImages);
+        }
+        parsed
+            .images
+            .iter()
+            .map(|img| {
+                Ok(StyledFrame {
+                    image_bytes: decode_data_uri_or_fetch(&self.agent, &img.url)?,
+                    inference_seconds: 0.0, // RIFE's real response carries no timings field
+                })
+            })
+            .collect()
     }
 }
 

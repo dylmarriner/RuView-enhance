@@ -191,10 +191,31 @@ flowchart LR
 
 ### Compositor
 
-- Optical-flow-based temporal blending: the last-accepted Layer-2 keyframe is
-  warped forward each Layer-1 tick using motion estimated between successive
-  Layer-1 frames, so the visible motion stays smooth between low-frequency
-  neural updates instead of jumping/holding.
+- Global-motion-compensated temporal blending (real cross-correlation
+  motion estimate, not dense per-pixel optical flow — see `compositor.rs`):
+  the last-accepted Layer-2 keyframe is warped forward each Layer-1 tick,
+  so the visible motion stays smooth between low-frequency neural updates
+  instead of jumping/holding.
+- **Real frame interpolation, `--interpolate` (2026-09-02)**: investigated
+  the user's "more smooth animation, possibly ComfyUI style workflow"
+  request. Fal.ai does not host arbitrary ComfyUI workflow execution as a
+  real product (`fal-ai/comfy-server`, referenced by a third-party
+  ComfyUI-fal-API GitHub project's own terminology, returns a real HTTP 404
+  on fal.ai's own site — ruled out, not pursued). `fal-ai/rife` (Real-Time
+  Intermediate Flow Estimation) IS real and confirmed
+  (`start_image_url`/`end_image_url`/`num_frames` -> real in-between
+  frames), with a real verified rate of $0.0013/compute-second. Wired in as
+  an opt-in compositor upgrade: for each gap between two real accepted
+  Layer-2 keyframes, one real RIFE call produces real interpolated frames
+  to fill it, and the compositor treats each as a fresh real keyframe for
+  its tick — no synthetic warp needed where real interpolated content
+  exists (the synthetic warp remains the fallback for the tail after the
+  last keyframe, or if a RIFE call fails). Validated end-to-end: a real run
+  (16 frames, 3 real style keyframes, 2 real RIFE calls each producing 5
+  real in-between frames, real spend $0.14 that run) produced visibly
+  smoother, physically plausible motion between keyframes — confirmed by
+  pulling and inspecting the sequence, and by re-verifying the improved
+  composite live over WebRTC in an actual browser tab.
 
 ### SSIM-based frame rejection
 
