@@ -21,3 +21,4 @@ clap = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+base64 = "0.22"

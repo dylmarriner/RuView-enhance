@@ -118,7 +118,33 @@ inactive, cool grey tones, status: vacant, monochrome architectural
 wireframe, clean vector linework, muted slate and white palette, dashboard
 UI aesthetic, isometric technical diagram style, precise and clinical."*
 
-Full per-activity prompt text for all four styles is in
+**Branded / RuView tech-overlay** — image-to-image against RuView's own
+marketing hero graphic (`assets/ruview-small-gemini.jpg`), not a pure
+text-prompt style like the other four. **This style deliberately depicts a
+literal human silhouette with a glowing pose-skeleton overlay** (joint
+markers, WiFi signal arcs, floating vital-sign readout panels), matching the
+reference image's own sci-fi data-overlay aesthetic. This is a materially
+weaker privacy posture than `abstract` and should be understood as such by
+any caller: the figure is fal.ai's own synthetic generation conditioned on a
+real product-marketing image, not a reproduction of any real person's
+likeness, but it is the only preset among the five that renders anything
+resembling a human form. Callers who want to avoid human-figure depiction
+should use `abstract` instead. Example (occupied, moving, single occupant):
+*"a room with one glowing cyan pose-skeleton human figure mid-stride in
+motion, joint markers with motion trails, WiFi signal arcs radiating from a
+router, floating vital-sign readout panels, status overlay reading OCCUPIED
+- ACTIVE, dark navy-blue background, glowing cyan and white sci-fi data
+overlay aesthetic, futuristic WiFi sensing visualization, technical HUD
+readout style, high contrast glow, RuView WiFi-DensePose branding
+aesthetic."* Implementation: the reference image is base64-encoded and
+passed directly as a `data:image/jpeg;base64,...` URI in the `image_url`
+field of `POST https://fal.run/fal-ai/fast-sdxl/image-to-image` (confirmed
+this session: no separate fal.ai storage-upload call is required, a data URI
+is accepted directly), with `strength` (default 0.55) controlling how much
+the output favors the reference image's composition versus the per-frame
+text prompt.
+
+Full per-activity prompt text for all five styles is in
 `v2/crates/wifi-densepose-room-viz/src/main.rs::build_prompt`.
 
 ### Generation and assembly
@@ -158,7 +184,10 @@ not an assumption.)
   as build artifacts (gitignored), not committed to the repository.
 - The abstract/data-art preset is recommended as the privacy-preferred
   default for any future non-demonstration use, since it structurally
-  cannot render a human likeness regardless of prompt drift.
+  cannot render a human likeness regardless of prompt drift. Conversely,
+  **`branded` is the weakest privacy posture of the five presets** and
+  should only be used for deliberate, explicitly-authorized branding/
+  demonstration purposes, exactly as this session's use was.
 
 ## Consequences
 
@@ -186,3 +215,23 @@ not an assumption.)
   H.264 MP4 (1024x576, 8 frames, ~8s, non-corrupt).
 - `cargo check`/`cargo clippy --all-targets -- -D warnings` both clean for
   the new crate.
+- **Branded style (added in a follow-up session)**: real image-to-image
+  connectivity confirmed via a minimal test call to
+  `fast-sdxl/image-to-image` with a base64 data-URI `image_url` (HTTP 200,
+  ~0.48s inference) before any code was written, establishing that no
+  separate fal.ai storage-upload step is needed. A real 8-frame capture
+  against the live household feed produced a real, `ffprobe`-verified H.264
+  MP4 (1024x1024, 8 frames, 8s, non-corrupt). All 8 frames are byte-
+  identical (same MD5) -- checked honestly, not assumed a bug: the raw
+  sensing feature values (breathing/motion band power, per-node RSSI)
+  genuinely varied between live polls during the capture window (confirmed
+  via direct polls of the live endpoint), but the coarse `Activity` bucket
+  that `build_prompt` actually consumes stayed at `OccupiedMoving` (single
+  occupant) for the entire ~16s window, and a fixed seed + fixed prompt +
+  fixed reference image + fixed strength legitimately produces deterministic
+  output from `fast-sdxl`. This is expected model behavior given a real,
+  genuinely-unchanging coarse state, not fabricated or cached data. Real
+  total spend for this style's validation + capture: 9 real API calls (1
+  connectivity test + 8 capture frames) at fal.ai's `fast-sdxl`-class
+  per-image pricing (order of $0.02-0.03/image per public pricing pages),
+  well under the $20 budget set for this work.

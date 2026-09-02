@@ -32,6 +32,17 @@ enum Style {
     /// Clean technical/dashboard line-art. Literal room depiction, abstracted
     /// into an occupancy-status diagram rather than a photoreal scene.
     Minimal,
+    /// Matches RuView's own marketing hero graphic via image-to-image style
+    /// reference: a glowing cyan/blue sci-fi data-overlay aesthetic with a
+    /// visible human pose-skeleton figure, WiFi signal arcs, and floating
+    /// vital-sign readouts. UNLIKE every other style here, this ONE
+    /// deliberately depicts a literal human silhouette with body-tracking
+    /// overlay, a materially different, weaker privacy posture than
+    /// `Abstract`. The figure is fal.ai's own synthetic generation, not a
+    /// reproduction of any real person's likeness, but callers who want to
+    /// avoid any human-figure depiction should prefer `Abstract` instead.
+    /// See docs/adr/ADR-351-*.md for the full privacy-framing note.
+    Branded,
 }
 
 /// Coarse, shared scene-state abstraction. All four styles consume this
@@ -211,6 +222,42 @@ fn build_prompt(style: Style, scene: SceneState) -> String {
                  clinical"
             )
         }
+        Style::Branded => {
+            // Matches RuView's own hero graphic via image-to-image style
+            // reference (see `reference_image_data_uri`). This prompt is
+            // paired with that reference at call time, not used alone.
+            let status_desc = match (scene.activity, scene.multiple_occupants) {
+                (Activity::Vacant, _) => {
+                    "an empty room, WiFi signal arcs radiating from a router, no glowing human \
+                     pose-skeleton figure present, status overlay reading VACANT"
+                }
+                (Activity::OccupiedStill, false) => {
+                    "a room with one glowing cyan pose-skeleton human figure standing still, \
+                     joint markers steady, WiFi signal arcs radiating from a router, floating \
+                     vital-sign readout panels, status overlay reading OCCUPIED - STATIONARY"
+                }
+                (Activity::OccupiedStill, true) => {
+                    "a room with two glowing cyan pose-skeleton human figures standing still, \
+                     joint markers steady on both, WiFi signal arcs radiating from a router, \
+                     floating vital-sign readout panels, status overlay reading MULTIPLE OCCUPANTS - STATIONARY"
+                }
+                (Activity::OccupiedMoving, false) => {
+                    "a room with one glowing cyan pose-skeleton human figure mid-stride in motion, \
+                     joint markers with motion trails, WiFi signal arcs radiating from a router, \
+                     floating vital-sign readout panels, status overlay reading OCCUPIED - ACTIVE"
+                }
+                (Activity::OccupiedMoving, true) => {
+                    "a room with two glowing cyan pose-skeleton human figures in motion, joint \
+                     markers with motion trails on both, WiFi signal arcs radiating from a router, \
+                     floating vital-sign readout panels, status overlay reading MULTIPLE OCCUPANTS - ACTIVE"
+                }
+            };
+            format!(
+                "{status_desc}, dark navy-blue background, glowing cyan and white sci-fi data \
+                 overlay aesthetic, futuristic WiFi sensing visualization, technical HUD readout \
+                 style, high contrast glow, RuView WiFi-DensePose branding aesthetic"
+            )
+        }
     }
 }
 
@@ -237,6 +284,14 @@ struct Cli {
     /// use inside this binary's hot path — pass one explicitly).
     #[arg(long)]
     seed: i64,
+    /// Path to a local reference image for image-to-image style matching.
+    /// Only consumed when `--style branded`; ignored for every other style.
+    #[arg(long)]
+    style_ref_image: Option<PathBuf>,
+    /// Image-to-image strength (0..1, higher = more influenced by the
+    /// prompt vs. the reference image). Only used with `--style branded`.
+    #[arg(long, default_value_t = 0.55)]
+    style_ref_strength: f32,
 }
 
 /// Poll the real live sensing endpoint via SSH loopback (the server is not
@@ -279,17 +334,40 @@ async fn generate_frame(
     fal_key: &str,
     prompt: &str,
     seed: i64,
+    reference_image_data_uri: Option<&str>,
+    reference_strength: f32,
 ) -> Result<Vec<u8>> {
-    let request_body = serde_json::json!({
-        "prompt": prompt,
-        "negative_prompt": NEGATIVE_PROMPT,
-        "num_inference_steps": 6,
-        "image_size": "landscape_16_9",
-        "seed": seed,
-        "format": "jpeg",
-    });
+    let (endpoint, request_body) = match reference_image_data_uri {
+        // Style::Branded: image-to-image against RuView's own hero graphic.
+        // A base64 data: URI is accepted directly in `image_url` -- no
+        // separate fal.ai storage upload call needed, confirmed via a real
+        // test call before this was written.
+        Some(image_url) => (
+            "https://fal.run/fal-ai/fast-sdxl/image-to-image",
+            serde_json::json!({
+                "image_url": image_url,
+                "prompt": prompt,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "strength": reference_strength,
+                "num_inference_steps": 8,
+                "seed": seed,
+                "format": "jpeg",
+            }),
+        ),
+        None => (
+            "https://fal.run/fal-ai/fast-sdxl",
+            serde_json::json!({
+                "prompt": prompt,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "num_inference_steps": 6,
+                "image_size": "landscape_16_9",
+                "seed": seed,
+                "format": "jpeg",
+            }),
+        ),
+    };
     let response = client
-        .post("https://fal.run/fal-ai/fast-sdxl")
+        .post(endpoint)
         .header("Authorization", format!("Key {fal_key}"))
         .json(&request_body)
         .send()
@@ -329,6 +407,20 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cli.out_dir).context("creating output directory")?;
     let client = reqwest::Client::new();
 
+    let reference_image_data_uri: Option<String> = if matches!(cli.style, Style::Branded) {
+        let ref_path = cli
+            .style_ref_image
+            .as_ref()
+            .context("--style-ref-image is required when --style branded")?;
+        let bytes = std::fs::read(ref_path)
+            .with_context(|| format!("reading reference image {}", ref_path.display()))?;
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("data:image/jpeg;base64,{encoded}"))
+    } else {
+        None
+    };
+
     let mut previous_activity: Option<Activity> = None;
     for frame_index in 0..cli.frames {
         let latest = poll_sensing_latest(&cli.sensing_ssh_host)?;
@@ -341,7 +433,15 @@ async fn main() -> Result<()> {
         let prompt = build_prompt(cli.style, scene);
         tracing::info!(frame = frame_index, %prompt, "generating frame");
 
-        let frame_bytes = generate_frame(&client, &fal_key, &prompt, cli.seed).await?;
+        let frame_bytes = generate_frame(
+            &client,
+            &fal_key,
+            &prompt,
+            cli.seed,
+            reference_image_data_uri.as_deref(),
+            cli.style_ref_strength,
+        )
+        .await?;
         let frame_path = cli.out_dir.join(format!("frame_{frame_index:04}.jpg"));
         std::fs::write(&frame_path, &frame_bytes)
             .with_context(|| format!("writing {}", frame_path.display()))?;
