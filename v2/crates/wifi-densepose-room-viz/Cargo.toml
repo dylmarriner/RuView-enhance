@@ -1,0 +1,23 @@
+[package]
+name = "wifi-densepose-room-viz"
+version = "0.1.0"
+edition.workspace = true
+description = "Near-real-time generative room visualization from live RuView sensing state via fal.ai (ADR-351)"
+license.workspace = true
+authors = ["rUv <ruv@ruv.net>", "WiFi-DensePose Contributors"]
+repository.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "room-viz"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tracing = "0.1"
+tracing-subscriber = "0.3"

@@ -28,6 +28,7 @@ members = [
     "crates/wifi-densepose-ruvector",
     "crates/wifi-densepose-desktop",
     "crates/wifi-densepose-pointcloud",
+    "crates/wifi-densepose-room-viz", # ADR-351 -- near-real-time fal.ai room visualization
     # geo + worldgraph extracted to ruvnet/worldgraph submodule (see crates/worldgraph)
     "crates/wifi-densepose-engine",      # ADR-135..146 integration/composition layer
     "crates/wifi-densepose-calibration", # ADR-151 — per-room calibration & specialist training
