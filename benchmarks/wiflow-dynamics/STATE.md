@@ -216,7 +216,78 @@ outside reviewer real time): the test split holds **52,487** valid pairs;
 subsamples. Corrupt files 487–499 are excluded via the committed masks, and PCK
 aggregation is a **single flat mean over frames × keypoints** (not per-frame-then-mean).
 
-Last updated: 2026-09-08 (session start)
+## HOW TO RESUME (added after a resume trial FAILED — see "Resume trial" below)
+
+Everything below is regenerable; nothing here needs a rerun to *read* the results.
+
+**Fixtures are gitignored and a fresh checkout has none.** Regenerate in this order —
+step 1 is Python (the one justified deviation, see below), steps 2+ are Rust:
+
+```bash
+cd benchmarks/wiflow-dynamics
+~/wiflow-std-bench/venv/bin/python scripts/make_fixtures.py      # split idx, preds, GT, sha256 manifest
+~/wiflow-std-bench/venv/bin/python scripts/dump_m3_fixtures.py   # train/val idx, all_gt_clean, pair list
+cd harness
+cargo build --release
+./target/release/prepare        # 15.5 GB CSI -> fixtures/band_features.npy (270 bands), ~1 s cached
+```
+
+**Then, to verify the artifact is intact:**
+
+```bash
+cd benchmarks/wiflow-dynamics/harness
+cargo test --release                      # expect 13 passed (8 eig + 5 retraction)
+./target/release/validate                 # M2; must print verdict PASS, exit 0
+```
+
+**To re-run an experiment** (all write to `../results/`, all seeded):
+
+```bash
+./target/release/m3                       # rungs 1-2: joint Gaussian, M3 + M4      -> m3_m4.json
+./target/release/diag_repr                # representation sweep                    -> repr_diagnostic.txt
+./target/release/rung3                    # rung 3 + oracle + controls (RUNG3_SEED) -> rung3.json
+RUNG3_SEED=7 ./target/release/rung3       # a replication seed                      -> redirect yourself
+./target/release/rung4                    # rung 4: MC-EIG (RUNG4_SEED)             -> rung4.json
+```
+
+### File map — which result belongs to which milestone
+
+| file | milestone | what it holds |
+|---|---|---|
+| `fixtures/manifest.json` | M1/M2 | sha256s + the metrics the fixtures were validated against |
+| `fixtures/reproducibility_floor.json` | M1 | the TF32 measurement establishing the 1.4e-5 floor |
+| `results/m2_validation.json` | **M2** | baseline reproduction, 6 checks |
+| `results/repr_diagnostic.txt` | M3 (pre-work) | the 7-variant representation sweep that refuted my pre-registration |
+| `results/m3_m4.json` | **M3 + M4**, rung 2 | joint Gaussian, EIG policies, diagonalised-NLL annotation |
+| `results/rung3.json` | rung 3 (seed 2026) | heteroscedastic head, oracle, selection control, block bootstrap |
+| `results/rung3_seed7.json` | rung 3 | replication seed 7 — part of the set that retracted the EIG win |
+| `results/rung3_seed101.json` | rung 3 | replication seed 101 |
+| `results/rung3_seed555.json` | rung 3 | replication seed 555 |
+| `results/rung3_undertrained_12ep.json` | rung 3 | the deliberately-kept 12-epoch undertrained run |
+| `results/rung4.json` | rung 4 | value-aware Σ, Monte-Carlo EIG, overconfidence + r=0.039 diagnostics |
+
+### The next action, unambiguously
+
+**All five chartered milestones are complete; rungs 3-4 are beyond charter and both
+failed their pre-registered criteria.** The single highest-value next experiment is the
+**homoscedastic same-backbone control** specified under "Untested controls" below —
+it is the one test that isolates whether per-sample σ carries information at all, and
+it needs no new modelling, only a frozen mean head and a global Σ̂.
+Do **not** start another rung before it.
+
+### Resume trial (RUN, and it FAILED — this section is the fix)
+
+The claim "a later session resumes mid-flight from here" was untested, so I tested it
+mechanically against the committed artifacts. **Three real gaps, all now fixed above:**
+1. **No runnable command existed anywhere in STATE.md** — a reader could not reproduce
+   M2 at all. Fixed by the command blocks above.
+2. **`fixtures/*.npy` are gitignored**, so a fresh checkout has none and `validate`
+   would fail immediately; the regeneration order was undocumented. Fixed.
+3. **Four result files were unmapped** to any milestone (`repr_diagnostic.txt`,
+   `rung3_seed{7,101,555}.json`, `rung4.json`). Fixed by the file map.
+
+Last updated: 2026-09-09 (resume trial + selection/clustering controls)
+Originally started: 2026-09-08
 Worktree: `/home/ruvultra/projects/ruview-worktrees/wiflow-dynamics`
 Branch: `feat/wiflow-action-conditioned-dynamics` (off RuView `d6407ae0`)
 
