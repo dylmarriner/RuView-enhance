@@ -151,6 +151,86 @@ deviation.
    WiFlow-STD contains real CSI→pose signal; the ESP32 set did not demonstrate any.
    This is the honesty bar for every subsequent claim.
 
+## M3/M4 PRE-REGISTRATION (written 2026-09-08 ~22:55, BEFORE any model was fitted)
+
+Pre-registered because this repo's one retracted claim came from a protocol chosen
+after seeing results. Deviations from this section must be recorded as deviations.
+
+### Representation (chosen once, not swept)
+
+- **Bands:** 540 channels → **B = 27 contiguous bands of 20 channels**. Justified by
+  the measured lag-1 channel autocorrelation (0.739): neighbours are correlated, so a
+  contiguous band is a coherent probe unit. Not an antenna factorization — none exists
+  in this data (verified).
+- **Band feature `z`:** per-band mean over its 20 channels, **kept per frame** →
+  `z ∈ R^{27×20} = R^540`. Time is deliberately NOT collapsed: averaging over the
+  20 frames would destroy the motion signal the pose head needs.
+- **Action:** reveal one band = reveal its 20 time-dims together. Budget = K bands.
+- **Pair (t, t+1):** consecutive window indices in the same file (359,500 exist).
+- **Split:** the same seed-42 file-level split as M2, so pose numbers stay comparable
+  to the 75.4% bar.
+
+### Model ladder (each rung must earn the next)
+
+1. **Persistence** — predict `z_{t+1} = z_t`. Measured first. If one-step band
+   dynamics is near-trivial (R² ≈ 0.99), say so plainly; the real content is then the
+   pose conditional, not the dynamics.
+2. **Joint Gaussian** over `(z_t, z_{t+1}, y_{t+1})` (1110-dim), shrinkage `λI` with
+   λ chosen on **val**. Conditioning on any revealed subset is closed-form, so NLL,
+   coverage and EIG are analytic and hand-checkable. **This alone satisfies M3's
+   letter**: it is `p(next observation | which sensors are read)` with calibrated
+   uncertainty.
+3. **Neural heteroscedastic head** (Burn) — attempted only after 1–2 pass. Must beat
+   the joint Gaussian's held-out NLL *and* stay calibrated, or it is reported as
+   not helping.
+
+### Metrics (fixed now)
+
+- **Proper scoring rule:** multivariate Gaussian NLL on held-out (per-dim CRPS if cheap).
+- **Calibration:** empirical coverage of central 50/80/90/95% predictive intervals vs
+  nominal. **Pass = every level within ±3 percentage points.** Report the full curve,
+  never a single scalar.
+- **Point error:** RMSE on `z`, torso-PCK@20 + MPJPE on pose (harness, unchanged).
+
+### Guards extended for M3 (failing checks, not reported numbers)
+
+- **Predicted-mean degeneracy:** std of `μ_{t+1}` across t must exceed 1e-4 — same
+  detector, applied to the dynamics head. A model that predicts one constant next
+  observation must fail.
+- **Must beat persistence** on NLL, and **must beat the joint Gaussian** for the
+  neural rung to be reported as an improvement.
+- **Must beat the 75.4% mean-pose bar** for any pose claim.
+- Improvements smaller than the measured floor (~1.4e-5 PCK@20) are **not** reported
+  as improvements.
+
+### M4 protocol (fixed now)
+
+- Policies compared at **identical budget K**, paired on the same test pairs, seeded:
+  **EIG-greedy** vs **random-K** (mean ± CI over ≥10 seeds) vs **fixed-K**
+  (chosen on **train**, never on test).
+- **Bracketing check — the machinery is wrong if this fails:** an **oracle** policy
+  that peeks at the true `z_{t+1}` to choose S must upper-bound, and random must
+  lower-bound. EIG must sit strictly between them.
+- **EIG unit tests:** EIG ≥ 0; monotone non-decreasing in |S|; greedy matches
+  brute-force on a 5-band synthetic; analytic EIG matches a Monte-Carlo estimate.
+- **EIG target is pose** `y_{t+1}` (the charter's actual question — "which probe most
+  reduces uncertainty about pose"). EIG about unobserved bands is secondary.
+
+### Honesty constraints agreed in advance
+
+- **A homoscedastic Σ makes "EIG-driven" a FIXED policy.** For a Gaussian,
+  EIG(S) = ½ logdet-ratio of covariance blocks — it depends only on Σ, never on the
+  observed values. So with rung 2, the EIG-optimal probe set is the *same at every
+  timestep*, and "EIG vs fixed" compares information-theoretic set selection against
+  naive set selection. That is a legitimate result but it is **NOT adaptive sensing**,
+  and must be reported in those words. Adaptive EIG requires input-dependent
+  `Σ(z_t, mask)` — which is precisely what rung 3 would buy, and the only thing that
+  would license the word "adaptive".
+- **Pose accuracy from band features is NOT comparable to the 96% full-CSI number** —
+  different input abstraction (540 → 27 band means). It is reported against the
+  **75.4% mean-pose bar only**, with that non-comparability stated.
+- Nothing here is a causal intervention (see "Framing that must not drift").
+
 ## Reporting rules
 
 Every number states **MEASURED** (by this work, this run, command shown) or **CITED**
