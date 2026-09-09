@@ -360,7 +360,9 @@
     ],
     "mpjpe": 0.020734599625430342,
     "pck@20": 0.8194666666666667,
-    "pose_nll": -113.28574954390666
+    "pose_nll": -113.28574954390666,
+    "pose_nll_diagonalised": -81.92434795347855,
+    "pose_nll_diagonalised_note": "off-diagonals zeroed -- the like-for-like comparison against rung 3's diagonal head. Annotation, not a criterion."
   },
   "shrinkage": {
     "chosen_on": "val",

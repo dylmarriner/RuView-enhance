@@ -174,6 +174,24 @@ fn main() {
     let mu_verdict = check_constant_pose(&mu_series, test_eval.len());
     mu_verdict.assert_ok("joint-Gaussian dynamics head");
 
+    // Diagonalised rung-2 NLL: zero the off-diagonals of the pose posterior and
+    // rescore. Rung 3's head is diagonal, so THIS is the like-for-like comparison
+    // against it. Annotation only -- the pre-registered criterion still uses the full
+    // covariance, and is not being rewritten.
+    let full_cov = model.pose_posterior_cov(&[]).unwrap();
+    let mut diag_cov = nalgebra::DMatrix::<f64>::zeros(POSE_DIM, POSE_DIM);
+    for i in 0..POSE_DIM {
+        diag_cov[(i, i)] = full_cov[(i, i)];
+    }
+    let mut diag_nll = 0.0f64;
+    for &t in &test_eval {
+        let zt: Vec<f64> = (0..BAND_DIM).map(|i| z[t * BAND_DIM + i] as f64).collect();
+        let mu = model.pose_posterior_mean(&zt, &[], &[]).unwrap();
+        let y = DVector::from_iterator(POSE_DIM, (0..POSE_DIM).map(|i| gt[(t + 1) * POSE_DIM + i] as f64));
+        diag_nll += gaussian_nll(&y, &mu, &diag_cov).unwrap();
+    }
+    let diag_nll = diag_nll / test_eval.len() as f64;
+
     // Mean-pose bar restricted to exactly these evaluation pairs, so the comparison
     // is like-for-like rather than against the M2 whole-split number.
     let bar = mean_pose_bar(gt, &test_eval);
@@ -264,7 +282,10 @@ fn main() {
         "rung1_persistence": { "band_r2": persistence_r2, "band_rmse": persistence_rmse },
         "shrinkage": { "selected_lambda": lambda, "chosen_on": "val", "curve": lambda_curve },
         "rung2_m3_no_probe": {
-            "pose_nll": m3_none.nll, "pck@20": m3_none.pck20, "mpjpe": m3_none.mpjpe,
+            "pose_nll": m3_none.nll,
+            "pose_nll_diagonalised": diag_nll,
+            "pose_nll_diagonalised_note": "off-diagonals zeroed -- the like-for-like \
+                comparison against rung 3's diagonal head. Annotation, not a criterion.", "pck@20": m3_none.pck20, "mpjpe": m3_none.mpjpe,
             "coverage": m3_none.coverage
         },
         "honesty_bar_on_same_pairs": { "pck@20": bar.0, "mpjpe": bar.1 },

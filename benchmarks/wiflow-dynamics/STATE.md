@@ -16,13 +16,30 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
 4. **Measurement refuted my own pre-registered representation.** "27 bands x 20 frames,
    never collapse time" was the *worst* of seven variants and the only one failing the
    bar. Pose signal lives in fine channel structure; time resolution barely matters.
-5. **The primitive works, with per-sample adaptive probing:** rung 3 reaches PCK@20
-   0.9425 (bar 0.7557) and EIG-greedy beats random by **3–5 SE at every budget**, with
-   19,653 distinct probe sets across 20,000 samples (rung 2 had exactly 1).
-6. **But rung 3 FAILS its own pre-registered pass condition** (2 of 3 criteria): its
-   joint NLL and its calibration are both worse than rung 2's. **No calibrated-
-   uncertainty claim may be made from rung 3.** Next step: low-rank + diagonal
-   covariance head, and a heavier-tailed predictive.
+5. **Point accuracy: rung 3 reaches PCK@20 ≈0.942 (bar 0.7557, +18.7 pts)**, stable
+   across three seeds — but this comes **entirely from the nonlinear mean head on
+   `z_t`**, not from the probing.
+6. **PROBING DOES NOT HELP — it monotonically HURTS, significantly.** Paired against
+   *not probing at all*, EIG-greedy scores t = −1.42, **−5.04, −8.54, −10.16** at
+   K = 1, 3, 6, 9. Every policy at every budget is ≤ the no-probe number. Honest M4
+   statement: *revealing time-averaged `z_{t+1}` bands adds no measurable information
+   about `y_{t+1}` beyond `z_t` in either model class; probing actively costs
+   accuracy, and more probing costs more.* The +18.7 pts is the nonlinear mean head;
+   the action-conditioning contributes **nothing or less than nothing**.
+7. **Rung 3 FAILS ALL THREE of its pre-registered criteria.** An apparent
+   "EIG beats random by 3–5 SE" result was produced by a single **unseeded**
+   initialisation and **did not replicate** across three seeds — retracted within this
+   session. **No calibrated-uncertainty claim may be made from rung 3.** Measured, not
+   speculated: diagonalising rung 2's covariance gives NLL −81.92 vs rung 3's ≈−98, so
+   heteroscedasticity does pay on marginals; rung 2 won on joint NLL via its full
+   30×30 covariance. Next: low-rank + diagonal head, heavier-tailed predictive.
+8. **The open question this leaves** (do not resolve by assertion): is the missing
+   information absent, or merely unreachable by this architecture? Persistence R²
+   0.871 says 87% of `z_{t+1}` is already implied by `z_t`, which argues *absent*.
+   Rung 2's target-peeking bound argued *some exists*. The discriminating experiment
+   is a target-peeking bound **at rung 3**: if even an oracle cannot beat no-probe,
+   the marginal information is not there and the primitive's value must come from a
+   different observation definition than time-averaged bands.
 
 **Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
 number** — different input abstraction (540 raw channels x 20 frames → 270 band means)
@@ -369,11 +386,49 @@ property of the model class, not of information-gain probing.* Once `Σ` depends
    linear-Gaussian predictor fixed. A better predictor moves the whole curve; the bound
    was never a bound on all models.
 
-**Net:** the charter's M3/M4 primitive is demonstrated end-to-end — action-conditioned
-prediction with per-sample adaptive, information-gain-driven probe selection that
-measurably beats random and fixed at matched budget. The uncertainty is **not**
-calibrated to the pre-registered standard, so the "calibrated uncertainty" half of M3
-is met only by rung 2 (3 of 4 levels), and by rung 3 not at all.
+### RETRACTION WITHIN THIS SESSION — the rung-3 EIG result did not replicate
+
+The run above was **unseeded**: `LinearConfig::init` draws from Burn's global RNG,
+which I had not seeded (my LCG covered masks and shuffles only). After seeding it and
+rerunning across **three initialisations (2026, 7, 101)**:
+
+| seed | no-probe PCK@20 | pose NLL | t(greedy−noprobe) @K=1,3,6,9 | t(greedy−random) @K=1,3,6,9 |
+|---|---|---|---|---|
+| 2026 | 0.9424 | −97.17 | −1.42, −5.04, −8.54, −10.16 | +0.94, −0.56, −3.70, −1.67 |
+| 7 | 0.9375 | −94.88 | −2.80, −5.02, −8.69, −9.78 | +0.03, −1.47, −2.56, −2.92 |
+| 101 | 0.9452 | −102.02 | −3.24, −7.20, −12.73, −15.37 | +1.29, +1.53, −0.25, +0.39 |
+
+1. **The "EIG-greedy beats random by 3–5 SE" claim is RETRACTED.** It came from a
+   single unseeded initialisation. Across three seeds the sign is not stable
+   (K=3: −0.56 / −1.47 / **+1.53**; K=9: −1.67 / −2.92 / **+0.39**). **Criterion 3
+   does not reproduce**, so rung 3 fails **all three** pre-registered criteria, not two.
+   This is exactly the failure mode the charter warns about, caught by seeding and
+   replication rather than by a single lucky run.
+2. **"Probing hurts" is robust and is the real finding.**
+   `any_budget_where_eig_greedy_beats_no_probe_by_2se` is **false on every seed**, and
+   t(greedy−noprobe) is large and negative at every K ≥ 3 on every seed, growing
+   monotonically worse with budget (to −15.4). Revealing more costs more.
+3. **Point accuracy is robust:** no-probe PCK@20 = 0.9424 / 0.9375 / 0.9452
+   (mean ≈0.942 vs bar 0.7557). The +18.7 pts is real and comes entirely from the
+   nonlinear mean head on `z_t`.
+4. **The NLL caveat is now MEASURED, not speculated.** Diagonalising rung 2's pose
+   posterior (zeroing off-diagonals — the like-for-like comparison against rung 3's
+   diagonal head) gives **−81.92**, versus rung 3's ≈−94.9 to −102.0. So
+   heteroscedasticity *does* pay off on the marginals; rung 2's advantage on joint NLL
+   came from its **full 30×30 covariance** capturing cross-keypoint correlation.
+   Criterion 1 as written still **FAILS** — it is not being rewritten — but the fix is
+   a low-rank + diagonal head, not abandoning heteroscedasticity.
+
+**Net, corrected:** the machinery is built, unit-tested and validated, and the
+nonlinear dynamics head is a large robust win on point accuracy. But **the charter's
+central premise does not hold for this observation definition**: information-gain-driven
+probing of time-averaged `z_{t+1}` bands does not beat not probing, in either model
+class, on any seed. Rung 3 fails all three of its pre-registered criteria. The
+"calibrated uncertainty" half of M3 is met only by rung 2 (3 of 4 coverage levels).
+
+**Reproducibility note (M5):** rung-3 numbers are now seeded (`RUNG3_SEED`, default
+2026) and reproducible. The earlier unseeded run is preserved as
+`results/rung3_undertrained_12ep.json`; per-seed results are `results/rung3_seed*.json`.
 
 ## Reporting rules
 

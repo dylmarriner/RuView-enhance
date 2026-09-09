@@ -139,6 +139,10 @@ fn main() {
     let test_pairs = subsample(&build_pairs(&splits[2], &masks, &w2f), 20_000, 999);
 
     let device = NdArrayDevice::default();
+    // Seed Burn's global RNG: LinearConfig::init draws from it, so without this the
+    // run is not reproducible even though masks and shuffles use a seeded LCG.
+    let init_seed: u64 = std::env::var("RUNG3_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(2026);
+    <B as burn::tensor::backend::Backend>::seed(&device, init_seed);
     let mut model: HeteroModel<B> = HeteroModel::new(&device, 512, 256);
     let mut opt = AdamConfig::new().init();
     let mut rng = Rng(2026);
@@ -213,6 +217,11 @@ fn main() {
         let fx_e = evaluate(&inf, z, gt, &test_pairs, &vec![fixed.clone(); test_pairs.len()], &device);
 
         let (d, se, t) = paired(&g.per_sample, &rd.per_sample);
+        let (dgf, segf, tgf) = paired(&g.per_sample, &fx_e.per_sample);
+        // The comparison the charter actually turns on: does probing beat NOT probing?
+        let (dn_g, sen_g, tn_g) = paired(&g.per_sample, &no_probe.per_sample);
+        let (dn_r, sen_r, tn_r) = paired(&rd.per_sample, &no_probe.per_sample);
+        let (dn_f, sen_f, tn_f) = paired(&fx_e.per_sample, &no_probe.per_sample);
         // How often does the per-sample EIG set actually differ from the modal one?
         let mut counts = std::collections::HashMap::new();
         for s in &eig_sets {
@@ -224,6 +233,13 @@ fn main() {
             "pck@20": { "eig_greedy": g.pck20, "random": rd.pck20, "fixed": fx_e.pck20 },
             "pose_nll": { "eig_greedy": g.nll, "random": rd.nll, "fixed": fx_e.nll },
             "paired_greedy_minus_random": { "delta": d, "se": se, "t": t, "beats_by_2se": t > 2.0 },
+            "paired_greedy_minus_fixed": { "delta": dgf, "se": segf, "t": tgf },
+            "vs_no_probe": {
+                "note": "positive t means probing BEATS not probing at all",
+                "greedy_minus_noprobe": { "delta": dn_g, "se": sen_g, "t": tn_g },
+                "random_minus_noprobe": { "delta": dn_r, "se": sen_r, "t": tn_r },
+                "fixed_minus_noprobe":  { "delta": dn_f, "se": sen_f, "t": tn_f }
+            },
             "adaptivity": {
                 "distinct_probe_sets": counts.len(),
                 "modal_set_fraction": modal as f64 / eig_sets.len() as f64,
@@ -243,6 +259,9 @@ fn main() {
         .iter()
         .any(|p| p["paired_greedy_minus_random"]["beats_by_2se"].as_bool().unwrap_or(false));
 
+    let any_probe_beats_noprobe = policies.iter().any(|p| {
+        p["vs_no_probe"]["greedy_minus_noprobe"]["t"].as_f64().unwrap_or(0.0) > 2.0
+    });
     let verdict = if nll_ok && cov_ok && eig_ok {
         "PASS -- rung 3 helped on all three pre-registered criteria"
     } else {
@@ -252,6 +271,7 @@ fn main() {
     let report = serde_json::json!({
         "milestone": "Rung 3 -- neural heteroscedastic head. MEASURED by harness/src/bin/rung3.rs, this run.",
         "backend": "burn-ndarray (CPU), by design -- see STATE.md rung-3 pre-registration",
+        "init_seed": init_seed,
         "training": { "epochs": epochs, "batch": batch, "lr": lr, "train_pairs": train_pairs.len(),
                       "history": history },
         "no_probe": { "pose_nll": no_probe.nll, "pck@20": no_probe.pck20,
@@ -265,6 +285,13 @@ fn main() {
             "2_coverage_within_3pp_all_levels": cov_ok,
             "3_eig_beats_random_by_2se": eig_ok,
             "rung2_best_pck_for_reference": RUNG2_BEST_PCK
+        },
+        "does_probing_help_at_all": {
+            "any_budget_where_eig_greedy_beats_no_probe_by_2se": any_probe_beats_noprobe,
+            "no_probe_pck@20": no_probe.pck20,
+            "note": "If false, EIG is selecting the LEAST HARMFUL probes rather than \
+                     helpful ones -- revealing time-averaged z_{t+1} bands adds no \
+                     measurable information about y_{t+1} beyond z_t."
         },
         "verdict": verdict
     });
