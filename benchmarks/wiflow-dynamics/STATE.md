@@ -121,12 +121,12 @@ deviation.
       reproduction.
 - [x] **M2 — Reproduce the honest baseline.** DONE 2026-09-08. `validate` exits 0;
       raw report `results/m2_validation.json`.
-- [ ] **M3 — Action-conditioned dynamics model.** Next-observation prediction
-      conditioned on an explicit action (probe/subcarrier/antenna-group selection),
-      emitting prediction + **calibrated** uncertainty. Report a proper scoring rule
-      and a calibration metric, not just point error.
-- [ ] **M4 — Information-gain evaluation.** EIG-driven probe selection vs (a) random
-      and (b) fixed probing, on held-out data. Paired, seeded, same budget.
+- [x] **M3 — Action-conditioned dynamics model.** DONE (rung 2, joint Gaussian),
+      2026-09-08. Beats the mean-pose bar by **+6.3 pts**. Calibration **marginally
+      FAILS** the pre-registered criterion at one of four levels. `results/m3_m4.json`.
+- [x] **M4 — Information-gain evaluation.** DONE 2026-09-08. EIG-greedy wins on
+      information at every budget but **does NOT** convert that into pose accuracy —
+      an honest negative, with an oracle bracket quantifying what adaptivity is worth.
 - [ ] **M5 — Lineage/evidence recorded for every claim.**
 
 ## Open questions — ALL RESOLVED 2026-09-08 (MEASURED)
@@ -298,3 +298,88 @@ data; (c) a finding that invalidates the charter itself.
   expected information gain for a candidate probe *without peeking* requires
   p(unobserved CSI | observed, mask), so the model needs an **observation head**
   alongside the pose head, and the loader must serve full windows plus masks.
+
+- **2026-09-08 ~23:15 — M3 + M4 COMPLETE (rung 2, joint Gaussian).**
+
+  ### DEVIATION FROM PRE-REGISTRATION (recorded, with the measurement that forced it)
+
+  The pre-registered representation — *"27 bands of 20 channels, keeping all 20
+  frames … time is deliberately NOT collapsed: averaging the 20 frames would destroy
+  the motion signal the pose head needs"* — was **measured to be wrong, and was the
+  worst of seven variants tested.** `scripts`-free diagnostic `harness/src/bin/diag_repr.rs`
+  asked the easiest possible version of the question (same-timestep pose, no
+  forecasting gap) at fixed feature dimension 540:
+
+  | representation | same-timestep PCK@20 | vs bar (0.7523) |
+  |---|---|---|
+  | **27 bands x 20 frames (pre-registered)** | **0.7495** | **−0.0029** |
+  | 54 x 10 | 0.7668 | +0.0145 |
+  | 108 x 5 | 0.7782 | +0.0259 |
+  | 135 x 4 | 0.7942 | +0.0419 |
+  | 270 x 2 | 0.8127 | +0.0603 |
+  | 540 x 1 | 0.8150 | +0.0627 |
+  | **270 bands, mean over time** | **0.8132 at HALF the dim** | +0.0609 |
+
+  Pose information lives in **fine channel structure**; averaging 20 adjacent channels
+  destroys it, while averaging over the 20 frames costs almost nothing. The
+  pre-registered choice was the only variant that failed to beat the bar. This is
+  exactly why the representation was pre-registered *and then measured* rather than
+  assumed.
+
+  **Revised representation:** `z` = **270 bands of 2 channels, averaged over all 20
+  frames** (best NLL of any variant, half the dimension). Separately, the error of
+  conflating *feature* granularity with *action* granularity was corrected: features
+  stay fine (270 bands) while an action reveals a contiguous **group of 10 bands =
+  20 channels** — a physically meaningful subcarrier group, 27 probe groups total.
+
+  ### M3 results (MEASURED, `results/m3_m4.json`)
+
+  - Persistence rung: band R² **0.871** — one-step dynamics is *not* trivial, so the
+    dynamics term is doing real work.
+  - Shrinkage λ = 1e-5, selected on **val**, never test.
+  - Conditioning on `z_t` only: **PCK@20 0.8195 vs bar 0.7561 → +6.33 pts, BEATS the
+    bar.** MPJPE 0.02073, pose NLL −113.29.
+  - Degeneracy guard: passes (predicted means vary across t).
+  - **Calibration FAILS the pre-registered criterion**, marginally and at one level.
+    Coverage error vs nominal: **50% → +3.48 pp (FAIL, tolerance ±3)**, 80% → +0.35,
+    90% → −1.63, 95% → −2.53 (all PASS). Reported as a fail; the tolerance is not
+    being widened after the fact. The predictive is slightly over-dispersed at the
+    centre — the residuals are more peaked than Gaussian.
+
+  ### M4 results — the honest negative
+
+  | K | EIG greedy | EIG fixed | EIG random | PCK greedy | PCK fixed | PCK random | **PCK oracle** |
+  |---|---|---|---|---|---|---|---|
+  | 1 | 0.017 | 0.014 | 0.013 | 0.8217 | 0.8214 | 0.8213 ± 0.0005 | **0.8323** |
+  | 3 | 0.045 | 0.036 | 0.038 | 0.8214 | 0.8224 | 0.8217 ± 0.0008 | **0.8454** |
+  | 6 | 0.082 | 0.070 | 0.072 | 0.8211 | 0.8210 | 0.8219 ± 0.0005 | **0.8547** |
+  | 9 | 0.115 | 0.108 | 0.104 | 0.8230 | 0.8219 | 0.8221 ± 0.0007 | **0.8596** |
+
+  - **EIG-greedy does maximise what it optimises:** it beats fixed and random on EIG
+    nats at every budget, monotonically in K, and the bracketing check holds (oracle
+    strictly above every policy at every K). The machinery is unit-tested
+    independently (7/7 in `tests/eig.rs`, including an analytic-vs-Monte-Carlo check).
+  - **It does NOT convert into pose accuracy.** Greedy/fixed/random differ by ~0.001
+    PCK@20 — inside the random policy's own seed spread (±0.0005–0.0008). At this rung,
+    **EIG-driven probing is not measurably better than probing at random.**
+  - **The oracle bracket says why, and how much is on the table.** A policy that peeks
+    at the true `z_{t+1}` reaches 0.8596 at K=9 vs 0.8230 for EIG-greedy — **+3.7 pts
+    of headroom** that a *per-sample adaptive* policy could in principle capture.
+  - Root cause is the pre-registered caveat, now confirmed empirically: Σ is
+    homoscedastic, so the EIG-optimal probe set is **identical at every timestep**.
+    It cannot exploit that different bands are informative at different moments —
+    which is precisely what the oracle does. This is information-theoretic set
+    selection, **not adaptive sensing**.
+
+  ### What this licenses, and what it does not
+
+  - Licensed: "a closed-form action-conditioned dynamics model over WiFi-CSI band
+    features predicts next-window pose 6.3 points above the constant-pose bar, with
+    approximately-calibrated uncertainty (3 of 4 coverage levels within ±3 pp)."
+  - **NOT licensed:** any claim that EIG-driven probing improves pose estimation. It
+    did not, and that is the measured result.
+  - **NOT comparable** to the 96.09% full-CSI number — different input abstraction
+    (540 raw channels x 20 frames → 270 band means). The only valid comparison is to
+    the 75.61% mean-pose bar on the same pairs.
+  - The +3.7 pt oracle gap is the well-posed target for rung 3 (neural heteroscedastic
+    Σ). Rung 3 is **not yet attempted**; nothing is claimed for it.

@@ -1,0 +1,14 @@
+SAME-TIMESTEP pose from band features (no forecasting gap).
+train 40000 / test 10000 windows
+
+27 bands x 20 frames (M3 choice)   dim   540  PCK@20 0.7495  (bar 0.7523, delta -0.0029)  MPJPE 0.02525  NLL -111.06
+27 bands x 4 frames                dim   108  PCK@20 0.7508  (bar 0.7523, delta -0.0015)  MPJPE 0.02517  NLL -111.13
+54 bands x 10 frames               dim   540  PCK@20 0.7668  (bar 0.7523, delta +0.0145)  MPJPE 0.02428  NLL -111.71
+108 bands x 5 frames               dim   540  PCK@20 0.7782  (bar 0.7523, delta +0.0259)  MPJPE 0.02329  NLL -112.41
+135 bands x 4 frames               dim   540  PCK@20 0.7942  (bar 0.7523, delta +0.0419)  MPJPE 0.02210  NLL -112.79
+270 bands x 2 frames               dim   540  PCK@20 0.8127  (bar 0.7523, delta +0.0603)  MPJPE 0.02111  NLL -113.08
+540 channels x 1 frame             dim   540  PCK@20 0.8150  (bar 0.7523, delta +0.0627)  MPJPE 0.02082  NLL -112.35
+540 channels, MEAN over frames     dim   540  PCK@20 0.8140  (bar 0.7523, delta +0.0617)  MPJPE 0.02092  NLL -112.09
+270 bands, MEAN over frames        dim   270  PCK@20 0.8132  (bar 0.7523, delta +0.0609)  MPJPE 0.02106  NLL -113.16
+135 bands, MEAN over frames        dim   135  PCK@20 0.7956  (bar 0.7523, delta +0.0433)  MPJPE 0.02207  NLL -112.88
+540 ch mean + 540 ch frame0 is not tested here dim    27  PCK@20 0.7514  (bar 0.7523, delta -0.0009)  MPJPE 0.02515  NLL -111.13

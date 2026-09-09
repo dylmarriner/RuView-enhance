@@ -20,6 +20,8 @@
 //! So the forward pass is not bit-reproducible, and **no improvement smaller than
 //! ~1.4e-5 PCK@20 is a real improvement**.
 
+pub mod bands;
+pub mod gaussian;
 pub mod guards;
 pub mod metrics;
 pub mod npy;
