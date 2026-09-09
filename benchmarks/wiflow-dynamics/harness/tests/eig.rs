@@ -183,3 +183,50 @@ fn gaussian_nll_is_minimised_at_the_true_mean() {
     let expect = 0.5 * (d as f64 * (2.0 * std::f64::consts::PI).ln() + logdet(&cov).unwrap());
     assert!((at_mean - expect).abs() < 1e-10);
 }
+
+/// Does post-hoc recalibration of the variance head change EIG's RANKING?
+///
+/// This matters because the obvious next fix -- temperature-scale the variance head
+/// so coverage passes, then re-run EIG -- would be a null experiment if the answer is
+/// no. EIG(S) = H(before) - H(after S) = 0.5 * sum_i [log s2_i(M) - log s2_i(M u S)].
+/// Recalibration that depends only on the dimension index adds the same constant to
+/// both terms, so it must cancel exactly.
+///
+/// Verified computationally rather than trusted, since it drives a recommendation.
+#[test]
+fn eig_is_invariant_to_dimension_wise_recalibration() {
+    // Simulate a diagonal predictive: log-variances per pose dim, before and after
+    // probing each of several candidate sets.
+    let mut rng = Rng(0xCA11B);
+    let dims = 30usize;
+    let before: Vec<f64> = (0..dims).map(|_| rng.normal()).collect();
+    let after: Vec<Vec<f64>> = (0..6)
+        .map(|_| (0..dims).map(|_| rng.normal() - 0.5).collect())
+        .collect();
+
+    let eig = |b: &[f64], a: &[f64]| -> f64 {
+        0.5 * (0..dims).map(|i| b[i] - a[i]).sum::<f64>()
+    };
+    let raw: Vec<f64> = after.iter().map(|a| eig(&before, a)).collect();
+
+    // Any per-dimension offset: a global temperature is the special case c_i = c.
+    let offsets: Vec<f64> = (0..dims).map(|_| 2.0 * rng.normal()).collect();
+    let b_cal: Vec<f64> = before.iter().zip(&offsets).map(|(v, c)| v + c).collect();
+    let cal: Vec<f64> = after
+        .iter()
+        .map(|a| {
+            let ac: Vec<f64> = a.iter().zip(&offsets).map(|(v, c)| v + c).collect();
+            eig(&b_cal, &ac)
+        })
+        .collect();
+
+    for (r, c) in raw.iter().zip(&cal) {
+        assert!(
+            (r - c).abs() < 1e-12,
+            "EIG changed under dimension-wise recalibration: {r} vs {c}"
+        );
+    }
+    // And therefore the argmax -- the actual selection -- is identical.
+    let am = |v: &[f64]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+    assert_eq!(am(&raw), am(&cal), "selected probe set changed under recalibration");
+}

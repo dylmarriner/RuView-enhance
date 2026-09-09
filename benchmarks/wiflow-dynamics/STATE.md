@@ -103,7 +103,26 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
       calibration, the link is established; if it does not, the criterion is
       inadequate for a different reason.
 
-13. **Robustness caveat:** rung 4 is **single-seed (2026)**. Its headline verdict is
+13. **The obvious next fix is a NULL BY CONSTRUCTION — proved, not guessed.**
+    I was about to recommend "temperature-scale the variance head until coverage
+    passes, then re-run EIG". **That experiment cannot produce any change.**
+    `EIG(S) = 0.5 Σ_i [log σ²_i(M) − log σ²_i(M ∪ S)]` — any recalibration whose
+    offset depends only on the dimension index (a global temperature is the special
+    case) adds the same constant to both terms and cancels exactly. Verified
+    computationally in `tests/eig.rs::eig_is_invariant_to_dimension_wise_recalibration`
+    (8/8 pass), including that the arg-max — the actual probe selection — is identical.
+    **Consequence, and it redirects the whole line of work:** EIG only ever sees
+    *differences between masks*, so the variance head's failure here is in its
+    **mask-dependence**, not its overall scale. Marginal-calibration fixes
+    (temperature scaling, per-dimension recalibration, isotonic on the marginals)
+    are all provably useless for this. The fix has to make `σ²(z_t, mask)` correctly
+    *responsive to which bands are revealed* — a modelling problem, not a
+    post-processing one. Candidates: train the variance head with an explicit
+    mask-contrastive objective, or drop the diagonal assumption so the covariance can
+    express which revealed dims actually constrain which pose dims.
+    (This supersedes the "post-hoc temperature scaling" next step in item 11–12.)
+
+14. **Robustness caveat:** rung 4 is **single-seed (2026)**. Its headline verdict is
     unlikely to flip (t = −9.07 against no-probe), but the diagnostic ratios in item 11
     and the correlation in item 12 have not been replicated across seeds. Rung 3
     taught exactly this lesson. Treat items 11–12 as one-seed measurements.
