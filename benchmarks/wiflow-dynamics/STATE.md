@@ -311,6 +311,47 @@ coverage protocol, same policies and paired tests. Nothing about the harness mov
 recorded as "not attempted / incomplete", never as a partial claim. Rung 3 is
 optional; the charter is already satisfied by rungs 1–2.
 
+### RUNG 4 PRE-REGISTRATION (written 2026-09-09 ~00:00, BEFORE the model was written)
+
+**Why this exists:** the rung-3 target-peeking bound proved the information is present
+(+2.9 pts at K=9, t=+22.3) and that closed-form EIG cannot reach it (−0.4 pts). The
+diagnosis is specific: my rung-3 variance head is **blind to revealed values** by
+design, so it can only express *"how much would set S teach me on average"*, never
+*"how much did these particular values teach me"*. The bound shows probe value is
+**value-dependent**. Rung 4 removes exactly that limitation.
+
+**Architecture change (the whole point):**
+- **Variance head now SEES revealed values** — `(z_t, mask ⊙ z_{t+1}, mask) → log σ²_y`.
+- **New observation head** — `(z_t, mask ⊙ z_{t+1}, mask) → (μ_z, log σ²_z)` over the
+  270 next-window band dims. This is the piece the original M3/M4 design constraint
+  called for and that rung 3 traded away for closed-form tractability.
+- Trained jointly: pose NLL + observation NLL, random masks per sample.
+
+**EIG is now Monte-Carlo, and must be** (a closed form no longer exists, which is the
+price of value-dependence):
+```
+H_before = 0.5 * sum_i log sigma^2_y(z_t, M, revealed)
+for m in 1..M:  sample z_S^(m) ~ p(z_{t+1}[S] | z_t, M, revealed)   # observation head
+                H_m = 0.5 * sum_i log sigma^2_y(z_t, M u S, revealed u z_S^(m))
+EIG(S) = H_before - mean_m(H_m)
+```
+Still **peek-free**: candidate values are *sampled from the model*, never read from the
+future. M = 4 samples, K in {3, 9}, 5,000 eval pairs (cost-bounded; same pairs for
+every policy and for the bound).
+
+**Pass condition, fixed now — rung 4 helps only if BOTH:**
+1. MC-EIG-greedy **beats no-probe** by >2 SE at some budget (rung 3 failed this: it
+   *hurt* by 5–15 SE); **and**
+2. MC-EIG-greedy beats **random** at the same budget by >2 SE, replicated across
+   **≥3 seeds with a consistent sign** (the bar rung 3's retracted claim failed).
+
+Anything less is reported as **"rung 4 did not close the gap"**, with the fraction of
+the oracle gap it did close stated as a measurement. The target-peeking bound is
+recomputed on the same pairs as the reference ceiling.
+
+**Not a criterion change:** rungs 1–3 and their verdicts are untouched. Rung 4 is a new
+experiment with its own pre-registration, not a re-scoring of an earlier one.
+
 ### Honesty constraints agreed in advance
 
 - **A homoscedastic Σ makes "EIG-driven" a FIXED policy.** For a Gaussian,
