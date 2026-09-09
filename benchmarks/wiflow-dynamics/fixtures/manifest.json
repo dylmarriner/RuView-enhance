@@ -1,0 +1,99 @@
+{
+  "generated_by": "benchmarks/wiflow-dynamics/scripts/make_fixtures.py",
+  "checkpoint": "/home/ruvultra/wiflow-std-bench/upstream/test/best_pose_model.pth",
+  "checkpoint_sha256": "4ff10bf8e4545bea259db65b9d2200ba0e38b4d41891d764646376e1557f7be3",
+  "dataset_dir": "/home/ruvultra/wiflow-std-bench/preprocessed_csi_data",
+  "protocol": {
+    "split": "upstream create_preprocessed_train_val_test_loaders, random_seed=42, file-level 70/15/15",
+    "pck": "torso-normalized, NECK_IDX=2 PELVIS_IDX=12, clamp(min=0.01), flat mean over batch x keypoints",
+    "gt": "all_keypoints.npy (already 15-kp and already scaled); enable_temporal_clean=True"
+  },
+  "metrics_measured": {
+    "test_full": {
+      "f64_canonical": {
+        "samples": 54000,
+        "mpjpe": 0.00983551750663296,
+        "pck@10": 0.8686259259259259,
+        "pck@20": 0.9608876543209877,
+        "pck@30": 0.9789061728395062,
+        "pck@40": 0.985795061728395,
+        "pck@50": 0.9898827160493827
+      },
+      "f32_batched_256": {
+        "samples": 54000,
+        "mpjpe": 0.009835517505804697,
+        "pck@10": 0.8686259255585848,
+        "pck@20": 0.9608876529269749,
+        "pck@30": 0.9789061739886249,
+        "pck@40": 0.9857950639194912,
+        "pck@50": 0.9898827185984012
+      },
+      "f32_flat": {
+        "samples": 54000,
+        "mpjpe": 0.009835517965257168,
+        "pck@10": 0.8686259388923645,
+        "pck@20": 0.9608876705169678,
+        "pck@30": 0.9789061546325684,
+        "pck@40": 0.9857950806617737,
+        "pck@50": 0.9898827075958252
+      }
+    },
+    "test_clean": {
+      "f64_canonical": {
+        "samples": 52560,
+        "mpjpe": 0.009434072171384327,
+        "pck@10": 0.876986301369863,
+        "pck@20": 0.9661491628614917,
+        "pck@30": 0.9823401826484018,
+        "pck@40": 0.9879058853373922,
+        "pck@50": 0.9911237950279046
+      },
+      "f32_batched_256": {
+        "samples": 52560,
+        "mpjpe": 0.009434072268755377,
+        "pck@10": 0.8769863022698297,
+        "pck@20": 0.9661491623207858,
+        "pck@30": 0.9823401823072855,
+        "pck@40": 0.9879058878352834,
+        "pck@50": 0.9911237983761676
+      },
+      "f32_flat": {
+        "samples": 52560,
+        "mpjpe": 0.009434073232114315,
+        "pck@10": 0.8769863247871399,
+        "pck@20": 0.9661491513252258,
+        "pck@30": 0.9823401570320129,
+        "pck@40": 0.9879058599472046,
+        "pck@50": 0.9911237955093384
+      }
+    }
+  },
+  "metrics_expected_cited": {
+    "test_full": {
+      "samples": 54000,
+      "pck@20": 0.9608815324571398,
+      "mpjpe": 0.009834060806367133
+    },
+    "test_clean": {
+      "samples": 52560,
+      "pck@20": 0.9661454100405608,
+      "mpjpe": 0.009432755044379373
+    }
+  },
+  "float32_accumulation_noise": {
+    "test_full": {
+      "pck@20_accumulation_spread": 1.7589992906685836e-08,
+      "pck@20_vs_recorded": 6.1204698350580955e-06
+    },
+    "test_clean": {
+      "pck@20_accumulation_spread": 1.1536265831502135e-08,
+      "pck@20_vs_recorded": 3.7522802250888887e-06
+    }
+  },
+  "files": {
+    "split_indices.npz": "23d116084127d3feef4af9decf400a18f460e454ad38e81944e54ad40e5c3136",
+    "test_clean_sel.npy": "22f09424890862f0fcbf901701f1db0b98a396195f001c1ead707e8bdf98b258",
+    "test_gt.npy": "5b9d470fcbb536a9aa6d41bba8a010d0ccfad53e40ccafc96417245dc6001495",
+    "test_pred.npy": "5ec02637ca3f95eef40e9db0155e16163772bf36363a30defe47d05b7e73aeb6"
+  }
+}

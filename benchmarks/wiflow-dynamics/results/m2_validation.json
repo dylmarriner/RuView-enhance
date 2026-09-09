@@ -1,0 +1,126 @@
+{
+  "checks": {
+    "clean.mpjpe": {
+      "delta": 1.3171270052455414e-6,
+      "got": 0.009434072171384618,
+      "pass": true,
+      "recorded": 0.009432755044379373,
+      "tolerance": 0.00001
+    },
+    "clean.pck@20": {
+      "delta": 3.7528209309023453e-6,
+      "got": 0.9661491628614917,
+      "pass": true,
+      "recorded": 0.9661454100405608,
+      "tolerance": 0.00002
+    },
+    "corruption_masks": {
+      "big_windows": 9072,
+      "clean_test_windows": 52560,
+      "nan_windows": 9070,
+      "pass": true,
+      "selector_matches_fixture": true,
+      "union": 9072
+    },
+    "full.mpjpe": {
+      "delta": 1.4567002662516093e-6,
+      "got": 0.009835517506633385,
+      "pass": true,
+      "recorded": 0.009834060806367133,
+      "tolerance": 0.00001
+    },
+    "full.pck@20": {
+      "delta": 6.1218638478521825e-6,
+      "got": 0.9608876543209877,
+      "pass": true,
+      "recorded": 0.9608815324571398,
+      "tolerance": 0.00002
+    },
+    "gt_reconstruction": {
+      "mismatches_after_clean": 0,
+      "mismatches_before_clean": 8098,
+      "note": "independent Rust .npy read + zero-clean must equal the Python-dumped GT bit-for-bit",
+      "pass": true
+    }
+  },
+  "degeneracy_guard": {
+    "degenerate": false,
+    "pred_std": 0.025897703945664912,
+    "threshold": 0.0001
+  },
+  "honesty_bar_mean_pose": {
+    "model_beats_oracle_bar": true,
+    "model_pck@20": 0.9608876543209877,
+    "note": "On the ESP32 set (RESULTS.md measurement b) the mean-pose bar was 95.9% and nothing beat it. This is the equivalent number for WiFlow-STD.",
+    "test_fitted_oracle": {
+      "mpjpe": 0.026154468885861978,
+      "pck@20": 0.7545851851851851
+    },
+    "train_fitted": {
+      "mpjpe": 0.026071531376584203,
+      "pck@20": 0.7537086419753086
+    }
+  },
+  "measured_by": "harness/src/bin/validate.rs (this run)",
+  "milestone": "M2 -- reproduce the honest baseline through the Rust harness",
+  "reproducibility_floor": {
+    "basis": "MEASURED by scripts/diag_reproducibility_floor.py: TF32 on/off alone moves PCK@20 by 1.36e-5; the recorded value lies between the two runs",
+    "mpjpe": 0.00001,
+    "pck@20": 0.00002
+  },
+  "scores": {
+    "test_clean": {
+      "mpjpe": 0.009434072171384618,
+      "pck": [
+        [
+          "pck@10",
+          0.876986301369863
+        ],
+        [
+          "pck@20",
+          0.9661491628614917
+        ],
+        [
+          "pck@30",
+          0.9823401826484018
+        ],
+        [
+          "pck@40",
+          0.9879058853373922
+        ],
+        [
+          "pck@50",
+          0.9911237950279046
+        ]
+      ],
+      "samples": 52560
+    },
+    "test_full": {
+      "mpjpe": 0.009835517506633385,
+      "pck": [
+        [
+          "pck@10",
+          0.8686259259259259
+        ],
+        [
+          "pck@20",
+          0.9608876543209877
+        ],
+        [
+          "pck@30",
+          0.9789061728395062
+        ],
+        [
+          "pck@40",
+          0.985795061728395
+        ],
+        [
+          "pck@50",
+          0.9898827160493827
+        ]
+      ],
+      "samples": 54000
+    }
+  },
+  "verdict": "PASS"
+}

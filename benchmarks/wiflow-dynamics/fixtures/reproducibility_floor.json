@@ -1,0 +1,27 @@
+{
+  "question": "is the 6.1e-6 PCK@20 gap vs eval_retrained.json protocol drift or numeric floor?",
+  "recorded_2026_06_10": {
+    "pck@20_full": 0.9608815324571398,
+    "mpjpe_full": 0.009834060806367133
+  },
+  "tf32_on": {
+    "mpjpe": 0.00983551750663296,
+    "pck@20": 0.9608876543209877
+  },
+  "tf32_off": {
+    "mpjpe": 0.009829798604105376,
+    "pck@20": 0.9608740740740741
+  },
+  "tf32_on_vs_off": {
+    "pred_max_abs_diff": 0.0002317279577255249,
+    "pred_mean_rel_diff": 5.9230638726148754e-05,
+    "pck@20_delta": 1.3580246913558192e-05,
+    "mpjpe_delta": 5.7189025275839606e-06
+  },
+  "gap_to_recorded": {
+    "tf32_on_pck@20": 6.1218638478521825e-06,
+    "tf32_off_pck@20": 7.458383065706009e-06,
+    "tf32_on_mpjpe": 1.456700265826602e-06,
+    "tf32_off_mpjpe": 4.2622022617573585e-06
+  }
+}

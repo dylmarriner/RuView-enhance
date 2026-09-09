@@ -1,0 +1,6 @@
+# Derived fixtures: regenerate with scripts/make_fixtures.py. Too large for git and
+# reproducible from the dataset + checkpoint. manifest.json (sha256s + metrics) and
+# reproducibility_floor.json ARE committed -- they are the evidence.
+fixtures/*.npy
+fixtures/*.npz
+harness/target/

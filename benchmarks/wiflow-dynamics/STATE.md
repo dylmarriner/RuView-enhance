@@ -116,14 +116,11 @@ deviation.
 
 ## Milestones (guards before capability — non-negotiable order)
 
-- [ ] **M1 — Anti-Goodhart harness.** Torso-normalized PCK matching upstream exactly;
-      mean-predictor baseline; constant-pose detector (prediction std across frames
-      must be non-degenerate); NaN/corrupt-window masking. Must include a **failing
-      test that reproduces the retraction**: near-static GT + constant prediction,
-      where the old absolute-0.2 protocol passes and this harness rejects.
-- [ ] **M2 — Reproduce the honest baseline** (PCK@20 ≈ 0.9609/0.9661) through the new
-      harness. If it cannot be reproduced: STOP and report. Do not proceed to novel
-      modelling on an unvalidated harness.
+- [x] **M1 — Anti-Goodhart harness.** DONE 2026-09-08. `harness/` (Rust, no Burn yet).
+      5/5 guard tests pass (`cargo test --release`), including the retraction
+      reproduction.
+- [x] **M2 — Reproduce the honest baseline.** DONE 2026-09-08. `validate` exits 0;
+      raw report `results/m2_validation.json`.
 - [ ] **M3 — Action-conditioned dynamics model.** Next-observation prediction
       conditioned on an explicit action (probe/subcarrier/antenna-group selection),
       emitting prediction + **calibrated** uncertainty. Report a proper scoring rule
@@ -132,17 +129,27 @@ deviation.
       and (b) fixed probing, on held-out data. Paired, seeded, same budget.
 - [ ] **M5 — Lineage/evidence recorded for every claim.**
 
-## Open questions to resolve before M3 design
+## Open questions — ALL RESOLVED 2026-09-08 (MEASURED)
 
-1. **Are windows temporally ordered within a file?** (`window_info.npz:window_to_frame`,
-   `config.npz:stride`). If window i+1 does not follow window i in time, "next-observation
-   dynamics" must be redefined — and said so explicitly.
-2. **What is the 540-channel layout?** (antennas × subcarriers × amp/phase?) The action
-   must select a *semantically meaningful* group (antenna pair, subcarrier band), not
-   arbitrary indices.
-3. **What is the mean-predictor's torso-PCK@20 on the WiFlow test split?** Unknown.
-   On the ESP32 set it was 95.9% because one subject barely moved; across 5 subjects
-   it may be far lower. Whatever it is, it is the honesty bar for everything after.
+1. **Windows temporally ordered within a file? YES.** `config.npz`: `window_size=20`,
+   `stride=20` → non-overlapping. `window_to_frame` within file 0 is `0,1,…,719`,
+   strictly increasing; 720 windows/file × 500 files = 360,000. So window *i* and
+   *i+1* are temporally adjacent **provided both lie in the same file** — next-observation
+   dynamics is well-defined, with a file-boundary guard.
+2. **540-channel layout: flat, unfactorized.** Upstream itself names it
+   `NUM_SUBCARRIERS = 540` (`config.py:9`) and feeds it as a flat axis. Empirically
+   (200 windows, file 0): data is [0,1]-normalized, and there is **no** antenna /
+   amplitude-phase block structure — first and second halves have near-identical
+   mean/std, and channel-mean autocorrelation shows no period-30 or period-180 peak.
+   What it *does* show is strong local smoothness: **lag-1 autocorrelation 0.739**.
+   → The defensible action unit is a **contiguous subcarrier band**, justified by that
+   measured local correlation. Do NOT invent an antenna×subcarrier factorization.
+3. **Mean-predictor bar on WiFlow test: 75.37% torso-PCK@20** (train-fitted;
+   test-fitted oracle 75.46%, MPJPE 0.0261). MEASURED by `validate`.
+   **The retrained model's 96.09% beats the bar by 20.7 points.**
+   Contrast with the ESP32 set, where the bar was 95.9% and *nothing* beat it:
+   WiFlow-STD contains real CSI→pose signal; the ESP32 set did not demonstrate any.
+   This is the honesty bar for every subsequent claim.
 
 ## Reporting rules
 
@@ -161,3 +168,53 @@ data; (c) a finding that invalidates the charter itself.
 - **2026-09-08 ~22:15** — Session start. Ground truth verified (table above).
   Worktree + branch created. Charter discrepancy on measurement (b) found and
   recorded. Decision: no vast.ai rental. Next: M1.
+
+- **2026-09-08 ~22:45 — M1 + M2 COMPLETE.** All three open questions resolved.
+
+  **Reproducibility floor discovered and MEASURED (new, load-bearing).** The first
+  fixture run failed a 1e-9 assertion: PCK@20 came out 0.9608877 vs the recorded
+  0.9608815, a 6.1e-6 gap. First hypothesis — float32 summation order — was **wrong**:
+  replicating upstream's exact per-batch-of-256 accumulation reproduced the same
+  0.9608877, and MPJPE (threshold-free) differed by 1.5e-4 relative while three
+  accumulation orders of the *same* predictions agreed to 5e-10. So the predictions
+  themselves differed. `scripts/diag_reproducibility_floor.py` then tested TF32
+  directly: toggling it alone moves PCK@20 by **1.36e-5** and MPJPE by **5.7e-6**, and
+  the recorded 2026-06-10 value falls *between* the TF32-on (0.9608877) and TF32-off
+  (0.9608741) results. Conclusion: the forward pass is not bit-reproducible across
+  cuDNN/TF32 configurations. **No PCK@20 improvement smaller than ~1.4e-5 is real.**
+  Tolerances throughout are set to this measured floor, not to a guessed epsilon.
+
+  **M1 — `harness/` (Rust, 4 modules, no Burn yet — guards should be fast to run).**
+  `metrics.rs` implements upstream's PCK exactly (torso = ‖t[2]−t[12]‖, clamp 0.01,
+  single flat mean over frames×keypoints) *and* `absolute_pck`, the broken protocol,
+  deliberately retained as a foil. `guards.rs` has the constant-pose detector
+  (measurement-(b)'s pred-std definition, threshold 1e-4), the mean-pose bar, the
+  corruption masks, `assert_finite`, and a Rust reimplementation of upstream's
+  zero-cleaning. `npy.rs` is a mmap .npy reader (the CSI array is 15.5 GB).
+  `cargo test --release`: **5/5 pass**, including
+  `broken_absolute_protocol_passes_where_torso_normalized_rejects` — the charter's
+  "prove it can't": on a synthetic near-static scene with a constant predictor, the
+  retracted absolute-0.2 protocol scores >0.99 while torso-normalized scores <0.60
+  and the degeneracy guard trips.
+
+  **M2 — `validate` exits 0; all 6 checks pass** (`results/m2_validation.json`):
+  | Check | Got | Recorded | Delta | Tol |
+  |---|---|---|---|---|
+  | full.pck@20 | 0.9608876543 | 0.9608815325 | 6.1e-6 | 2e-5 |
+  | full.mpjpe | 0.0098355175 | 0.0098340608 | 1.5e-6 | 1e-5 |
+  | clean.pck@20 | 0.9661491629 | 0.9661454100 | 3.8e-6 | 2e-5 |
+  | clean.mpjpe | 0.0094340722 | 0.0094327550 | 1.3e-6 | 1e-5 |
+
+  The Rust f64 result is **bit-identical** to the independent Python f64 computation
+  (0.9608876543209877 both), and both sit inside the measured floor of the recorded
+  value. Independent GT reconstruction: Rust's own .npy reader + its own zero-cleaning
+  rebuilt the Python-dumped GT with **0 mismatches**, after differing in **8,098**
+  values pre-clean — so the cleaning path is genuinely exercised, not a no-op.
+  Masks re-derived independently: 9,070 NaN / 9,072 big / 9,072 union / 52,560 clean.
+  Degeneracy guard on the real checkpoint: pred_std **0.0259** (retracted model 0.0000;
+  ESP32 honest model 0.0113) — healthy, not flagged.
+
+  **Next: M3.** Design constraint carried forward from the M3/M4 dependency: computing
+  expected information gain for a candidate probe *without peeking* requires
+  p(unobserved CSI | observed, mask), so the model needs an **observation head**
+  alongside the pose head, and the loader must serve full windows plus masks.

@@ -1,0 +1,21 @@
+[package]
+name = "wiflow-harness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Anti-Goodhart evaluation harness for WiFlow-STD WiFi-CSI pose estimation"
+
+# Deliberately self-contained: no path dependency on the nested `ruforecast` repo,
+# which is its own git repo and absent from a fresh RuView worktree (see STATE.md).
+# Burn is not a dependency yet — M1/M2 are evaluation guards only, and keeping the
+# build small keeps the guards fast to run.
+
+[dependencies]
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
