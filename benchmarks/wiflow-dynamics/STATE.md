@@ -127,7 +127,8 @@ deviation.
 - [x] **M4 — Information-gain evaluation.** DONE 2026-09-08. EIG-greedy wins on
       information at every budget but **does NOT** convert that into pose accuracy —
       an honest negative, with an oracle bracket quantifying what adaptivity is worth.
-- [ ] **M5 — Lineage/evidence recorded for every claim.**
+- [x] **M5 — Lineage/evidence recorded for every claim.** STATE.md + `results/*.json` +
+      `fixtures/manifest.json` (sha256s). Every number states MEASURED or CITED.
 
 ## Open questions — ALL RESOLVED 2026-09-08 (MEASURED)
 
@@ -263,6 +264,87 @@ optional; the charter is already satisfied by rungs 1–2.
   different input abstraction (540 → 27 band means). It is reported against the
   **75.4% mean-pose bar only**, with that non-comparability stated.
 - Nothing here is a causal intervention (see "Framing that must not drift").
+
+## Rung 3 — run log and one methodology change (recorded as it happened)
+
+**Run 1 (12 epochs, `results/rung3_undertrained_12ep.json`): self-reported
+"RUNG 3 DID NOT HELP".** Criterion 1 failed (val NLL −81.24 vs rung-2 −113.29) and
+criterion 2 failed (coverage); criterion 3 passed. **The run was undertrained, not
+converged** — 12 epochs took 16 s and the loss was still descending steeply
+(−68 → −81 over the final epochs). Two things in it are worth keeping regardless:
+- PCK@20 **0.8357** vs bar 0.7557 (**+8.0 pts**) — already above rung 2's 0.8195,
+  from an undertrained model.
+- **71 distinct probe sets** across the test pairs, modal set only 42% —
+  the probe set genuinely **varies per sample**. Rung 2 had exactly **1** distinct set
+  by construction. The capability rung 3 was built to add demonstrably exists.
+
+**Methodology change, stated plainly:** training length was raised from a fixed 12
+epochs to early stopping on val NLL (patience 40, cap 400). This is a *convergence*
+fix for an obviously undertrained model, not a change to any pre-registered pass
+criterion — the three criteria in the rung-3 pre-registration are untouched, and the
+evaluation set, bar, and protocol are identical. Both runs are kept; the 12-epoch
+result is preserved rather than discarded.
+
+### Run 2 (converged, early-stopped at epoch 163, best epoch 123) — `results/rung3.json`
+
+**Verdict by the pre-registered conjunction: "RUNG 3 DID NOT HELP" — 2 of 3 criteria
+missed.** That is the headline verdict and it stands. But the criteria conflated two
+questions, and rung 3 answers them oppositely:
+
+| Pre-registered criterion | Result |
+|---|---|
+| 1. beats rung-2 pose NLL | **FAIL** — −102.83 vs −113.29 |
+| 2. coverage within ±3 pp at all four levels | **FAIL** — +7.46 pp @50%, +3.20 pp @80% (90/95 pass) |
+| 3. EIG-greedy beats random by >2 SE | **PASS**, decisively — see below |
+
+**What rung 3 did do (MEASURED, same 20,000 test pairs as rung 2):**
+
+- **PCK@20 0.9425 vs bar 0.7557 → +18.7 pts.** Rung 2 on these same pairs was ~0.8208.
+  A nonlinear mean head is worth **~+12 pts** over the linear-Gaussian one. MPJPE
+  0.01073 vs rung 2's ~0.0207. Degeneracy guard passes (pred std 0.0208).
+- **EIG-driven probing now works, at every budget:**
+
+  | K | greedy | random | fixed | greedy−random | SE | t |
+  |---|---|---|---|---|---|---|
+  | 1 | 0.9425 | 0.9417 | 0.9419 | +0.00078 | 0.00025 | **+3.11** |
+  | 3 | 0.9420 | 0.9404 | 0.9411 | +0.00166 | 0.00035 | **+4.80** |
+  | 6 | 0.9412 | 0.9390 | 0.9380 | +0.00221 | 0.00044 | **+5.04** |
+  | 9 | 0.9400 | 0.9383 | 0.9406 | +0.00176 | 0.00045 | **+3.91** |
+
+- **Adaptivity is real and large:** at K=9, **19,653 distinct probe sets across 20,000
+  samples** (modal set ≈0%). Rung 2 had exactly **1**, by construction.
+
+**The central scientific finding of this work:** *the M4 negative at rung 2 was a
+property of the model class, not of information-gain probing.* Once `Σ` depends on
+`z_t`, so the probe set can vary per sample, EIG-driven selection beats random by
+3–5 SE at every budget. Under a homoscedastic `Σ` it could not, because the
+"EIG-optimal" set was frozen across all timesteps.
+
+**Two caveats I am not allowed to hide behind, and one clarification:**
+
+1. **The NLL comparison is not like-for-like, and that is my design's fault.** Rung 2
+   carries a **full 30×30** pose covariance; my rung-3 head is **diagonal**. Joint
+   multivariate NLL strongly rewards modelling cross-keypoint correlation, which a
+   diagonal head structurally cannot. So −102.83 vs −113.29 does **not** show rung 3's
+   marginals are worse. It is still a **FAIL** against the criterion as written — I am
+   not rewriting the criterion — but the right next step is a low-rank + diagonal
+   covariance head, not abandoning heteroscedasticity.
+2. **Calibration got worse, not better** (+7.46 pp at the 50% level vs rung 2's
+   +3.48 pp), in the same direction: over-covered at the centre, i.e. residuals more
+   peaked than Gaussian. A Student-t or low-rank predictive is the obvious fix. As it
+   stands, **rung 3's uncertainty is less trustworthy than rung 2's**, and no
+   calibrated-uncertainty claim may be made from it.
+3. **Clarification, to pre-empt a false contradiction:** rung 3's 0.9425 exceeds rung
+   2's target-peeking upper bound of 0.8568. That is not inconsistent. That bound
+   upper-bounded *probe-selection policies within the rung-2 model class*, holding the
+   linear-Gaussian predictor fixed. A better predictor moves the whole curve; the bound
+   was never a bound on all models.
+
+**Net:** the charter's M3/M4 primitive is demonstrated end-to-end — action-conditioned
+prediction with per-sample adaptive, information-gain-driven probe selection that
+measurably beats random and fixed at matched budget. The uncertainty is **not**
+calibrated to the pre-registered standard, so the "calibrated uncertainty" half of M3
+is met only by rung 2 (3 of 4 levels), and by rung 3 not at all.
 
 ## Reporting rules
 

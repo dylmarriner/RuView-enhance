@@ -1,0 +1,218 @@
+{
+  "backend": "burn-ndarray (CPU), by design -- see STATE.md rung-3 pre-registration",
+  "beats_bar": true,
+  "degeneracy_guard": {
+    "degenerate": false,
+    "pred_std": 0.016023467696127766,
+    "threshold": 0.0001
+  },
+  "honesty_bar_same_pairs": {
+    "mpjpe": 0.02603940523099254,
+    "pck@20": 0.75565
+  },
+  "milestone": "Rung 3 -- neural heteroscedastic head. MEASURED by harness/src/bin/rung3.rs, this run.",
+  "no_probe": {
+    "coverage": [
+      {
+        "empirical": 0.6158283333333333,
+        "error_pp": 11.582833333333332,
+        "nominal": 0.5
+      },
+      {
+        "empirical": 0.8512266666666667,
+        "error_pp": 5.122666666666664,
+        "nominal": 0.8
+      },
+      {
+        "empirical": 0.90759,
+        "error_pp": 0.7589999999999986,
+        "nominal": 0.9
+      },
+      {
+        "empirical": 0.9363616666666666,
+        "error_pp": -1.3638333333333308,
+        "nominal": 0.95
+      }
+    ],
+    "mpjpe": 0.019796433696580587,
+    "pck@20": 0.83574,
+    "pose_nll": -81.23594375
+  },
+  "policies": [
+    {
+      "adaptivity": {
+        "distinct_probe_sets": 1,
+        "modal_set_fraction": 1.0,
+        "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
+      },
+      "budget_k": 1,
+      "paired_greedy_minus_random": {
+        "beats_by_2se": false,
+        "delta": -0.004313333333333364,
+        "se": 0.00037483196895436315,
+        "t": -11.5073784804586
+      },
+      "pck@20": {
+        "eig_greedy": 0.8304933333333333,
+        "fixed": 0.8347033333333334,
+        "random": 0.8348066666666667
+      },
+      "pose_nll": {
+        "eig_greedy": -80.657655859375,
+        "fixed": -81.2702796875,
+        "random": -81.120386328125
+      }
+    },
+    {
+      "adaptivity": {
+        "distinct_probe_sets": 7,
+        "modal_set_fraction": 0.7363,
+        "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
+      },
+      "budget_k": 3,
+      "paired_greedy_minus_random": {
+        "beats_by_2se": true,
+        "delta": 0.004560000000000032,
+        "se": 0.0005045303016857214,
+        "t": 9.03810927661688
+      },
+      "pck@20": {
+        "eig_greedy": 0.8352333333333334,
+        "fixed": 0.8325433333333333,
+        "random": 0.8306733333333334
+      },
+      "pose_nll": {
+        "eig_greedy": -80.389519921875,
+        "fixed": -80.92885546875,
+        "random": -80.7511015625
+      }
+    },
+    {
+      "adaptivity": {
+        "distinct_probe_sets": 18,
+        "modal_set_fraction": 0.6644,
+        "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
+      },
+      "budget_k": 6,
+      "paired_greedy_minus_random": {
+        "beats_by_2se": false,
+        "delta": -0.002416666666666691,
+        "se": 0.0006109591591180738,
+        "t": -3.9555289917499166
+      },
+      "pck@20": {
+        "eig_greedy": 0.8206166666666667,
+        "fixed": 0.8236666666666667,
+        "random": 0.8230333333333333
+      },
+      "pose_nll": {
+        "eig_greedy": -78.4006375,
+        "fixed": -80.363200390625,
+        "random": -80.01705546875
+      }
+    },
+    {
+      "adaptivity": {
+        "distinct_probe_sets": 71,
+        "modal_set_fraction": 0.4242,
+        "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
+      },
+      "budget_k": 9,
+      "paired_greedy_minus_random": {
+        "beats_by_2se": true,
+        "delta": 0.005983333333333409,
+        "se": 0.0006415411205105044,
+        "t": 9.32650011362045
+      },
+      "pck@20": {
+        "eig_greedy": 0.8231133333333334,
+        "fixed": 0.8358166666666667,
+        "random": 0.81713
+      },
+      "pose_nll": {
+        "eig_greedy": -76.970840234375,
+        "fixed": -79.6653265625,
+        "random": -79.440788671875
+      }
+    }
+  ],
+  "preregistered_criteria": {
+    "1_beats_rung2_nll": {
+      "pass": false,
+      "rung2": -113.29,
+      "rung3": -81.23594375
+    },
+    "2_coverage_within_3pp_all_levels": false,
+    "3_eig_beats_random_by_2se": true,
+    "rung2_best_pck_for_reference": 0.8208
+  },
+  "training": {
+    "batch": 512,
+    "epochs": 12,
+    "history": [
+      {
+        "epoch": 0,
+        "train_nll": -42.67732829158589,
+        "val_nll": -56.74852752685547
+      },
+      {
+        "epoch": 1,
+        "train_nll": -60.61488364914716,
+        "val_nll": -62.73134994506836
+      },
+      {
+        "epoch": 2,
+        "train_nll": -58.326725038431455,
+        "val_nll": -51.11528778076172
+      },
+      {
+        "epoch": 3,
+        "train_nll": -65.42834896152303,
+        "val_nll": -63.737789154052734
+      },
+      {
+        "epoch": 4,
+        "train_nll": -68.45023649829929,
+        "val_nll": -65.93348693847656
+      },
+      {
+        "epoch": 5,
+        "train_nll": -62.15681699979103,
+        "val_nll": -51.822471618652344
+      },
+      {
+        "epoch": 6,
+        "train_nll": -68.0091497776872,
+        "val_nll": -73.48114013671875
+      },
+      {
+        "epoch": 7,
+        "train_nll": -68.32070777375819,
+        "val_nll": -73.49523162841797
+      },
+      {
+        "epoch": 8,
+        "train_nll": -75.84418700913251,
+        "val_nll": -77.30884552001953
+      },
+      {
+        "epoch": 9,
+        "train_nll": -69.88452507277667,
+        "val_nll": -75.26997375488281
+      },
+      {
+        "epoch": 10,
+        "train_nll": -78.93434686175847,
+        "val_nll": -80.26214599609375
+      },
+      {
+        "epoch": 11,
+        "train_nll": -81.27487842107223,
+        "val_nll": -83.18534088134766
+      }
+    ],
+    "lr": 0.001,
+    "train_pairs": 60000
+  },
+  "verdict": "RUNG 3 DID NOT HELP -- at least one pre-registered criterion was missed"
+}

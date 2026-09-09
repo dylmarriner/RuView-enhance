@@ -23,6 +23,7 @@
 pub mod bands;
 pub mod gaussian;
 pub mod guards;
+pub mod hetero;
 pub mod metrics;
 pub mod npy;
 
