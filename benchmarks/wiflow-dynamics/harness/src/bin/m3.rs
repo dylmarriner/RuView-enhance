@@ -23,7 +23,7 @@ const COVERAGE_LEVELS: [(f64, f64); 4] =
 
 /// Pre-registered compute bounds (see STATE.md addendum).
 const FIT_SUBSAMPLE: usize = 60_000; // >= 54x the 1110-dim joint
-const M4_SUBSAMPLE: usize = 2_000; // paired across all policies
+const M4_SUBSAMPLE: usize = 20_000; // paired across all policies (power check)
 const RANDOM_SEEDS: usize = 10;
 
 struct Rng(u64);
@@ -196,6 +196,7 @@ fn main() {
         let mut rand_pck = Vec::new();
         let mut rand_nll = Vec::new();
         let mut rand_eig = Vec::new();
+        let mut last_random_per_sample: Vec<f64> = Vec::new();
         for s in 0..RANDOM_SEEDS {
             let mut rng = Rng(rand_seed(s));
             let mut pool: Vec<usize> = (0..NUM_PROBE_GROUPS).collect();
@@ -208,10 +209,21 @@ fn main() {
             let r = evaluate(&model, z, gt, &m4_pairs, &set);
             rand_pck.push(r.pck20);
             rand_nll.push(r.nll);
+            last_random_per_sample = r.per_sample;
         }
 
-        // Oracle bracket: per-sample greedy on the TRUE residual. Upper bound.
+        // Per-sample random: a FRESH random set for every sample. Isolates
+        // "adaptivity with no information" from "adaptivity with information".
+        let per_sample_random = random_per_sample_evaluate(&model, z, gt, &m4_pairs, k, 0xBEEF);
+
+        // Target-peeking upper bound: per-sample greedy on the residual against the
+        // TRUE y_{t+1}. It selects using the TARGET, so it is not achievable even by a
+        // perfect observation-adaptive policy -- it upper-bounds all of them.
         let oracle = oracle_evaluate(&model, z, gt, &m4_pairs, k);
+
+        let (d_gr, se_gr, t_gr) = paired(&g.per_sample, &last_random_per_sample);
+        let (d_gf, se_gf, t_gf) = paired(&g.per_sample, &f.per_sample);
+        let (d_psr, se_psr, t_psr) = paired(&per_sample_random.per_sample, &f.per_sample);
 
         m4.push(serde_json::json!({
             "budget_k": k,
@@ -220,10 +232,17 @@ fn main() {
                           "random_mean": mean(&rand_eig), "random_sd": sd(&rand_eig) },
             "pck@20": { "eig_greedy": g.pck20, "fixed": f.pck20,
                         "random_mean": mean(&rand_pck), "random_sd": sd(&rand_pck),
-                        "oracle": oracle.0 },
+                        "random_per_sample": per_sample_random.pck20,
+                        "target_peeking_upper_bound": oracle.0 },
+            "paired_tests": {
+                "greedy_minus_random":     { "delta": d_gr,  "se": se_gr,  "t": t_gr },
+                "greedy_minus_fixed":      { "delta": d_gf,  "se": se_gf,  "t": t_gf },
+                "randomPerSample_minus_fixed": { "delta": d_psr, "se": se_psr, "t": t_psr }
+            },
             "pose_nll": { "eig_greedy": g.nll, "fixed": f.nll,
                           "random_mean": mean(&rand_nll), "random_sd": sd(&rand_nll) },
-            "mpjpe": { "eig_greedy": g.mpjpe, "fixed": f.mpjpe, "oracle": oracle.1 },
+            "mpjpe": { "eig_greedy": g.mpjpe, "fixed": f.mpjpe,
+                       "target_peeking_upper_bound": oracle.1 },
             "coverage": g.coverage,
         }));
     }
@@ -275,6 +294,18 @@ struct Eval {
     pck20: f64,
     mpjpe: f64,
     coverage: serde_json::Value,
+    /// Per-sample PCK@20 (mean over that frame's 15 keypoints), for paired tests.
+    per_sample: Vec<f64>,
+}
+
+/// Paired difference a-b: mean, standard error, and mean/SE ratio.
+fn paired(a: &[f64], b: &[f64]) -> (f64, f64, f64) {
+    let n = a.len();
+    let d: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    let m = d.iter().sum::<f64>() / n as f64;
+    let var = d.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+    let se = (var / n as f64).sqrt();
+    (m, se, if se > 0.0 { m / se } else { 0.0 })
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -336,8 +367,15 @@ fn evaluate(model: &DynamicsModel, z: &[f32], gt: &[f32], pairs: &[usize], probe
     }
 
     let s = score(&preds, &truths, pairs.len());
+    let per_sample: Vec<f64> = (0..pairs.len())
+        .map(|i| {
+            let b = i * POSE_DIM;
+            score(&preds[b..b + POSE_DIM], &truths[b..b + POSE_DIM], 1).pck_at(0.2)
+        })
+        .collect();
     let denom = (pairs.len() * POSE_DIM) as f64;
     Eval {
+        per_sample,
         nll: nll / pairs.len() as f64,
         pck20: s.pck_at(0.2),
         mpjpe: s.mpjpe,
@@ -351,6 +389,45 @@ fn evaluate(model: &DynamicsModel, z: &[f32], gt: &[f32], pairs: &[usize], probe
             }))
             .collect::<Vec<_>>()),
     }
+}
+
+/// A fresh random probe set for EVERY sample. Distinguishes "varying the probe set
+/// per sample" (which alone should buy nothing) from "varying it *informatively*".
+fn random_per_sample_evaluate(
+    model: &DynamicsModel,
+    z: &[f32],
+    gt: &[f32],
+    pairs: &[usize],
+    k: usize,
+    seed: u64,
+) -> Eval {
+    let mut rng = Rng(seed);
+    let mut preds = Vec::with_capacity(pairs.len() * POSE_DIM);
+    let mut truths = Vec::with_capacity(pairs.len() * POSE_DIM);
+    for &t in pairs {
+        let mut pool: Vec<usize> = (0..NUM_PROBE_GROUPS).collect();
+        for i in 0..k {
+            let j = i + rng.below(pool.len() - i);
+            pool.swap(i, j);
+        }
+        let set: Vec<usize> = pool[..k].to_vec();
+        let zt: Vec<f64> = (0..BAND_DIM).map(|i| z[t * BAND_DIM + i] as f64).collect();
+        let revealed: Vec<f64> = DynamicsModel::probe_dims(&set)
+            .iter()
+            .map(|&d| z[(t + 1) * BAND_DIM + d] as f64)
+            .collect();
+        let mu = model.pose_posterior_mean(&zt, &set, &revealed).unwrap();
+        preds.extend(mu.iter().map(|&v| v as f32));
+        truths.extend((0..POSE_DIM).map(|i| gt[(t + 1) * POSE_DIM + i]));
+    }
+    let s = score(&preds, &truths, pairs.len());
+    let per_sample: Vec<f64> = (0..pairs.len())
+        .map(|i| {
+            let b = i * POSE_DIM;
+            score(&preds[b..b + POSE_DIM], &truths[b..b + POSE_DIM], 1).pck_at(0.2)
+        })
+        .collect();
+    Eval { nll: f64::NAN, pck20: s.pck_at(0.2), mpjpe: s.mpjpe, coverage: serde_json::json!(null), per_sample }
 }
 
 /// Oracle bracket: choose the probe set per sample using the TRUE next observation.

@@ -13,6 +13,11 @@ description = "Anti-Goodhart evaluation harness for WiFlow-STD WiFi-CSI pose est
 [dependencies]
 memmap2 = "0.9"
 nalgebra = "0.33"
+# Rung 3 only. CPU ndarray backend deliberately: the heteroscedastic head is tiny
+# (270 -> hidden -> ~600), 60k samples train in minutes on CPU, and this avoids the
+# Blackwell (sm_120) CUDA build risk entirely. Capability, not throughput, is the
+# question rung 3 asks.
+burn = { version = "0.21", features = ["ndarray", "autodiff", "std"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

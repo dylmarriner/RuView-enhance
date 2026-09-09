@@ -371,6 +371,49 @@ data; (c) a finding that invalidates the charter itself.
     which is precisely what the oracle does. This is information-theoretic set
     selection, **not adaptive sensing**.
 
+  ### Power check + mechanism isolation (added after the first M4 run)
+
+  The first M4 ran on 2,000 pairs, where SE ≈ 0.0016 and the policy gaps were ~0.001 —
+  so "EIG ≈ random" could have been a **power** problem rather than a real null.
+  Rerun at **20,000 pairs** (SE ≈ 0.0002), with paired per-sample tests:
+
+  | K | greedy | fixed | random | random-per-sample | target-peeking bound | greedy−random t |
+  |---|---|---|---|---|---|---|
+  | 1 | 0.8208 | 0.8207 | 0.8205 | 0.8206 | **0.8311** | +1.55 |
+  | 3 | 0.8204 | 0.8208 | 0.8206 | 0.8205 | **0.8427** | −0.65 |
+  | 6 | 0.8199 | 0.8200 | 0.8208 | 0.8207 | **0.8523** | **−3.15** |
+  | 9 | 0.8203 | 0.8208 | 0.8208 | 0.8208 | **0.8568** | **−2.09** |
+
+  - The null is now **underpowered-proof**. With 10× the samples, EIG-greedy is still
+    not better than random — and at K=6 and K=9 it is *slightly and significantly
+    **worse*** (t = −3.15, −2.09), though the magnitude is tiny (≤0.0009 PCK@20).
+  - **Mechanism, stated plainly:** EIG maximises the log-determinant of the 30-dim
+    pose posterior — total joint entropy reduction. PCK@20 is a *thresholded,
+    per-keypoint* criterion. These are different utilities, so maximising the first
+    can very slightly hurt the second. EIG is not the wrong *machinery*; it is the
+    wrong *objective for this metric*.
+  - **Adaptivity-with-no-information is worth nothing**, as the homoscedastic account
+    predicts: drawing a *fresh random probe set per sample* matches a fixed set
+    (t = −0.91, −1.49, +2.44, +0.18 — no consistent sign). So the whole of the
+    upper-bound gap is "knowing which bands matter *at this timestep*".
+
+  ### Correction: the oracle is a TARGET-PEEKING bound, not an achievable policy
+
+  It selects bands by residual against the **true `y_{t+1}`** — i.e. using the target
+  itself, not merely the future observation. So it upper-bounds *every* policy,
+  including a perfect observation-adaptive one; it is **not** a reachable target.
+  Renamed `target_peeking_upper_bound` in the JSON. The +3.6 pt gap at K=9 is
+  therefore a **ceiling on the value of adaptivity**, not a promise.
+
+  ### Non-comparability note (do not turn this into a claim)
+
+  M3 forecasts `y_{t+1}` from `z_t` at 0.8195, while `diag_repr` *senses* `y_t` from
+  `z_t` at 0.8132. It is tempting to say "forecasting beats sensing" — **do not**.
+  The two runs use different evaluation subsets (pairs vs windows), different train
+  sizes (60k vs 40k), and different λ (selected vs fixed 1e-5); their mean-pose bars
+  differ too (0.7561 vs 0.7523). They are not like-for-like and no comparison between
+  them is licensed.
+
   ### What this licenses, and what it does not
 
   - Licensed: "a closed-form action-conditioned dynamics model over WiFi-CSI band
