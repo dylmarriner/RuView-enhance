@@ -56,6 +56,27 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
    `p(z_{t+1}[S] | z_t, revealed)` and average the resulting pose entropies — proper
    Monte-Carlo EIG. That is the single highest-value next experiment.
 
+10. **RUNG 4 (value-aware variance + observation head + Monte-Carlo EIG): DID NOT
+    CLOSE THE GAP — it went backwards.** MC-EIG is *worse than random*
+    (t = −4.13 at K=9) and worse than no-probe (t = −9.07), closing **−40%** of the
+    oracle gap. The bound is unchanged (+2.9 pts, t = +22.4): the information is still
+    there.
+
+11. **The unifying mechanism, now MEASURED rather than hypothesised.** At K=9, MC-EIG
+    selects probe sets with **lower predicted variance** (2.91e-4 vs random's 3.45e-4)
+    but **higher actual squared error** (2.78e-4 vs 2.52e-4). Error/variance ratio —
+    1.0 if calibrated — is **0.96 for EIG vs 0.73 for random**.
+    **Expected-information-gain selection under a miscalibrated predictive
+    distribution is an overconfidence-seeking criterion.** EIG hunts for the sets the
+    model *claims* will shrink its entropy most; when the variance head is
+    miscalibrated, those are disproportionately the sets where its confidence is
+    unearned. This explains the whole arc: **every rung failed its calibration
+    criterion, and EIG's failure is downstream of that.** Calibration is not a
+    nice-to-have for information-gain probing — it is a **precondition**.
+    The actionable next step is therefore *not* a better EIG estimator but a
+    **calibrated** predictive (low-rank + diagonal covariance, heavier tails, or
+    post-hoc recalibration), with EIG re-tested only once coverage passes.
+
 **Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
 number** — different input abstraction (540 raw channels x 20 frames → 270 band means)
 and a different task (forecasting `y_{t+1}`, not sensing `y_t`). The only valid
