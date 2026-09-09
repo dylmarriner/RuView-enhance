@@ -82,9 +82,24 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
    **≈ 1.0 point, not 3.3**. Persistence R² 0.871 pointed the right way after all — the
    marginal information is present but small.
 
-   **Standing rule this establishes:** any peeking oracle in this artifact must be
-   reported as *oracle minus best-of-C-random at matched search size*, never as *oracle
-   minus no-probe*. The latter is an upper bound contaminated by its own search.
+   **STANDING RULE this establishes — worth adopting repo-wide:** any peeking oracle
+   must be reported as *oracle minus best-of-C-random at matched search size*, never as
+   *oracle minus no-probe*. The latter is an upper bound contaminated by its own search.
+   That one line would have prevented a 5× overstatement here.
+
+   **A cheaper screen exists, and it is NOT sufficient — recorded so nobody re-trusts
+   it.** Pure selection inflation grows only as `sqrt(2 ln C)` (1.27× from K=1 to K=9),
+   while the observed oracle gain grew 3.38×. That gap looks like proof of real
+   information, and it was used to argue the control was unnecessary. **It is not
+   proof.** The screen assumes the only quantity scaling with budget is the *search
+   size* C — but raising K also **reveals more coordinates**, which helps *any* policy,
+   including random-with-peeking. Measured here: best-of-C-random's own advantage grew
+   **1.37×** from K=3→K=9 against the oracle's **1.42×** — essentially the same rate.
+   So the growth signal was mostly "revealing more helps", not "the selector found
+   information". The screen can rule *out* "purely noise" (correctly — +0.0057 is real),
+   but it **cannot size the artifact**, and it is confounded whenever search size and
+   revealed information both scale with the budget, which is the normal case.
+   **Only the matched-C control sizes it.**
 
 9. **Why EIG cannot reach even that ~0.6 pt ceiling — a design choice I made.** My
    variance head is deliberately blind to revealed *values* (only `z_t` and the mask),
