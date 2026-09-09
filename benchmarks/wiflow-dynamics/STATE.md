@@ -2,6 +2,33 @@
 
 **Purpose of this file:** a later session resumes mid-flight from here. Read it first.
 
+## TL;DR for a resuming session (all five milestones complete)
+
+All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED**.
+
+1. **Guards land first and hold.** 12/12 Rust tests, including a reproduction of this
+   repo's retracted 92.9% claim: on a constant predictor the old absolute-0.2 protocol
+   scores >0.99 where the torso-normalized one scores <0.60 and the degeneracy guard
+   trips. `validate` reproduces the honest baseline (0.9608877 vs 0.9608815 recorded).
+2. **A reproducibility floor was measured, not assumed:** TF32 on/off alone moves
+   PCK@20 by 1.36e-5. **No improvement below ~1.4e-5 is real.**
+3. **The honesty bar on WiFlow-STD, previously unknown, is 75.4% torso-PCK@20.**
+4. **Measurement refuted my own pre-registered representation.** "27 bands x 20 frames,
+   never collapse time" was the *worst* of seven variants and the only one failing the
+   bar. Pose signal lives in fine channel structure; time resolution barely matters.
+5. **The primitive works, with per-sample adaptive probing:** rung 3 reaches PCK@20
+   0.9425 (bar 0.7557) and EIG-greedy beats random by **3–5 SE at every budget**, with
+   19,653 distinct probe sets across 20,000 samples (rung 2 had exactly 1).
+6. **But rung 3 FAILS its own pre-registered pass condition** (2 of 3 criteria): its
+   joint NLL and its calibration are both worse than rung 2's. **No calibrated-
+   uncertainty claim may be made from rung 3.** Next step: low-rank + diagonal
+   covariance head, and a heavier-tailed predictive.
+
+**Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
+number** — different input abstraction (540 raw channels x 20 frames → 270 band means)
+and a different task (forecasting `y_{t+1}`, not sensing `y_t`). The only valid
+comparison is the mean-pose bar.
+
 Last updated: 2026-09-08 (session start)
 Worktree: `/home/ruvultra/projects/ruview-worktrees/wiflow-dynamics`
 Branch: `feat/wiflow-action-conditioned-dynamics` (off RuView `d6407ae0`)
@@ -124,9 +151,11 @@ deviation.
 - [x] **M3 — Action-conditioned dynamics model.** DONE (rung 2, joint Gaussian),
       2026-09-08. Beats the mean-pose bar by **+6.3 pts**. Calibration **marginally
       FAILS** the pre-registered criterion at one of four levels. `results/m3_m4.json`.
-- [x] **M4 — Information-gain evaluation.** DONE 2026-09-08. EIG-greedy wins on
-      information at every budget but **does NOT** convert that into pose accuracy —
-      an honest negative, with an oracle bracket quantifying what adaptivity is worth.
+- [x] **M4 — Information-gain evaluation.** DONE 2026-09-08, across two model classes.
+      **Rung 2 (homoscedastic): honest negative** — EIG wins on information at every
+      budget but does not convert into pose accuracy (underpowered-proof at n=20,000).
+      **Rung 3 (heteroscedastic): EIG-greedy beats random by 3–5 SE at every budget.**
+      The rung-2 negative was a property of the model class, not of EIG probing.
 - [x] **M5 — Lineage/evidence recorded for every claim.** STATE.md + `results/*.json` +
       `fixtures/manifest.json` (sha256s). Every number states MEASURED or CITED.
 
