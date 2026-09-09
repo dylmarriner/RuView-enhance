@@ -4,6 +4,12 @@
     "pred_std": 0.021679363445033534,
     "threshold": 0.0001
   },
+  "eig_signal_quality_K1": {
+    "fraction_of_samples_with_positive_r": 0.5428,
+    "interpretation": "EIG's predicted gain is essentially UNCORRELATED with realised benefit -- the criterion is uninformative on this problem",
+    "mean_per_sample_pearson_r": 0.038657429144175144,
+    "question": "across the 27 single-probe candidates, does predicted entropy reduction correlate with realised error reduction?"
+  },
   "eval_pairs": 5000,
   "mc_samples": 4,
   "measured_by": "harness/src/bin/rung4.rs, this run",

@@ -276,6 +276,11 @@ fn main() {
         }));
     }
 
+    // DIRECT test of the selection criterion: across the 27 single-probe candidates,
+    // does EIG's PREDICTED entropy reduction track the REALISED error reduction?
+    // This is the measurement item 11's two-number comparison could only gesture at.
+    let signal = eig_signal_quality(&inf, z, gt, &eval_pairs, MC_SAMPLES, seed ^ 0x5160, &device);
+
     let verdict = if any_beats_noprobe && any_beats_random {
         "PASS (single seed) -- needs >=3-seed sign consistency before any claim"
     } else {
@@ -297,6 +302,20 @@ fn main() {
                           "mpjpe": no_probe.mpjpe, "coverage": no_probe.coverage },
             "degeneracy_guard": check_constant_pose(&no_probe.preds, eval_pairs.len()),
             "policies": rows,
+            "eig_signal_quality_K1": {
+                "question": "across the 27 single-probe candidates, does predicted \
+                             entropy reduction correlate with realised error reduction?",
+                "mean_per_sample_pearson_r": signal.0,
+                "fraction_of_samples_with_positive_r": signal.1,
+                "interpretation": if signal.0 > 0.1 {
+                    "EIG's signal carries real information about benefit"
+                } else if signal.0 < -0.1 {
+                    "EIG's signal is ANTI-correlated with benefit"
+                } else {
+                    "EIG's predicted gain is essentially UNCORRELATED with realised \
+                     benefit -- the criterion is uninformative on this problem"
+                }
+            },
             "preregistered": {
                 "1_beats_no_probe_by_2se": any_beats_noprobe,
                 "2_beats_random_by_2se": any_beats_random,
@@ -454,6 +473,99 @@ fn mc_eig_greedy(
         }
     }
     out
+}
+
+/// Across all 27 single-probe candidates, correlate PREDICTED entropy reduction with
+/// REALISED squared-error reduction, per sample. Returns (mean Pearson r, fraction of
+/// samples with r > 0).
+fn eig_signal_quality(
+    m: &HeteroV2<BI>,
+    z: &[f32],
+    gt: &[f32],
+    pairs: &[usize],
+    samples: usize,
+    seed: u64,
+    d: &NdArrayDevice,
+) -> (f64, f64) {
+    let n = pairs.len();
+    let mut rng = Rng(seed);
+    let empty = vec![Vec::new(); n];
+    let y: Vec<f32> = pairs.iter().flat_map(|&t| (0..POSE_DIM).map(move |i| gt[(t + 1) * POSE_DIM + i])).collect();
+
+    let (zt0, mn0, mk0) = planes(z, pairs, &empty, None);
+    let (pmu0, plv0) = m.pose(
+        to_t::<BI>(zt0.clone(), n, BAND_DIM, d),
+        to_t::<BI>(mn0.clone(), n, BAND_DIM, d),
+        to_t::<BI>(mk0.clone(), n, BAND_DIM, d),
+    );
+    let mu0: Vec<f32> = pmu0.into_data().to_vec().unwrap();
+    let lv0: Vec<f32> = plv0.into_data().to_vec().unwrap();
+    let h_before: Vec<f64> =
+        (0..n).map(|i| 0.5 * (0..POSE_DIM).map(|q| lv0[i * POSE_DIM + q] as f64).sum::<f64>()).collect();
+    let err0: Vec<f64> = (0..n)
+        .map(|i| (0..POSE_DIM).map(|q| { let j = i * POSE_DIM + q; ((mu0[j] - y[j]) as f64).powi(2) }).sum())
+        .collect();
+    let (omu, olv) = m.observation(
+        to_t::<BI>(zt0, n, BAND_DIM, d),
+        to_t::<BI>(mn0, n, BAND_DIM, d),
+        to_t::<BI>(mk0, n, BAND_DIM, d),
+    );
+    let omud: Vec<f32> = omu.into_data().to_vec().unwrap();
+    let olvd: Vec<f32> = olv.into_data().to_vec().unwrap();
+
+    let mut pred = vec![vec![0.0f64; NUM_PROBE_GROUPS]; n];
+    let mut real = vec![vec![0.0f64; NUM_PROBE_GROUPS]; n];
+    for cand in 0..NUM_PROBE_GROUPS {
+        let gs: Vec<Vec<usize>> = (0..n).map(|_| vec![cand]).collect();
+        // predicted: MC-averaged post-probe entropy using SAMPLED values
+        let mut h_after = vec![0.0f64; n];
+        for _s in 0..samples {
+            let mut vals = vec![0.0f32; n * BAND_DIM];
+            for i in 0..n {
+                for q in 0..BAND_DIM {
+                    vals[i * BAND_DIM + q] = z[(pairs[i] + 1) * BAND_DIM + q];
+                }
+                for q in group_dims(cand) {
+                    let j = i * BAND_DIM + q;
+                    vals[j] = (omud[j] as f64 + (olvd[j] as f64 * 0.5).exp() * rng.normal()) as f32;
+                }
+            }
+            let (zt, mn, mk) = planes(z, pairs, &gs, Some(&vals));
+            let (_, plv) = m.pose(
+                to_t::<BI>(zt, n, BAND_DIM, d), to_t::<BI>(mn, n, BAND_DIM, d), to_t::<BI>(mk, n, BAND_DIM, d));
+            let lv: Vec<f32> = plv.into_data().to_vec().unwrap();
+            for i in 0..n {
+                h_after[i] += 0.5 * (0..POSE_DIM).map(|q| lv[i * POSE_DIM + q] as f64).sum::<f64>();
+            }
+        }
+        // realised: TRUE values revealed
+        let (zt, mn, mk) = planes(z, pairs, &gs, None);
+        let (pmu, _) = m.pose(
+            to_t::<BI>(zt, n, BAND_DIM, d), to_t::<BI>(mn, n, BAND_DIM, d), to_t::<BI>(mk, n, BAND_DIM, d));
+        let mud: Vec<f32> = pmu.into_data().to_vec().unwrap();
+        for i in 0..n {
+            pred[i][cand] = h_before[i] - h_after[i] / samples as f64;
+            let e: f64 = (0..POSE_DIM)
+                .map(|q| { let j = i * POSE_DIM + q; ((mud[j] - y[j]) as f64).powi(2) }).sum();
+            real[i][cand] = err0[i] - e;
+        }
+    }
+
+    let mut rs = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, b) = (&pred[i], &real[i]);
+        let k = NUM_PROBE_GROUPS as f64;
+        let (ma, mb) = (a.iter().sum::<f64>() / k, b.iter().sum::<f64>() / k);
+        let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+        let va: f64 = a.iter().map(|x| (x - ma).powi(2)).sum::<f64>().sqrt();
+        let vb: f64 = b.iter().map(|x| (x - mb).powi(2)).sum::<f64>().sqrt();
+        if va > 1e-12 && vb > 1e-12 {
+            rs.push(cov / (va * vb));
+        }
+    }
+    let mean = rs.iter().sum::<f64>() / rs.len() as f64;
+    let pos = rs.iter().filter(|r| **r > 0.0).count() as f64 / rs.len() as f64;
+    (mean, pos)
 }
 
 /// Mean predicted pose variance and mean actual squared error under a given policy.

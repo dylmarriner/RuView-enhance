@@ -62,20 +62,51 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
     oracle gap. The bound is unchanged (+2.9 pts, t = +22.4): the information is still
     there.
 
-11. **The unifying mechanism, now MEASURED rather than hypothesised.** At K=9, MC-EIG
-    selects probe sets with **lower predicted variance** (2.91e-4 vs random's 3.45e-4)
-    but **higher actual squared error** (2.78e-4 vs 2.52e-4). Error/variance ratio —
-    1.0 if calibrated — is **0.96 for EIG vs 0.73 for random**.
-    **Expected-information-gain selection under a miscalibrated predictive
-    distribution is an overconfidence-seeking criterion.** EIG hunts for the sets the
-    model *claims* will shrink its entropy most; when the variance head is
-    miscalibrated, those are disproportionately the sets where its confidence is
-    unearned. This explains the whole arc: **every rung failed its calibration
-    criterion, and EIG's failure is downstream of that.** Calibration is not a
-    nice-to-have for information-gain probing — it is a **precondition**.
-    The actionable next step is therefore *not* a better EIG estimator but a
-    **calibrated** predictive (low-rank + diagonal covariance, heavier tails, or
-    post-hoc recalibration), with EIG re-tested only once coverage passes.
+11. **CORRECTED mechanism (my first reading of my own diagnostic was backwards).**
+    At K=9, MC-EIG picks sets with lower predicted variance (2.91e-4 vs random's
+    3.45e-4) but higher actual squared error (2.78e-4 vs 2.52e-4). Error/variance
+    ratio — **1.0 if calibrated** — is **0.96 for EIG, 0.73 for random**.
+    I first read this as "EIG seeks overconfidence". **That is wrong.** 0.96 is the
+    *well-calibrated* end; 0.73 means the variance head assigns **falsely high**
+    variance to the sets random happens to pick — sets that are actually accurate.
+    So EIG is not hunting unearned confidence; it is **avoiding sets the head is
+    over-cautious about, and those are precisely the accurate ones**. The failure is
+    variance-head miscalibration in the *under*-confident direction corrupting EIG's
+    ranking.
+    **The unifying claim survives the correction** — miscalibration in *either*
+    direction breaks the ranking EIG depends on, so **calibration is a precondition
+    for information-gain probing, not a nice-to-have**, and every rung here failed its
+    calibration criterion. But "overconfidence-seeking" is retracted.
+    **Caveat on strength of evidence:** this two-number comparison comes from absolute
+    predicted variance on the *selected* sets, whereas EIG selects on *entropy
+    reduction from a baseline*. It is **suggestive, not a direct test**. The direct
+    test is item 12.
+    Actionable next step is therefore *not* a better EIG estimator but a **calibrated**
+    predictive (low-rank + diagonal covariance, heavier tails, or post-hoc temperature
+    scaling), with EIG re-tested only once coverage passes.
+
+12. **THE DIRECT MEASUREMENT, which supersedes both readings in item 11.** Across all
+    27 single-probe candidates, per sample, correlating EIG's **predicted** entropy
+    reduction against the **realised** squared-error reduction:
+    **mean per-sample Pearson r = +0.039**; fraction of samples with r > 0 = **0.543**
+    (chance = 0.5).
+    **EIG's predicted gain is essentially uncorrelated with realised benefit on this
+    problem.** That, and not any story about over- or under-confidence, is why EIG
+    performs like random selection — and why its one systematic tendency (preferring
+    low predicted variance) is, if anything, mildly harmful.
+    - **MEASURED:** the criterion is uninformative here (r ≈ 0.04).
+    - **INFERRED, not measured:** that variance-head miscalibration is *why* it is
+      uninformative. That remains the leading explanation — every rung failed its
+      calibration criterion — but the causal link is an inference. The clean test is
+      the pre-registered next experiment: post-hoc temperature-scale the variance head
+      on val, then re-run EIG and re-measure this same correlation. If r rises with
+      calibration, the link is established; if it does not, the criterion is
+      inadequate for a different reason.
+
+13. **Robustness caveat:** rung 4 is **single-seed (2026)**. Its headline verdict is
+    unlikely to flip (t = −9.07 against no-probe), but the diagnostic ratios in item 11
+    and the correlation in item 12 have not been replicated across seeds. Rung 3
+    taught exactly this lesson. Treat items 11–12 as one-seed measurements.
 
 **Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
 number** — different input abstraction (540 raw channels x 20 frames → 270 band means)
