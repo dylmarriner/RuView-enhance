@@ -44,9 +44,11 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
    **K=6 and K=9**, not at low budgets. An over-claimed negative is the same error as
    an over-claimed positive with the sign flipped, and this correction was applied to
    my own negative result at the same standard I applied to the positive one.
-   **Cluster-robust and seed-robust survivor:** greedy − no-probe is negative in every
-   seed × budget cell and grows monotonically more negative with budget — a sign
-   argument that needs no within-file independence assumption at all.
+   **Cluster-robust and seed-robust survivor — the claim to lead with:** greedy −
+   no-probe is negative in **all 16 seed × budget cells** (4 seeds × K=1,3,6,9) and
+   grows monotonically more negative with budget. A sign test over 16 cells is
+   p ≈ 1.5e-5 **with no within-file independence assumption whatsoever**, so it is
+   immune to the clustering that weakened the t-statistics above.
    The +18.7 pts is the nonlinear mean head; the action-conditioning contributes nothing.
 7. **Rung 3 FAILS ALL THREE of its pre-registered criteria.** An apparent
    "EIG beats random by 3–5 SE" result was produced by a single **unseeded**
@@ -97,8 +99,11 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
 10. **RUNG 4 (value-aware variance + observation head + Monte-Carlo EIG): DID NOT
     CLOSE THE GAP — it went backwards.** MC-EIG is *worse than random*
     (t = −4.13 at K=9) and worse than no-probe (t = −9.07), closing **−40%** of the
-    oracle gap. The bound is unchanged (+2.9 pts, t = +22.4): the information is still
-    there.
+    oracle gap. **Corrected (see item 8):** the bound's naive "+2.9 pts" is ~80%
+    selection-on-target inflation; the information that actually exists is **≈ +0.57 pts**
+    (oracle minus best-of-C-random at matched search size). So rung 4 failed to reach a
+    ceiling much lower than I first reported — which makes its failure less dramatic and
+    the whole probing question smaller-stakes than stated at the time.
 
 11. **CORRECTED mechanism (my first reading of my own diagnostic was backwards).**
     At K=9, MC-EIG picks sets with lower predicted variance (2.91e-4 vs random's
@@ -120,8 +125,9 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
     reduction from a baseline*. It is **suggestive, not a direct test**. The direct
     test is item 12.
     Actionable next step is therefore *not* a better EIG estimator but a **calibrated**
-    predictive (low-rank + diagonal covariance, heavier tails, or post-hoc temperature
-    scaling), with EIG re-tested only once coverage passes.
+    predictive — low-rank + diagonal covariance, or heavier tails.
+    **NOT post-hoc temperature scaling: item 13 proves that is a null by construction**
+    (EIG's ranking is exactly invariant to it).
 
 12. **THE DIRECT MEASUREMENT, which supersedes both readings in item 11.** Across all
     27 single-probe candidates, per sample, correlating EIG's **predicted** entropy
@@ -136,9 +142,11 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
     - **INFERRED, not measured:** that variance-head miscalibration is *why* it is
       uninformative. That remains the leading explanation — every rung failed its
       calibration criterion — but the causal link is an inference. The clean test is
-      the pre-registered next experiment: post-hoc temperature-scale the variance head
-      on val, then re-run EIG and re-measure this same correlation. If r rises with
-      calibration, the link is established; if it does not, the criterion is
+      the pre-registered next experiment: recalibrate the variance head, then re-run EIG
+      and re-measure this same correlation. **Note the recalibration must be
+      mask-dependent — item 13 proves a temperature or any per-dimension rescaling
+      leaves EIG's ranking bit-identical.** If r rises, the link is established; if not,
+      the criterion is
       inadequate for a different reason.
 
 13. **The obvious next fix is a NULL BY CONSTRUCTION — proved, not guessed.**
@@ -539,6 +547,12 @@ optional; the charter is already satisfied by rungs 1–2.
 
 ### RUNG 4 PRE-REGISTRATION (written 2026-09-09 ~00:00, BEFORE the model was written)
 
+> **SUPERSEDING NOTE (added later, pre-registration text left intact below).** The
+> "+2.9 pts" motivating figure was subsequently shown to be ~80% selection-on-target
+> inflation; the real headroom is ≈ +0.57 pts (item 8). The pre-registration is not
+> rewritten — it recorded what was believed when rung 4 was designed — but a reader
+> should carry the corrected number forward.
+
 **Why this exists:** the rung-3 target-peeking bound proved the information is present
 (+2.9 pts at K=9, t=+22.3) and that closed-form EIG cannot reach it (−0.4 pts). The
 diagnosis is specific: my rung-3 variance head is **blind to revealed values** by
@@ -676,9 +690,12 @@ rerunning across **three initialisations (2026, 7, 101)**:
 
 | seed | no-probe PCK@20 | pose NLL | t(greedy−noprobe) @K=1,3,6,9 | t(greedy−random) @K=1,3,6,9 |
 |---|---|---|---|---|
+| *(all four seeds below; t are per-sample i.i.d., NOT cluster-corrected — see item 6)* | | | | |
+|---|---|---|---|---|
 | 2026 | 0.9424 | −97.17 | −1.42, −5.04, −8.54, −10.16 | +0.94, −0.56, −3.70, −1.67 |
 | 7 | 0.9375 | −94.88 | −2.80, −5.02, −8.69, −9.78 | +0.03, −1.47, −2.56, −2.92 |
 | 101 | 0.9452 | −102.02 | −3.24, −7.20, −12.73, −15.37 | +1.29, +1.53, −0.25, +0.39 |
+| 555 | — | — | −4.10, −9.30, −13.48, −15.36 | — |
 
 1. **The "EIG-greedy beats random by 3–5 SE" claim is RETRACTED.** It came from a
    single unseeded initialisation. Across three seeds the sign is not stable
