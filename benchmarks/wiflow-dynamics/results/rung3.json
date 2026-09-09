@@ -51,6 +51,33 @@
         "modal_set_fraction": 0.3074,
         "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
       },
+      "block_bootstrap_file_level": {
+        "greedy_minus_no_probe": {
+          "ci95": [
+            -0.0006776492580908974,
+            0.00010020040080160315
+          ],
+          "delta": -0.00028999999999999984,
+          "significant": false
+        },
+        "greedy_minus_random": {
+          "ci95": [
+            -0.0002837589717910195,
+            0.0008816413111928667
+          ],
+          "delta": 0.00025666666666666665,
+          "significant": false
+        },
+        "note": "2000 reps resampling whole recording files; a CI excluding 0 is significant",
+        "random_minus_no_probe": {
+          "ci95": [
+            -0.0009139757947069739,
+            -0.0001803968731208662
+          ],
+          "delta": -0.0005466666666666661,
+          "significant": true
+        }
+      },
       "budget_k": 1,
       "paired_greedy_minus_fixed": {
         "delta": 0.0004833333333333324,
@@ -60,6 +87,7 @@
       "paired_greedy_minus_random": {
         "beats_by_2se": false,
         "delta": 0.00025666666666666665,
+        "note": "per-sample i.i.d., NOT cluster-corrected -- see block_bootstrap_file_level",
         "se": 0.00027233633825077567,
         "t": 0.9424620611235512
       },
@@ -98,6 +126,33 @@
         "modal_set_fraction": 0.01215,
         "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
       },
+      "block_bootstrap_file_level": {
+        "greedy_minus_no_probe": {
+          "ci95": [
+            -0.003045513698051358,
+            0.00017529933187801852
+          ],
+          "delta": -0.0015199999999999968,
+          "significant": false
+        },
+        "greedy_minus_random": {
+          "ci95": [
+            -0.0012316249503377022,
+            0.0009017132551848517
+          ],
+          "delta": -0.00021000000000000063,
+          "significant": false
+        },
+        "note": "2000 reps resampling whole recording files; a CI excluding 0 is significant",
+        "random_minus_no_probe": {
+          "ci95": [
+            -0.0020941007242377165,
+            -0.0003722723571155534
+          ],
+          "delta": -0.0013099999999999971,
+          "significant": true
+        }
+      },
       "budget_k": 3,
       "paired_greedy_minus_fixed": {
         "delta": -0.0004233333333333335,
@@ -107,6 +162,7 @@
       "paired_greedy_minus_random": {
         "beats_by_2se": false,
         "delta": -0.00021000000000000063,
+        "note": "per-sample i.i.d., NOT cluster-corrected -- see block_bootstrap_file_level",
         "se": 0.0003770269843283519,
         "t": -0.5569893103914073
       },
@@ -145,6 +201,33 @@
         "modal_set_fraction": 0.0007,
         "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
       },
+      "block_bootstrap_file_level": {
+        "greedy_minus_no_probe": {
+          "ci95": [
+            -0.006016177957532876,
+            -0.0007646332097899729
+          ],
+          "delta": -0.00339333333333335,
+          "significant": true
+        },
+        "greedy_minus_random": {
+          "ci95": [
+            -0.0039789487798337405,
+            0.00017576149496758542
+          ],
+          "delta": -0.001683333333333334,
+          "significant": false
+        },
+        "note": "2000 reps resampling whole recording files; a CI excluding 0 is significant",
+        "random_minus_no_probe": {
+          "ci95": [
+            -0.0028162442300321724,
+            -0.00044176506734426086
+          ],
+          "delta": -0.001709999999999997,
+          "significant": true
+        }
+      },
       "budget_k": 6,
       "paired_greedy_minus_fixed": {
         "delta": 0.0005700000000000004,
@@ -154,6 +237,7 @@
       "paired_greedy_minus_random": {
         "beats_by_2se": false,
         "delta": -0.001683333333333334,
+        "note": "per-sample i.i.d., NOT cluster-corrected -- see block_bootstrap_file_level",
         "se": 0.0004545715761868489,
         "t": -3.7031205238433342
       },
@@ -192,6 +276,33 @@
         "modal_set_fraction": 0.0002,
         "note": "rung 2 had exactly 1 distinct set by construction (homoscedastic)"
       },
+      "block_bootstrap_file_level": {
+        "greedy_minus_no_probe": {
+          "ci95": [
+            -0.006900233566900236,
+            -0.0018405629166876626
+          ],
+          "delta": -0.004470000000000011,
+          "significant": true
+        },
+        "greedy_minus_random": {
+          "ci95": [
+            -0.002031087387115184,
+            0.0002755095266547181
+          ],
+          "delta": -0.0008299999999999991,
+          "significant": false
+        },
+        "note": "2000 reps resampling whole recording files; a CI excluding 0 is significant",
+        "random_minus_no_probe": {
+          "ci95": [
+            -0.005288063800919955,
+            -0.001712733876476568
+          ],
+          "delta": -0.0036400000000000217,
+          "significant": true
+        }
+      },
       "budget_k": 9,
       "paired_greedy_minus_fixed": {
         "delta": -0.00037666666666666756,
@@ -201,6 +312,7 @@
       "paired_greedy_minus_random": {
         "beats_by_2se": false,
         "delta": -0.0008299999999999991,
+        "note": "per-sample i.i.d., NOT cluster-corrected -- see block_bootstrap_file_level",
         "se": 0.0004960623538356711,
         "t": -1.6731767560715773
       },
@@ -243,6 +355,72 @@
     "2_coverage_within_3pp_all_levels": false,
     "3_eig_beats_random_by_2se": false,
     "rung2_best_pck_for_reference": 0.8208
+  },
+  "selection_inflation_control": {
+    "information_survives_control": true,
+    "method": "best-of-C RANDOM sets, also chosen by peeking, C matched to the oracle's greedy candidate count; file-level block bootstrap (2000 reps, whole recording files resampled) for all intervals",
+    "question": "is the target-peeking bound real information, or the expected maximum of C noisy peeked scores?",
+    "rows": [
+      {
+        "bestOfC_minus_noprobe": {
+          "ci95_file_block": [
+            0.01312886736615564,
+            0.022262262262262227
+          ],
+          "delta": 0.016946666666666728
+        },
+        "best_of_C_random_peeking_pck@20": 0.9585466666666667,
+        "budget_k": 3,
+        "candidates_C": 78,
+        "no_probe_pck@20": 0.9416,
+        "oracle_minus_bestOfC": {
+          "ci95_file_block": [
+            0.002459779284669588,
+            0.004658991449538803
+          ],
+          "delta": 0.0034133333333333264,
+          "significant": true
+        },
+        "oracle_minus_noprobe": {
+          "ci95_file_block": [
+            0.015450586264656712,
+            0.027021262414183823
+          ],
+          "delta": 0.02036000000000004
+        },
+        "oracle_pck@20": 0.96196
+      },
+      {
+        "bestOfC_minus_noprobe": {
+          "ci95_file_block": [
+            0.017273149068734703,
+            0.030677397719651205
+          ],
+          "delta": 0.02326666666666667
+        },
+        "best_of_C_random_peeking_pck@20": 0.9648666666666667,
+        "budget_k": 9,
+        "candidates_C": 207,
+        "no_probe_pck@20": 0.9416,
+        "oracle_minus_bestOfC": {
+          "ci95_file_block": [
+            0.004680250151301178,
+            0.006814106395696346
+          ],
+          "delta": 0.005679999999999984,
+          "significant": true
+        },
+        "oracle_minus_noprobe": {
+          "ci95_file_block": [
+            0.022428273869515587,
+            0.037049003769520396
+          ],
+          "delta": 0.028946666666666586
+        },
+        "oracle_pck@20": 0.9705466666666667
+      }
+    ],
+    "verdict": "Oracle beats best-of-C-random at matched search size: the margin is exploitable information, and the honest bound is oracle MINUS best-of-C."
   },
   "target_peeking_bound_at_rung3": {
     "interpretation": "Information EXISTS but the EIG criterion / architecture cannot reach it.",

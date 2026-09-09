@@ -77,6 +77,93 @@ fn random_groups(rng: &mut Rng, k: usize) -> Vec<usize> {
     pool[..k].to_vec()
 }
 
+/// CONTROL for the target-peeking bound: best-of-C RANDOM sets, also chosen by peeking.
+///
+/// Why this is required before any "the information is real" claim. The oracle takes an
+/// argmax over ~C candidates per sample, scored against the SAME target used to choose
+/// them. Per-sample PCK@20 is a mean of 15 indicators, so it is noisy, and the expected
+/// maximum of C noisy scores exceeds the true best whether or not any information is
+/// exploited. If best-of-C RANDOM reaches the oracle's number, the oracle's margin is
+/// selection noise, not information. `c` is matched to the oracle's greedy candidate count.
+fn best_of_c_random_peeking(
+    m: &HeteroModel<BI>,
+    z: &[f32],
+    gt: &[f32],
+    pairs: &[usize],
+    k: usize,
+    c: usize,
+    seed: u64,
+    d: &NdArrayDevice,
+) -> (f64, Vec<f64>) {
+    let n = pairs.len();
+    let y: Vec<f32> = pairs.iter().flat_map(|&t| (0..POSE_DIM).map(move |i| gt[(t + 1) * POSE_DIM + i])).collect();
+    let mut best_err = vec![f64::INFINITY; n];
+    let mut best_pred = vec![0.0f32; n * POSE_DIM];
+    let mut rng = Rng(seed);
+
+    for _cand in 0..c {
+        let gs: Vec<Vec<usize>> = (0..n).map(|_| random_groups(&mut rng, k)).collect();
+        let (zt, mn, mk, _yy) = make_batch::<BI>(z, gt, pairs, &gs, d);
+        let (pmu, _) = m.forward(zt, mn, mk);
+        let mud: Vec<f32> = pmu.into_data().to_vec().unwrap();
+        for i in 0..n {
+            let e: f64 = (0..POSE_DIM)
+                .map(|q| { let j = i * POSE_DIM + q; ((mud[j] - y[j]) as f64).powi(2) })
+                .sum();
+            if e < best_err[i] {
+                best_err[i] = e;
+                best_pred[i * POSE_DIM..(i + 1) * POSE_DIM]
+                    .copy_from_slice(&mud[i * POSE_DIM..(i + 1) * POSE_DIM]);
+            }
+        }
+    }
+    let sc = score(&best_pred, &y, n);
+    let per_sample: Vec<f64> = (0..n)
+        .map(|i| score(&best_pred[i * POSE_DIM..(i + 1) * POSE_DIM], &y[i * POSE_DIM..(i + 1) * POSE_DIM], 1).pck_at(0.2))
+        .collect();
+    (sc.pck_at(0.2), per_sample)
+}
+
+/// File-level block bootstrap on a paired per-sample difference.
+///
+/// Adjacent windows within a recording file are enormously correlated (pose persistence
+/// between adjacent windows is 0.9970), so a per-sample i.i.d. SE understates uncertainty
+/// badly. Resampling whole FILES respects that clustering.
+/// Returns (observed delta, 2.5th pct, 97.5th pct).
+fn block_bootstrap(
+    a: &[f64],
+    b: &[f64],
+    pairs: &[usize],
+    w2f: &[i64],
+    reps: usize,
+    seed: u64,
+) -> (f64, f64, f64) {
+    let diffs: Vec<f64> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+    let mut by_file: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+    for (i, &t) in pairs.iter().enumerate() {
+        by_file.entry(w2f[t]).or_default().push(i);
+    }
+    let files: Vec<&Vec<usize>> = by_file.values().collect();
+    let nf = files.len();
+    let mut rng = Rng(seed);
+    let mut means = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let (mut sum, mut cnt) = (0.0f64, 0usize);
+        for _ in 0..nf {
+            for &i in files[rng.below(nf)] {
+                sum += diffs[i];
+                cnt += 1;
+            }
+        }
+        means.push(sum / cnt.max(1) as f64);
+    }
+    means.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let obs = diffs.iter().sum::<f64>() / diffs.len() as f64;
+    let lo = means[(reps as f64 * 0.025) as usize];
+    let hi = means[((reps as f64 * 0.975) as usize).min(reps - 1)];
+    (obs, lo, hi)
+}
+
 /// Per-sample greedy probe selection using the TRUE y_{t+1} -- a target-peeking upper
 /// bound on every policy, achievable by none.
 fn oracle_probe_sets(
@@ -271,6 +358,17 @@ fn main() {
         let (dgf, segf, tgf) = paired(&g.per_sample, &fx_e.per_sample);
         // The comparison the charter actually turns on: does probing beat NOT probing?
         let (dn_g, sen_g, tn_g) = paired(&g.per_sample, &no_probe.per_sample);
+        // Cluster-robust intervals. Adjacent windows within a recording file are
+        // correlated at 0.9970 (pose persistence), so per-sample i.i.d. SEs understate
+        // uncertainty. These resample whole FILES. Applied to the NEGATIVE findings with
+        // the same rigour as to the positive one -- an over-claimed negative is the same
+        // error with the sign flipped.
+        let (bd_gn, blo_gn, bhi_gn) =
+            block_bootstrap(&g.per_sample, &no_probe.per_sample, &test_pairs, &w2f, 2000, 21);
+        let (bd_gr, blo_gr, bhi_gr) =
+            block_bootstrap(&g.per_sample, &rd.per_sample, &test_pairs, &w2f, 2000, 22);
+        let (bd_rn, blo_rn, bhi_rn) =
+            block_bootstrap(&rd.per_sample, &no_probe.per_sample, &test_pairs, &w2f, 2000, 23);
         let (dn_r, sen_r, tn_r) = paired(&rd.per_sample, &no_probe.per_sample);
         let (dn_f, sen_f, tn_f) = paired(&fx_e.per_sample, &no_probe.per_sample);
         // How often does the per-sample EIG set actually differ from the modal one?
@@ -283,7 +381,14 @@ fn main() {
             "budget_k": k,
             "pck@20": { "eig_greedy": g.pck20, "random": rd.pck20, "fixed": fx_e.pck20 },
             "pose_nll": { "eig_greedy": g.nll, "random": rd.nll, "fixed": fx_e.nll },
-            "paired_greedy_minus_random": { "delta": d, "se": se, "t": t, "beats_by_2se": t > 2.0 },
+            "paired_greedy_minus_random": { "delta": d, "se": se, "t": t, "beats_by_2se": t > 2.0,
+                "note": "per-sample i.i.d., NOT cluster-corrected -- see block_bootstrap_file_level" },
+            "block_bootstrap_file_level": {
+                "note": "2000 reps resampling whole recording files; a CI excluding 0 is significant",
+                "greedy_minus_no_probe": { "delta": bd_gn, "ci95": [blo_gn, bhi_gn], "significant": bhi_gn < 0.0 || blo_gn > 0.0 },
+                "greedy_minus_random":   { "delta": bd_gr, "ci95": [blo_gr, bhi_gr], "significant": bhi_gr < 0.0 || blo_gr > 0.0 },
+                "random_minus_no_probe": { "delta": bd_rn, "ci95": [blo_rn, bhi_rn], "significant": bhi_rn < 0.0 || blo_rn > 0.0 }
+            },
             "paired_greedy_minus_fixed": { "delta": dgf, "se": segf, "t": tgf },
             "vs_no_probe": {
                 "note": "positive t means probing BEATS not probing at all",
@@ -319,6 +424,37 @@ fn main() {
             "oracle_minus_noprobe": { "delta": d, "se": se, "t": t, "beats_by_2se": t > 2.0 }
         }));
     }
+    // Control + cluster-robust intervals for the bound.
+    let mut control_rows = Vec::new();
+    for &k in &[3usize, 9] {
+        // Greedy at budget k evaluates sum_{j=0}^{k-1} (27-j) candidates per sample.
+        let c: usize = (0..k).map(|j| NUM_PROBE_GROUPS - j).sum();
+        let sets = oracle_probe_sets(&inf, z, gt, &oracle_pairs, k, &device);
+        let orc = evaluate(&inf, z, gt, &oracle_pairs, &sets, &device);
+        let (boc_pck, boc_per_sample) =
+            best_of_c_random_peeking(&inf, z, gt, &oracle_pairs, k, c, 0xC0FFEE + k as u64, &device);
+        let (d_on, lo_on, hi_on) =
+            block_bootstrap(&orc.per_sample, &oracle_noprobe.per_sample, &oracle_pairs, &w2f, 2000, 11);
+        let (d_ob, lo_ob, hi_ob) =
+            block_bootstrap(&orc.per_sample, &boc_per_sample, &oracle_pairs, &w2f, 2000, 12);
+        let (d_bn, lo_bn, hi_bn) =
+            block_bootstrap(&boc_per_sample, &oracle_noprobe.per_sample, &oracle_pairs, &w2f, 2000, 13);
+        control_rows.push(serde_json::json!({
+            "budget_k": k,
+            "candidates_C": c,
+            "oracle_pck@20": orc.pck20,
+            "best_of_C_random_peeking_pck@20": boc_pck,
+            "no_probe_pck@20": oracle_noprobe.pck20,
+            "oracle_minus_noprobe":   { "delta": d_on, "ci95_file_block": [lo_on, hi_on] },
+            "oracle_minus_bestOfC":   { "delta": d_ob, "ci95_file_block": [lo_ob, hi_ob],
+                                        "significant": lo_ob > 0.0 },
+            "bestOfC_minus_noprobe":  { "delta": d_bn, "ci95_file_block": [lo_bn, hi_bn] }
+        }));
+    }
+    let information_survives_control = control_rows
+        .iter()
+        .any(|r| r["oracle_minus_bestOfC"]["significant"].as_bool().unwrap_or(false));
+
     let oracle_beats_noprobe = oracle_rows
         .iter()
         .any(|r| r["oracle_minus_noprobe"]["beats_by_2se"].as_bool().unwrap_or(false));
@@ -360,6 +496,23 @@ fn main() {
             "2_coverage_within_3pp_all_levels": cov_ok,
             "3_eig_beats_random_by_2se": eig_ok,
             "rung2_best_pck_for_reference": RUNG2_BEST_PCK
+        },
+        "selection_inflation_control": {
+            "question": "is the target-peeking bound real information, or the expected \
+                         maximum of C noisy peeked scores?",
+            "method": "best-of-C RANDOM sets, also chosen by peeking, C matched to the \
+                       oracle's greedy candidate count; file-level block bootstrap (2000 \
+                       reps, whole recording files resampled) for all intervals",
+            "rows": control_rows,
+            "information_survives_control": information_survives_control,
+            "verdict": if information_survives_control {
+                "Oracle beats best-of-C-random at matched search size: the margin is \
+                 exploitable information, and the honest bound is oracle MINUS best-of-C."
+            } else {
+                "Oracle does NOT beat best-of-C-random at matched search size: the \
+                 apparent gain is SELECTION NOISE, not information. Any claim that \
+                 'the information is real' is WITHDRAWN."
+            }
         },
         "target_peeking_bound_at_rung3": {
             "pairs": oracle_pairs.len(),

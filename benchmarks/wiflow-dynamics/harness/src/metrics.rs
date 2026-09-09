@@ -7,10 +7,31 @@
 //! the tests use to prove this harness rejects what the old one accepted.
 
 pub const NUM_KEYPOINTS: usize = 15;
-/// Upstream `NECK_IDX` on the 15-keypoint convention.
-pub const NECK_IDX: usize = 2;
-/// Upstream `PELVIS_IDX` on the 15-keypoint convention.
-pub const PELVIS_IDX: usize = 12;
+
+// UPSTREAM NAMING DEFECT, preserved numerically and corrected in name.
+//
+// `utils/metrics.py` declares `NECK_IDX, PELVIS_IDX = 2, 12`. But the dataset's own
+// `config.py:37-41` KEYPOINT_NAMES says:
+//     0: Neck, 1: Chest, 2: L_Shoulder, ... 8: Pelvis, ... 12: R_Hip
+// So indices 2 and 12 are **L_Shoulder** and **R_Hip** -- the normalizer is a
+// shoulder-to-opposite-hip DIAGONAL, not neck-to-pelvis. Actual Neck is 0 and actual
+// Pelvis is 8.
+//
+// The VALUES are kept exactly as upstream, because reproducing upstream's metric is
+// the entire point of M2 -- changing them would silently invalidate the 0.9609
+// comparison. Only the names are corrected, so this file stops asserting something the
+// data contradicts. A diagonal is still a legitimate scale proxy; it is just not what
+// upstream called it.
+/// Upstream's `NECK_IDX` = 2. Per the dataset's KEYPOINT_NAMES this is **L_Shoulder**.
+pub const TORSO_IDX_A: usize = 2;
+/// Upstream's `PELVIS_IDX` = 12. Per the dataset's KEYPOINT_NAMES this is **R_Hip**.
+pub const TORSO_IDX_B: usize = 12;
+
+/// Deprecated aliases retained so existing call sites and write-ups remain findable.
+/// Prefer [`TORSO_IDX_A`] / [`TORSO_IDX_B`], whose names match the data.
+pub const NECK_IDX: usize = TORSO_IDX_A;
+/// See [`NECK_IDX`].
+pub const PELVIS_IDX: usize = TORSO_IDX_B;
 /// Upstream `torch.clamp(normalize_distances, min=0.01)`.
 pub const TORSO_CLAMP: f64 = 0.01;
 
@@ -34,8 +55,11 @@ impl Scores {
     }
 }
 
-/// Per-frame torso length, upstream definition: `‖target[NECK] − target[PELVIS]‖`,
-/// clamped below at 0.01 so a degenerate frame cannot divide by ~0.
+/// Per-frame normalizer, upstream definition: `‖target[2] − target[12]‖`, clamped below
+/// at 0.01 so a degenerate frame cannot divide by ~0.
+///
+/// Called "torso" throughout for continuity with upstream and with this repo's prior
+/// results, but it is a **L_Shoulder-to-R_Hip diagonal** -- see the constant docs above.
 pub fn torso_norms(gt: &[f32], n: usize) -> Vec<f64> {
     (0..n)
         .map(|i| {

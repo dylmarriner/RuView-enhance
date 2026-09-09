@@ -19,13 +19,35 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
 5. **Point accuracy: rung 3 reaches PCK@20 ≈0.942 (bar 0.7557, +18.7 pts)**, stable
    across three seeds — but this comes **entirely from the nonlinear mean head on
    `z_t`**, not from the probing.
-6. **PROBING DOES NOT HELP — it monotonically HURTS, significantly.** Paired against
-   *not probing at all*, EIG-greedy scores t = −1.42, **−5.04, −8.54, −10.16** at
-   K = 1, 3, 6, 9. Every policy at every budget is ≤ the no-probe number. Honest M4
-   statement: *revealing time-averaged `z_{t+1}` bands adds no measurable information
-   about `y_{t+1}` beyond `z_t` in either model class; probing actively costs
-   accuracy, and more probing costs more.* The +18.7 pts is the nonlinear mean head;
-   the action-conditioning contributes **nothing or less than nothing**.
+6. **PROBING DOES NOT HELP — and under CLUSTER-ROBUST inference the honest statement
+   is narrower than I first wrote.** Adjacent windows within a recording file are
+   correlated at 0.9970, so per-sample i.i.d. SEs badly understate uncertainty. A
+   file-level block bootstrap (2,000 reps, whole recordings resampled) gives:
+
+   | K | greedy − no-probe | CI95 (file-block) | sig? | (i.i.d. t was) |
+   |---|---|---|---|---|
+   | 1 | −0.00029 | [−0.00068, +0.00010] | no | −1.42 |
+   | 3 | −0.00152 | [−0.00305, +0.00018] | **no** | −5.04 |
+   | 6 | −0.00339 | [−0.00602, −0.00076] | **yes** | −8.54 |
+   | 9 | −0.00447 | [−0.00690, −0.00184] | **yes** | −10.16 |
+
+   | K | greedy − random | CI95 (file-block) | sig? | (i.i.d. t was) |
+   |---|---|---|---|---|
+   | 1 | +0.00026 | [−0.00028, +0.00088] | no | +0.94 |
+   | 3 | −0.00021 | [−0.00123, +0.00090] | no | −0.56 |
+   | 6 | −0.00168 | [−0.00398, +0.00018] | **no** | −3.70 |
+   | 9 | −0.00083 | [−0.00203, +0.00028] | no | −1.67 |
+
+   **Corrected claims:** (a) EIG-greedy is **indistinguishable from random at every
+   budget** — the "significantly worse" reading came from uncorrected i.i.d. SEs and
+   does not survive; (b) probing is significantly worse than **not probing** only at
+   **K=6 and K=9**, not at low budgets. An over-claimed negative is the same error as
+   an over-claimed positive with the sign flipped, and this correction was applied to
+   my own negative result at the same standard I applied to the positive one.
+   **Cluster-robust and seed-robust survivor:** greedy − no-probe is negative in every
+   seed × budget cell and grows monotonically more negative with budget — a sign
+   argument that needs no within-file independence assumption at all.
+   The +18.7 pts is the nonlinear mean head; the action-conditioning contributes nothing.
 7. **Rung 3 FAILS ALL THREE of its pre-registered criteria.** An apparent
    "EIG beats random by 3–5 SE" result was produced by a single **unseeded**
    initialisation and **did not replicate** across three seeds — retracted within this
@@ -33,20 +55,36 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
    speculated: diagonalising rung 2's covariance gives NLL −81.92 vs rung 3's ≈−98, so
    heteroscedasticity does pay on marginals; rung 2 won on joint NLL via its full
    30×30 covariance. Next: low-rank + diagonal head, heavier-tailed predictive.
-8. **The open question is RESOLVED, and against the intuition.** I ran the
-   discriminating experiment — a target-peeking bound **at rung 3** (n=5,000 pairs):
+8. **The information exists but is FIVE TIMES SMALLER than I first claimed.** I ran a
+   target-peeking bound at rung 3 and reported "+2.9 pts — the information is real".
+   **That was ~80% selection artifact.** The oracle takes an argmax over C candidates
+   scored against the *same* target used to choose them; the expected maximum of C noisy
+   per-sample scores exceeds the true best whether or not any information is exploited.
+   The control — **best-of-C RANDOM sets, also chosen by peeking, C matched to the
+   oracle's greedy candidate count** — separates them (n=5,000 pairs, file-level block
+   bootstrap):
 
-   | K | oracle | no-probe | delta | SE | t |
+   | K | C | oracle | best-of-C random+peek | no-probe | oracle−bestOfC (CI95) |
    |---|---|---|---|---|---|
-   | 3 | 0.9620 | 0.9416 | **+0.0204** | 0.00104 | **+19.5** |
-   | 9 | 0.9705 | 0.9416 | **+0.0290** | 0.00130 | **+22.3** |
+   | 3 | 78 | 0.9620 | **0.9585** | 0.9416 | **+0.0034** [+0.0024, +0.0046] |
+   | 9 | 207 | 0.9705 | **0.9649** | 0.9416 | **+0.0057** [+0.0047, +0.0068] |
 
-   **The information EXISTS — abundantly.** Persistence R² 0.871 suggested it might be
-   absent; that inference was wrong, and measuring beat asserting. Probing *can* be
-   worth ~+2.9 pts at K=9. **EIG-driven selection simply cannot find it** (it loses
-   0.4 pts instead of gaining 2.9 — a ~3.3 pt gap to the bound).
+   Best-of-C-random alone buys **+0.0170 (K=3)** and **+0.0233 (K=9)** over no-probe
+   with **zero information exploited** — that is pure selection-on-target inflation, and
+   it is **80–83% of the naive oracle gain**.
 
-9. **Why EIG cannot reach it — the mechanism, and it is a design choice I made.** My
+   **Corrected conclusion:** the information is **real and significant** (the margin
+   survives a file-level block bootstrap comfortably) but it is worth **≈ +0.57 points
+   at K=9, not +2.9**. The honest ceiling for *any* probe policy is oracle-minus-
+   best-of-C ≈ +0.6 pts. EIG-greedy loses ~0.4 pts, so the gap to the honest ceiling is
+   **≈ 1.0 point, not 3.3**. Persistence R² 0.871 pointed the right way after all — the
+   marginal information is present but small.
+
+   **Standing rule this establishes:** any peeking oracle in this artifact must be
+   reported as *oracle minus best-of-C-random at matched search size*, never as *oracle
+   minus no-probe*. The latter is an upper bound contaminated by its own search.
+
+9. **Why EIG cannot reach even that ~0.6 pt ceiling — a design choice I made.** My
    variance head is deliberately blind to revealed *values* (only `z_t` and the mask),
    which is what kept EIG closed-form and peek-free. But this bound shows the value of
    a probe here is **value-dependent**, not merely mask-dependent: the oracle exploits
@@ -127,10 +165,56 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
     and the correlation in item 12 have not been replicated across seeds. Rung 3
     taught exactly this lesson. Treat items 11–12 as one-seed measurements.
 
-**Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
-number** — different input abstraction (540 raw channels x 20 frames → 270 band means)
-and a different task (forecasting `y_{t+1}`, not sensing `y_t`). The only valid
-comparison is the mean-pose bar.
+**Nothing here is SOTA-beating.** But the incomparability claim I made earlier was
+wrong in both clauses, and is CORRECTED here:
+
+- **"A different task (forecasting)" — FALSE, retracted.** The model receives CSI at
+  `t` **and at `t+1`** and predicts pose at `t+1`. `CSI(t+1)` is **contemporaneous with
+  the target**. So this is concurrent CSI→pose sensing with one extra window of
+  temporal context — **the same task** the cited baseline solves, with strictly *more*
+  input. The `t+1` label is cosmetic when the corresponding observation is in the input
+  set. To earn the "forecasting" label the inputs would have to be restricted to
+  `CSI(≤t)`; they are not.
+- **"A different input abstraction" — true but far weaker than stated.** It was fair
+  when rung 2 sat 14 points back. Rung 3 reaches **0.9425 on the same 270-band
+  features**, leaving only **~1.8 points** to the cited 0.9609. So the band reduction
+  costs ~1.8 points, not 14.
+
+**The applicable comparison is therefore the cited 0.9609 baseline, and against it this
+work is ~1.8 points short — not 6.33 points ahead.** The honest ladder:
+
+| | PCK@20 | note |
+|---|---|---|
+| mean pose (split-fitted bar) | 0.7561 | weakest rung |
+| per-file mean pose | 0.7380 | leakage probe (lead, measured) |
+| rung 2 (joint Gaussian) | 0.8208 | |
+| **rung 3 (neural heteroscedastic)** | **0.9425** | same features as rung 2 |
+| **cited WiFlow CSI→pose** | **0.9609** | **same task, LESS input — the applicable bar** |
+| persistence (consumes GT pose) | 0.9970 | oracle, unreachable from CSI |
+
+**Persistence is NOT a fair bar** — it consumes ground-truth `pose(t)`, which this model
+never receives at any timestep. Different information sets. Its narrow lesson is only:
+never build a model whose job is `pose(t) → pose(t+1)`; that mapping is solved by copying.
+
+**The 14-point deficit decomposes ~87% model capacity / ~13% features** — rung 3 closed
+12.2 of it with features held fixed. **Caveat on that attribution:** rungs 2 and 3 differ
+in *two* ways at once (closed-form-linear vs neural, AND homoscedastic vs
+heteroscedastic), so "capacity" is not cleanly isolated. See the homoscedastic control
+spec below.
+
+**Bar instability (important for anyone quoting these numbers).** The mean-pose bar is
+**split-specific**: across sampled files it ranges 0.007–0.806 with IQR ≈ **0.056**, and
+0.7561 sits near its p75. That spread is three orders of magnitude larger than the
+1.4e-5 reproducibility floor and larger than several effects measured here. All
+comparisons in this work use `honesty_bar_on_same_pairs` — the bar recomputed on the
+model's own split — which is what makes them valid. **No bar figure from this work may
+be compared against a bar computed on a different split.**
+
+**Evaluation-set sizes, stated explicitly** (previously ambiguous and it cost an
+outside reviewer real time): the test split holds **52,487** valid pairs;
+`n = 20,000` is a **seeded subsample** of it, and the M4/oracle sets are further
+subsamples. Corrupt files 487–499 are excluded via the committed masks, and PCK
+aggregation is a **single flat mean over frames × keypoints** (not per-frame-then-mean).
 
 Last updated: 2026-09-08 (session start)
 Worktree: `/home/ruvultra/projects/ruview-worktrees/wiflow-dynamics`
@@ -556,6 +640,138 @@ class, on any seed. Rung 3 fails all three of its pre-registered criteria. The
 **Reproducibility note (M5):** rung-3 numbers are now seeded (`RUNG3_SEED`, default
 2026) and reproducible. The earlier unseeded run is preserved as
 `results/rung3_undertrained_12ep.json`; per-seed results are `results/rung3_seed*.json`.
+
+## Superseded claims in the git history (read before trusting a commit message)
+
+Commit messages are immutable, so falsified ones are superseded here rather than
+rewritten. A reader running `git log` must not take these as the last word.
+
+- **`5498dd7c` — "rung 3 heteroscedastic head — EIG probing works once Sigma depends on
+  z_t". FALSIFIED by my own replication.** That commit's 3–5 SE win came from a single
+  **unseeded** initialisation (Burn's `LinearConfig::init` draws from a global RNG my
+  LCG never covered). Across seeds 2026 / 7 / 101 the sign is not stable, and against
+  *no-probe* every policy loses. Superseding numbers are in items 6, 11–13 above.
+- **"EIG is an overconfidence-seeking criterion"** (commit `8e3aab75` message body) —
+  retracted in `2fbf21f4`; I had read the err/var ratio backwards. See item 11.
+
+## Terminology: this policy is NOT adaptive
+
+Called "adaptive sensing" in earlier notes; that is **wrong** and is corrected
+everywhere. The variance head takes `(z_t, mask)` and deliberately **not** the revealed
+values, so for a fixed `z_t` the entire greedy sequence is determined *before a single
+probe is taken*. It is **open-loop per instance, instance-conditioned across instances**
+— "per-sample probe-set selection".
+
+- Krause, Singh & Guestrin, JMLR 9:235–284 (2008) §10: *"any closed-loop strategy which
+  sequentially decides on the next location to measure, surprisingly, is equivalent to
+  an open loop placement strategy."* Krause & Guestrin, ICML 2007 §4: *"any objective
+  function depending only on the predictive variances cannot benefit from sequential
+  strategies."* An equality, not a bound.
+- It is also **not** a single static ranking: 19,653 distinct probe sets across 20,000
+  samples (rung 2 had exactly 1). That measurement is what distinguishes the three
+  cases — but note it *cannot* distinguish per-sample-fixed from closed-loop, since both
+  produce ~20,000 distinct sets. **Not adaptive, not static, instance-conditioned.**
+
+## No approximation guarantee is claimed, and none is available
+
+Any implication that greedy EIG inherits a `(1−1/e)` bound would be **false**; none
+appears in this artifact and none may be added.
+
+- Krause et al. (2008) Remark 13: *"The information gain, IG(A) = I(A;U) is not
+  submodular in A"*, with an explicit 3×3 Gaussian counterexample. Their `(1−1/e)` is
+  for `I(A; V\A)` (field coverage), **not** `I(A; Y)` for a distinguished target — which
+  is this case. Correlated CSI, where a band is useless alone but informative in
+  combination, is exactly the non-submodular regime.
+- Precision: **MI itself is submodular**; it is *monotonicity* that is approximate. The
+  honest quantity is Das & Kempe's (ICML 2011) submodularity ratio γ, estimated
+  empirically — not lower-bounded spectrally, which is near-vacuous for 540 correlated
+  features.
+- Chen, Hassani, Karbasi & Krause (COLT 2015): the MI criterion violates adaptive
+  submodularity, so even a properly closed-loop version would not inherit the
+  Golovin–Krause guarantee. Do not trade one unavailable guarantee for another.
+
+**This selection study is empirical. It carries no bound.**
+
+## Independent corroboration and prior art
+
+- **Rung 2's null has direct published corroboration.** Khamaisi & Rodrigues,
+  arXiv:2602.10823, *"Less is More: The Dilution Effect in Multi-Link Wireless Sensing"*
+  — 9-node / 72-link mesh over 12 days: *"sophisticated link selection provided no
+  significant advantage over random selection (p = 0.35)"*, the benefit coming from
+  avoiding multi-link fusion rather than optimising which link to use. That is this
+  result, independently, in a real WiFi-sensing deployment.
+- **The efficiency result is corroboration, not novelty.** "Fewer subcarriers suffice
+  for pose" is already published: Capozzi et al., IbPRIA 2025 (LNCS 15938),
+  attention-rollout subcarrier importance with a random control. *Caveat: only the
+  abstract was readable (SpringerLink 502'd), so its numbers are unread and no numeric
+  comparison is made here.*
+- **The gap statement**, with no mechanism attached in the literature: Meneghello et
+  al., IEEE Comm. Mag. 2023 (arXiv:2212.13930) — *"the design of sensing applications
+  should consider properly selecting the sub-channels that are the best for sensing
+  purposes."*
+- **The low-rank fix was reached twice independently** — from these results, and from
+  the literature: Dorta et al., CVPR 2018, *"Structured Uncertainty Prediction
+  Networks"*, `Σ = D + VVᵀ` at rank 4–8.
+- **What is genuinely unclaimed:** budgeted, information-gain-driven, *sequential*,
+  test-time CSI feature selection. Hard selection exists in EEG (Strypsteen & Bertrand
+  2021, Gumbel-softmax channel selection) and has not been ported to CSI; the CSI pose
+  subfield adds sensors rather than pruning them.
+- **The strongest surviving claim is about evaluation practice.** Active-feature-
+  acquisition work is evaluated almost exclusively by point accuracy — EDDI (ICML 2019),
+  GSMRL (ICML 2021), Covert et al. (ICML 2023) and AFABench (2025) report accuracy/F1
+  with **zero** calibration metrics; EDDI's regression curves use RMSE, which would show
+  PCK improving here while hiding the NLL collapse entirely. *"AFA policies are
+  evaluated exclusively by functionals of the mean; under a proper scoring rule the
+  greedy policy is worse than random and the gap grows with budget"* is defensible on
+  this evidence.
+
+## NLL degradation decomposes into two named mechanisms (MEASURED)
+
+From `results/rung3.json`, NLL from K=1 → K=9:
+
+| policy | K=1 | K=9 | degradation |
+|---|---|---|---|
+| random | −102.503 | −100.882 | 1.621 |
+| greedy | −101.823 | −95.634 | 6.189 |
+
+**Both degrade, so both mechanisms are present and separable:** ~1.62 nats is the
+baseline effect — **feedback covariate shift** over the mask distribution (Fannjiang,
+Bates, Angelopoulos, Listgarten & Jordan, PNAS 119(43), 2022) — and the ~4.57-nat excess
+is greedy-specific, the **optimizer's curse** (Smith & Winkler, *Management Science*
+52(3):311–322, 2006). Roughly **26% baseline / 74% greedy-specific**.
+Free follow-up: retrain the variance head on the policy's *own* induced mask
+distribution rather than uniform random masks. That attacks the covariate-shift half at
+zero modelling cost. It will **not** fix the open-loop property.
+
+## Untested controls and named-but-unchecked degeneracies (for a later session)
+
+- **PRIMARY untested control — homoscedastic same-backbone.** Hold *everything* fixed
+  including the **trained mean head**, so μ and therefore PCK are identical by
+  construction across arms; vary only the covariance, replacing per-sample
+  `Σ(z_t, mask)` with a single global `Σ̂` from training residuals, in the **full 30×30
+  form** (so heteroscedastic-vs-homoscedastic is not confounded with
+  diagonal-vs-full). Adjudicate on **ENCE** — the only metric that directly tests
+  whether per-sample σ is *informative* rather than merely calibrated; energy and
+  variogram scores alongside, NLL secondary. **Decision rule:** if the heteroscedastic
+  head does not beat that control on ENCE, per-sample variance carries no information.
+- **Corruption avoidance (unchecked).** Files 487–499 are corrupt and file-clustered, so
+  a selector could score by dodging corruption rather than by finding pose-informative
+  bands. Check: mask corruption before selection and report both.
+- **File fingerprinting (unchecked, likely weak).** A selector could pick features that
+  identify the recording, letting the predictor memorise per-file pose statistics.
+  Per-file mean pose is 0.7380 vs global 0.7264, so this channel is worth only ~+1.2
+  points here. Direct test: a classifier on the selected subset predicting file ID.
+- **Mask leakage — considered and DISCONFIRMED, no test needed.** The hypothesis was
+  that the predictor reads pose from *which* features were selected (the greedy mask is
+  a deterministic function of `z_t`, and `z_t` predicts pose), which would manufacture a
+  spurious greedy-over-random win. That mechanism predicts a win; replication produced
+  **no win**. The replication already did the work the proposed test would have done.
+- **Anatomical plausibility (not run).** The dataset ships `SKELETON_CONNECTIONS`
+  (14 bones); GT bone-length std across 345,373 complete windows is **0.00801**. Draw
+  M=100 samples from the stored per-instance (μ, σ), compute the 14 bone lengths, take
+  within-instance std per bone, average, divide by 0.00801. A ratio above ~1.3 means the
+  diagonal head emits anatomically impossible poses — a failure marginal coverage
+  structurally cannot see, and direct evidence for the low-rank fix.
 
 ## Reporting rules
 
