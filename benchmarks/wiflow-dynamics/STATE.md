@@ -216,6 +216,39 @@ after seeing results. Deviations from this section must be recorded as deviation
 - **EIG target is pose** `y_{t+1}` (the charter's actual question — "which probe most
   reduces uncertainty about pose"). EIG about unobserved bands is secondary.
 
+### RUNG 3 PRE-REGISTRATION (written 2026-09-08 ~23:05, BEFORE the model was written)
+
+**The question rung 3 asks, and nothing else:** *does an input-dependent `Σ(z_t, mask)`
+let EIG close any of the target-peeking gap?* Rung 2 established that adaptivity with
+no information buys nothing, and that the whole gap is "knowing which bands matter at
+this timestep". A heteroscedastic head is the minimal thing that could supply that.
+
+**Architecture (fixed now).** Two heads over the same inputs:
+- **variance head:** `(z_t, mask) → log σ²` for the 30 pose dims. It deliberately does
+  **not** see the revealed values. That makes EIG computable in closed form without
+  sampling *and* without peeking — the only reason the design is shaped this way.
+  Crucially `σ` now depends on `z_t`, so the EIG-optimal probe set **varies per
+  sample**. That is the one thing rung 2 could not do.
+- **mean head:** `(z_t, mask ⊙ z_{t+1}, mask) → μ`.
+- Diagonal Gaussian predictive; loss = Gaussian NLL; masks drawn at random per sample
+  per epoch so the model learns `p(· | z_t, S)` for arbitrary `S`.
+- Backend: **`burn-ndarray` (CPU), chosen deliberately.** The model is tiny and 60k
+  samples train in minutes; this removes the Blackwell/sm_120 CUDA build risk. Rung 3
+  is a capability question, not a throughput one.
+
+**Pass condition — ALL THREE, or rung 3 is reported as "did not help":**
+1. beats the rung-2 joint Gaussian on held-out pose NLL; **and**
+2. coverage within ±3 pp at **all four** levels (the criterion rung 2 marginally
+   missed at 50%); **and**
+3. EIG-greedy beats random on PCK@20 by **more than 2 SE**, paired, at some budget K.
+
+**Evaluation is reused unchanged** — same 20,000 test pairs, same mean-pose bar, same
+coverage protocol, same policies and paired tests. Nothing about the harness moves.
+
+**Hard time-box.** If rung 3 does not produce a measured result tonight, it is
+recorded as "not attempted / incomplete", never as a partial claim. Rung 3 is
+optional; the charter is already satisfied by rungs 1–2.
+
 ### Honesty constraints agreed in advance
 
 - **A homoscedastic Σ makes "EIG-driven" a FIXED policy.** For a Gaussian,
