@@ -15,6 +15,7 @@
     "mpjpe": 0.02603940523099254,
     "pck@20": 0.75565
   },
+  "init_seed": 2026,
   "milestone": "Rung 3 -- neural heteroscedastic head. MEASURED by harness/src/bin/rung3.rs, this run.",
   "no_probe": {
     "coverage": [
@@ -242,6 +243,35 @@
     "2_coverage_within_3pp_all_levels": false,
     "3_eig_beats_random_by_2se": false,
     "rung2_best_pck_for_reference": 0.8208
+  },
+  "target_peeking_bound_at_rung3": {
+    "interpretation": "Information EXISTS but the EIG criterion / architecture cannot reach it.",
+    "oracle_beats_no_probe_by_2se": true,
+    "pairs": 5000,
+    "rows": [
+      {
+        "budget_k": 3,
+        "no_probe_pck@20": 0.9416,
+        "oracle_minus_noprobe": {
+          "beats_by_2se": true,
+          "delta": 0.02036000000000004,
+          "se": 0.0010449355175440225,
+          "t": 19.484455890496886
+        },
+        "oracle_pck@20": 0.96196
+      },
+      {
+        "budget_k": 9,
+        "no_probe_pck@20": 0.9416,
+        "oracle_minus_noprobe": {
+          "beats_by_2se": true,
+          "delta": 0.028946666666666586,
+          "se": 0.0012961647253593282,
+          "t": 22.33255241430974
+        },
+        "oracle_pck@20": 0.9705466666666667
+      }
+    ]
   },
   "training": {
     "batch": 512,

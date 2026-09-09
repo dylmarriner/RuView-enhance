@@ -33,13 +33,28 @@ All numbers below are **MEASURED by this work**; the 0.9609 baseline is **CITED*
    speculated: diagonalising rung 2's covariance gives NLL −81.92 vs rung 3's ≈−98, so
    heteroscedasticity does pay on marginals; rung 2 won on joint NLL via its full
    30×30 covariance. Next: low-rank + diagonal head, heavier-tailed predictive.
-8. **The open question this leaves** (do not resolve by assertion): is the missing
-   information absent, or merely unreachable by this architecture? Persistence R²
-   0.871 says 87% of `z_{t+1}` is already implied by `z_t`, which argues *absent*.
-   Rung 2's target-peeking bound argued *some exists*. The discriminating experiment
-   is a target-peeking bound **at rung 3**: if even an oracle cannot beat no-probe,
-   the marginal information is not there and the primitive's value must come from a
-   different observation definition than time-averaged bands.
+8. **The open question is RESOLVED, and against the intuition.** I ran the
+   discriminating experiment — a target-peeking bound **at rung 3** (n=5,000 pairs):
+
+   | K | oracle | no-probe | delta | SE | t |
+   |---|---|---|---|---|---|
+   | 3 | 0.9620 | 0.9416 | **+0.0204** | 0.00104 | **+19.5** |
+   | 9 | 0.9705 | 0.9416 | **+0.0290** | 0.00130 | **+22.3** |
+
+   **The information EXISTS — abundantly.** Persistence R² 0.871 suggested it might be
+   absent; that inference was wrong, and measuring beat asserting. Probing *can* be
+   worth ~+2.9 pts at K=9. **EIG-driven selection simply cannot find it** (it loses
+   0.4 pts instead of gaining 2.9 — a ~3.3 pt gap to the bound).
+
+9. **Why EIG cannot reach it — the mechanism, and it is a design choice I made.** My
+   variance head is deliberately blind to revealed *values* (only `z_t` and the mask),
+   which is what kept EIG closed-form and peek-free. But this bound shows the value of
+   a probe here is **value-dependent**, not merely mask-dependent: the oracle exploits
+   *which values actually came back*, and a mask-only variance head structurally cannot
+   represent that. **The fix is the observation head the original design constraint
+   called for and I traded away for tractability:** sample candidate `z_{t+1}[S]` from
+   `p(z_{t+1}[S] | z_t, revealed)` and average the resulting pose entropies — proper
+   Monte-Carlo EIG. That is the single highest-value next experiment.
 
 **Nothing here is SOTA-beating, and nothing is comparable to the 96.09% full-CSI
 number** — different input abstraction (540 raw channels x 20 frames → 270 band means)

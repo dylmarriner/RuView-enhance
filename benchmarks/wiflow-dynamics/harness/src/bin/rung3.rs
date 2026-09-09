@@ -77,6 +77,57 @@ fn random_groups(rng: &mut Rng, k: usize) -> Vec<usize> {
     pool[..k].to_vec()
 }
 
+/// Per-sample greedy probe selection using the TRUE y_{t+1} -- a target-peeking upper
+/// bound on every policy, achievable by none.
+fn oracle_probe_sets(
+    model: &HeteroModel<BI>,
+    z: &[f32],
+    gt: &[f32],
+    pairs: &[usize],
+    k: usize,
+    device: &NdArrayDevice,
+) -> Vec<Vec<usize>> {
+    let mut out = vec![Vec::new(); pairs.len()];
+    for _step in 0..k {
+        let mut best: Vec<(f64, usize)> = vec![(f64::INFINITY, usize::MAX); pairs.len()];
+        for cand in 0..NUM_PROBE_GROUPS {
+            let gs: Vec<Vec<usize>> = (0..pairs.len())
+                .map(|i| {
+                    let mut set = out[i].clone();
+                    if !set.contains(&cand) {
+                        set.push(cand);
+                    }
+                    set
+                })
+                .collect();
+            let (zt, mn, mk, yy) = make_batch::<BI>(z, gt, pairs, &gs, device);
+            let (mu, _) = model.forward(zt, mn, mk);
+            let mud: Vec<f32> = mu.into_data().to_vec().unwrap();
+            let yd: Vec<f32> = yy.into_data().to_vec().unwrap();
+            for i in 0..pairs.len() {
+                if out[i].contains(&cand) {
+                    continue;
+                }
+                let err: f64 = (0..POSE_DIM)
+                    .map(|d| {
+                        let j = i * POSE_DIM + d;
+                        ((mud[j] - yd[j]) as f64).powi(2)
+                    })
+                    .sum();
+                if err < best[i].0 {
+                    best[i] = (err, cand);
+                }
+            }
+        }
+        for i in 0..pairs.len() {
+            if best[i].1 != usize::MAX {
+                out[i].push(best[i].1);
+            }
+        }
+    }
+    out
+}
+
 /// Assemble one training/eval batch.
 fn make_batch<Bk: burn::tensor::backend::Backend>(
     z: &[f32],
@@ -248,6 +299,30 @@ fn main() {
         }));
     }
 
+    // ---- discriminating experiment: target-peeking bound AT RUNG 3 ----------
+    // Open question this resolves: is the marginal information ABSENT, or merely
+    // unreachable by the EIG criterion / this architecture? An oracle that selects
+    // probes using the TRUE y_{t+1} upper-bounds every policy. If even IT cannot beat
+    // not probing, the information is not there for this observation definition.
+    // Subsampled to 5,000 pairs for cost; no-probe is rescored on the SAME pairs.
+    let oracle_pairs = subsample(&test_pairs, 5_000, 999);
+    let oracle_noprobe = evaluate(&inf, z, gt, &oracle_pairs, &vec![vec![]; oracle_pairs.len()], &device);
+    let mut oracle_rows = Vec::new();
+    for &k in &[3usize, 9] {
+        let sets = oracle_probe_sets(&inf, z, gt, &oracle_pairs, k, &device);
+        let o = evaluate(&inf, z, gt, &oracle_pairs, &sets, &device);
+        let (d, se, t) = paired(&o.per_sample, &oracle_noprobe.per_sample);
+        oracle_rows.push(serde_json::json!({
+            "budget_k": k,
+            "oracle_pck@20": o.pck20,
+            "no_probe_pck@20": oracle_noprobe.pck20,
+            "oracle_minus_noprobe": { "delta": d, "se": se, "t": t, "beats_by_2se": t > 2.0 }
+        }));
+    }
+    let oracle_beats_noprobe = oracle_rows
+        .iter()
+        .any(|r| r["oracle_minus_noprobe"]["beats_by_2se"].as_bool().unwrap_or(false));
+
     let cov_ok = no_probe
         .coverage
         .as_array()
@@ -285,6 +360,18 @@ fn main() {
             "2_coverage_within_3pp_all_levels": cov_ok,
             "3_eig_beats_random_by_2se": eig_ok,
             "rung2_best_pck_for_reference": RUNG2_BEST_PCK
+        },
+        "target_peeking_bound_at_rung3": {
+            "pairs": oracle_pairs.len(),
+            "rows": oracle_rows,
+            "oracle_beats_no_probe_by_2se": oracle_beats_noprobe,
+            "interpretation": if oracle_beats_noprobe {
+                "Information EXISTS but the EIG criterion / architecture cannot reach it."
+            } else {
+                "Even a target-peeking oracle cannot beat not probing: the marginal \
+                 information in time-averaged z_{t+1} bands is ABSENT, not merely \
+                 unreachable. The primitive needs a different observation definition."
+            }
         },
         "does_probing_help_at_all": {
             "any_budget_where_eig_greedy_beats_no_probe_by_2se": any_probe_beats_noprobe,
