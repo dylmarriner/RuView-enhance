@@ -30,6 +30,8 @@ pub mod emitter;
 pub mod availability;
 #[cfg(feature = "std")]
 pub mod event;
+#[cfg(feature = "std")]
+pub mod cbr;
 pub mod frame;
 #[cfg(feature = "std")]
 pub mod ha_discovery;
