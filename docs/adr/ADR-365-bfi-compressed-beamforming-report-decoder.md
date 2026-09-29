@@ -60,6 +60,27 @@ Honesty boundary encoded in the code and its tests:
 The decoder is allocation-light, `#![forbid(unsafe_code)]` (crate-wide), and
 passes the crate's `-D warnings` clippy gate (pedantic + nursery).
 
+### Offline ingest and motion features (software e2e)
+
+Two further modules complete the software pipeline on `SYNTHETIC` data, so only
+the physical capture remains:
+
+- `capture` — parses a `LINKTYPE_IEEE802_11_RADIOTAP` pcap itself (no libpcap
+  dependency), skips radiotap by its length field, extracts management
+  Action / Action-No-Ack bodies, feeds each to the decoder, and returns a
+  `ReportRateSummary` (reports/sec, sequence gaps, duplicates, decode
+  failures) — the report-rate dashboard input the plan calls for.
+- `features` — the "feedback angles" motion path: a bounded per-report summary
+  (circular-mean `Phi`, mean `Psi`, mean SNR) and a temporal `motion_energy`
+  primitive (circular `Phi` difference between consecutive reports), producing
+  a motion time series from a capture. No steering matrix `V` is
+  reconstructed, so no range/AoA is claimed.
+
+Chain now runnable end to end in software: `pcap -> decode -> motion series`.
+Not yet implemented: a trained sensing/tracking model, fusion with the CSI
+boards, and — the gating item — a real capture. No motion or tracking accuracy
+is claimed until a real capture with ground truth exists.
+
 ## Consequences
 
 - The BFLD pipeline can be fed real beamforming angles once a capture path

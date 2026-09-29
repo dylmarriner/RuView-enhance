@@ -32,6 +32,10 @@ pub mod availability;
 pub mod event;
 #[cfg(feature = "std")]
 pub mod cbr;
+#[cfg(feature = "std")]
+pub mod capture;
+#[cfg(feature = "std")]
+pub mod features;
 pub mod frame;
 #[cfg(feature = "std")]
 pub mod ha_discovery;
