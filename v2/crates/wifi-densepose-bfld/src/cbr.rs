@@ -9,13 +9,12 @@
 //! pre-computed proxy.
 //!
 //! Scope and honesty boundary (the `MEASURED`/`CLAIMED`/`SYNTHETIC` rule):
-//! - **VHT SU** follows IEEE 802.11-2020 §9.4.1.51 and is exercised by
-//!   round-trip and spec-table unit tests on `SYNTHETIC` frames. It has not yet
-//!   been cross-checked against a real over-the-air capture or an independent
-//!   decoder (`WiPiCap` / `Wi-BFI`), so decoded angle *values* are `CLAIMED`
-//!   until a captured frame decodes identically under a second tool.
-//! - **VHT MU** codebook-1 angle widths are not encoded here because the author
-//!   could not verify them; that case returns [`CbrError::Unsupported`].
+//! - **VHT SU and MU** follow IEEE 802.11-2020 §9.4.1.51. The angle bit widths
+//!   (Table 9-92) are cross-checked against the `Wi-BFI` and `WiPiCap` reference
+//!   decoders, which agree; the structure is exercised by round-trip and
+//!   spec-table unit tests on `SYNTHETIC` frames. Decoded angle *values* stay
+//!   `CLAIMED` until a real captured frame decodes identically (e.g. matrix
+//!   unitarity, as `WiPiCap` asserts) — no over-the-air capture yet.
 //! - **HE** and **EHT** angle bitstreams are [`CbrError::Unsupported`].
 
 #![cfg(feature = "std")]
@@ -178,16 +177,16 @@ impl VhtMimoControl {
         })
     }
 
-    /// `(psi_bits, phi_bits)` per 802.11-2020 Table 9-92, verified rows only.
-    fn angle_bits(self) -> Result<(u32, u32), CbrError> {
-        Ok(match (self.mu, self.codebook) {
-            (false, false) => (5, 7), // SU codebook 0
-            // SU codebook 1 and MU codebook 0 share the (7, 9) widths.
-            (false, true) | (true, false) => (7, 9),
-            (true, true) => {
-                return Err(CbrError::Unsupported("MU codebook 1 angle widths unverified"))
-            }
-        })
+    /// `(psi_bits, phi_bits)` per IEEE 802.11-2020 Table 9-92, cross-checked
+    /// against the Wi-BFI and WiPiCap reference decoders (which agree): SU uses
+    /// the smaller (2,4)/(4,6) widths, MU the larger (5,7)/(7,9).
+    fn angle_bits(self) -> (u32, u32) {
+        match (self.mu, self.codebook) {
+            (false, false) => (2, 4), // SU codebook 0
+            (false, true) => (4, 6),  // SU codebook 1
+            (true, false) => (5, 7),  // MU codebook 0
+            (true, true) => (7, 9),   // MU codebook 1
+        }
     }
 }
 
@@ -318,10 +317,7 @@ pub fn parse_vht_action(body: &[u8]) -> Result<VhtBeamform, CbrError> {
 /// Same conditions as [`parse_vht_action`].
 pub fn parse_vht_report(rep: &[u8]) -> Result<VhtBeamform, CbrError> {
     let control = VhtMimoControl::parse(rep)?;
-    if control.mu && control.codebook {
-        return Err(CbrError::Unsupported("MU codebook 1 angle widths unverified"));
-    }
-    let (psi_bits, phi_bits) = control.angle_bits()?;
+    let (psi_bits, phi_bits) = control.angle_bits();
     let nc = usize::from(control.nc);
 
     let snr_start = 3;
@@ -441,7 +437,20 @@ mod tests {
         assert_eq!(c.grouping, Grouping::Ng1);
         assert!(!c.codebook && !c.mu);
         assert_eq!(c.sounding_token, 42);
-        assert_eq!(c.angle_bits().unwrap(), (5, 7));
+        assert_eq!(c.angle_bits(), (2, 4)); // SU codebook 0: (psi, phi)
+    }
+
+    #[test]
+    fn angle_bits_match_reference_decoders() {
+        // (mu, codebook) -> (psi, phi), per Wi-BFI + WiPiCap (they agree).
+        let bits = |mu, cb| {
+            let raw = mk_ctl(1, 2, 0, 0, u8::from(cb), u8::from(mu), 0);
+            VhtMimoControl::parse(&raw).unwrap().angle_bits()
+        };
+        assert_eq!(bits(false, false), (2, 4)); // SU cb0
+        assert_eq!(bits(false, true), (4, 6)); // SU cb1
+        assert_eq!(bits(true, false), (5, 7)); // MU cb0
+        assert_eq!(bits(true, true), (7, 9)); // MU cb1
     }
 
     #[test]
@@ -453,15 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn mu_codebook1_unsupported_not_guessed() {
-        let raw = mk_ctl(2, 2, 2, 0, 1, 1, 0); // MU + codebook1
+    fn mu_codebook1_now_decodes() {
+        // Previously refused as "unverified"; the reference decoders define it
+        // as (psi=7, phi=9), so it must decode.
+        let raw = mk_ctl(2, 2, 2, 0, 1, 1, 0); // MU + codebook1, 2x2/80MHz/Ng1
         let mut body = vec![21u8, 0];
         body.extend_from_slice(&raw);
-        body.extend_from_slice(&[0; 64]);
-        assert_eq!(
-            parse_vht_action(&body),
-            Err(CbrError::Unsupported("MU codebook 1 angle widths unverified"))
-        );
+        body.extend_from_slice(&[0, 0]); // avg SNR, Nc=2
+        let ns = 234usize; // 80MHz Ng1
+        body.extend(std::iter::repeat_n(0u8, ns * (7 + 9) / 8 + 1));
+        let r = parse_vht_action(&body).unwrap();
+        assert_eq!((r.psi_bits, r.phi_bits), (7, 9));
     }
 
     /// End-to-end: synthesize a 2x2/80MHz/Ng1/SU-cb0 report with known angle
@@ -472,7 +483,7 @@ mod tests {
         let ctl = mk_ctl(nc, nr, 2, 0, 0, 0, 7); // 80MHz Ng1
         let ns = 234usize;
         let per = angles_per_subcarrier(nr, nc); // 1
-        let (psi_bits, phi_bits) = (5u32, 7u32);
+        let (psi_bits, phi_bits) = (2u32, 4u32); // SU codebook 0
 
         let phi_codes: Vec<u16> =
             (0..ns * per).map(|i| u16::try_from(i * 3 % (1 << phi_bits)).unwrap()).collect();

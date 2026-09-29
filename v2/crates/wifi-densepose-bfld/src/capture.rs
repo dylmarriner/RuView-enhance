@@ -199,7 +199,7 @@ mod tests {
         let ctl = &v.to_le_bytes()[..3];
         let ns = 234usize; // 80MHz Ng1
         let per = 1usize; // 2x2
-        let angle_bytes = (ns * per * (7 + 5)).div_ceil(8);
+        let angle_bytes = (ns * per * (4 + 2)).div_ceil(8); // SU cb0: phi=4, psi=2
         let mut body = vec![21u8, 0]; // category=21 VHT, action=0
         body.extend_from_slice(ctl);
         body.extend_from_slice(&[0, 0]); // avg SNR, Nc=2

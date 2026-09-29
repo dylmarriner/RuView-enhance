@@ -120,7 +120,7 @@ mod tests {
         let v: u32 = (2 - 1) | ((2 - 1) << 3) | (2 << 6) | (1 << 18);
         let ctl = &v.to_le_bytes()[..3];
         let ns = 234usize;
-        let (phi_bits, psi_bits) = (7u32, 5u32);
+        let (phi_bits, psi_bits) = (4u32, 2u32); // SU codebook 0
         let mut acc = 0u32;
         let mut held = 0u32;
         let mut stream = Vec::new();
@@ -164,10 +164,11 @@ mod tests {
 
     #[test]
     fn phi_difference_is_circular() {
-        // code 0 vs code (max) should be a SMALL circular step, not the max.
-        let max = (1u16 << 7) - 1; // phi_bits=7
-        let near_wrap = motion_energy(&report(0), &report(max)).unwrap();
-        let half = motion_energy(&report(0), &report(1 << 6)).unwrap(); // half-circle
+        // phi_bits=4 (SU cb0), so phi codes span 0..16. Hold psi constant by
+        // choosing codes that are all 0 mod 4 (psi = code % 4). Code 12 is only
+        // 4 steps from 0 across the wrap; code 8 is a half-circle away.
+        let near_wrap = motion_energy(&report(0), &report(12)).unwrap();
+        let half = motion_energy(&report(0), &report(8)).unwrap();
         assert!(near_wrap < half, "wrap {near_wrap} should be < half-circle {half}");
     }
 
