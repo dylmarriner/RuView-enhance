@@ -178,7 +178,7 @@ impl VhtMimoControl {
     }
 
     /// `(psi_bits, phi_bits)` per IEEE 802.11-2020 Table 9-92, cross-checked
-    /// against the Wi-BFI and WiPiCap reference decoders (which agree): SU uses
+    /// against the `Wi-BFI` and `WiPiCap` reference decoders (which agree): SU uses
     /// the smaller (2,4)/(4,6) widths, MU the larger (5,7)/(7,9).
     fn angle_bits(self) -> (u32, u32) {
         match (self.mu, self.codebook) {
@@ -247,19 +247,30 @@ pub struct VhtBeamform {
     pub psi: Vec<u16>,
 }
 
+/// Dequantize a `Phi` code: `phi = (k + 1/2) * pi / 2^(bphi-1)`, in `(0, 2*pi)`.
+/// Matches the `WiPiCap` `quantized_angle_formulas` (pinned by a unit test).
+#[must_use]
+pub fn dequant_phi(code: u16, phi_bits: u32) -> f64 {
+    (f64::from(code) + 0.5) * core::f64::consts::PI / f64::from(1u32 << (phi_bits - 1))
+}
+
+/// Dequantize a `Psi` code: `psi = (k + 1/2) * pi / 2^(bpsi+1)`, in `(0, pi/2)`.
+#[must_use]
+pub fn dequant_psi(code: u16, psi_bits: u32) -> f64 {
+    (f64::from(code) + 0.5) * core::f64::consts::PI / f64::from(1u32 << (psi_bits + 1))
+}
+
 impl VhtBeamform {
-    /// Dequantize a `Phi` code to radians: `phi = (k + 1/2) * pi / 2^(bphi-1)`,
-    /// spanning `(0, 2*pi)`.
+    /// Dequantize a `Phi` code to radians, spanning `(0, 2*pi)`.
     #[must_use]
     pub fn phi_radians(&self, code: u16) -> f64 {
-        (f64::from(code) + 0.5) * core::f64::consts::PI / f64::from(1u32 << (self.phi_bits - 1))
+        dequant_phi(code, self.phi_bits)
     }
 
-    /// Dequantize a `Psi` code to radians: `psi = (k + 1/2) * pi / 2^(bpsi+1)`,
-    /// spanning `(0, pi/2)`.
+    /// Dequantize a `Psi` code to radians, spanning `(0, pi/2)`.
     #[must_use]
     pub fn psi_radians(&self, code: u16) -> f64 {
-        (f64::from(code) + 0.5) * core::f64::consts::PI / f64::from(1u32 << (self.psi_bits + 1))
+        dequant_psi(code, self.psi_bits)
     }
 }
 
@@ -378,7 +389,7 @@ pub fn parse_vht_report(rep: &[u8]) -> Result<VhtBeamform, CbrError> {
 // ---- HE (802.11ax) ----
 
 /// Parsed HE MIMO Control field (802.11ax §9.4.1.63): 40 bits / 5 octets,
-/// LSB-first. Field offsets confirmed against the WiPiCap reference decoder.
+/// LSB-first. Field offsets confirmed against the `WiPiCap` reference decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeMimoControl {
     /// Number of columns Nc, `1..=4`.
@@ -430,7 +441,7 @@ impl HeMimoControl {
     }
 
     /// `(psi_bits, phi_bits)`. HE SU uses the same (2,4)/(4,6) widths as VHT SU
-    /// (Wi-BFI + WiPiCap). MU/CQI HE feedback is not decoded here.
+    /// (`Wi-BFI` + `WiPiCap`). MU/CQI HE feedback is not decoded here.
     fn angle_bits(self) -> Result<(u32, u32), CbrError> {
         if self.feedback_type != 0 {
             return Err(CbrError::Unsupported("HE MU/CQI feedback not decoded"));
@@ -439,8 +450,10 @@ impl HeMimoControl {
     }
 }
 
-/// A decoded HE compressed beamforming report. The subcarrier count is derived
-/// from the payload length (per WiPiCap) rather than an RU table, so it adapts
+/// A decoded HE compressed beamforming report.
+///
+/// The subcarrier count is derived from the payload length (per `WiPiCap`)
+/// rather than an RU table, so it adapts
 /// to the reported RU range without hardcoding 802.11ax grouping tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeBeamform {
@@ -759,13 +772,13 @@ mod tests {
         })
         .unwrap();
         let (bphi, bpsi) = (r.phi_bits, r.psi_bits);
+        let (iphi, ipsi) = (i32::try_from(bphi).unwrap(), i32::try_from(bpsi).unwrap());
         for a in 0..(1u16 << bphi) {
-            let want = PI * f64::from(a) / 2f64.powi(bphi as i32 - 1) + PI / 2f64.powi(bphi as i32);
+            let want = PI * f64::from(a) / 2f64.powi(iphi - 1) + PI / 2f64.powi(iphi);
             assert!((r.phi_radians(a) - want).abs() < 1e-12, "phi code {a}");
         }
         for a in 0..(1u16 << bpsi) {
-            let want =
-                PI * f64::from(a) / 2f64.powi(bpsi as i32 + 1) + PI / 2f64.powi(bpsi as i32 + 2);
+            let want = PI * f64::from(a) / 2f64.powi(ipsi + 1) + PI / 2f64.powi(ipsi + 2);
             assert!((r.psi_radians(a) - want).abs() < 1e-12, "psi code {a}");
         }
     }

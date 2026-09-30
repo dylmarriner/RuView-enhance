@@ -1,9 +1,10 @@
-//! Steering-matrix (V) reconstruction from decoded beamforming angles
-//! (ADR-365, plan feature-path B). Inverse Givens rotation per IEEE 802.11
-//! §19.3.11.10.2, ported from the WiPiCap reference `inverse_givens_rotation`.
+//! Steering-matrix (V) reconstruction from decoded beamforming angles.
+//!
+//! ADR-365, plan feature-path B. Inverse Givens rotation per IEEE 802.11
+//! §19.3.11.10.2, ported from the `WiPiCap` reference `inverse_givens_rotation`.
 //!
 //! Reconstructed V is the beamformee's compressed feedback matrix, NOT the full
-//! channel H — so no calibrated range or coherent AoA is claimed from it. Its
+//! channel H — so no calibrated range or coherent angle-of-arrival is claimed. Its
 //! value here is twofold: it is feature-path B (temporal changes in V track
 //! motion), and its **unitarity** (V^H V = I) is a decoder correctness oracle —
 //! if the angle bit widths, ordering, and dequantization are right, V
@@ -41,7 +42,7 @@ impl Complex {
         Self { re: self.re + o.re, im: self.im + o.im }
     }
     fn mul(self, o: Self) -> Self {
-        Self { re: self.re * o.re - self.im * o.im, im: self.re * o.im + self.im * o.re }
+        Self { re: self.re.mul_add(o.re, -(self.im * o.im)), im: self.re.mul_add(o.im, self.im * o.re) }
     }
     fn conj(self) -> Self {
         Self { re: self.re, im: -self.im }
@@ -56,7 +57,7 @@ fn eye(rows: usize, cols: usize) -> Mat {
         .collect()
 }
 
-/// `a^T · b` (plain transpose, matching WiPiCap's real Givens `.T`).
+/// `a^T · b` (plain transpose, matching the real Givens `.T` in `WiPiCap`).
 fn matmul_tn(a: &Mat, b: &Mat) -> Mat {
     let (n, k, m) = (a[0].len(), a.len(), b[0].len());
     let mut out = vec![vec![Complex::ZERO; m]; n];
@@ -81,7 +82,8 @@ enum Kind {
 /// Regenerate the ordered Givens angle specs (kind + matrix position) for an
 /// (Nr, Nc) feedback matrix, matching the decode order used by `cbr`.
 fn angle_specs(nr: usize, nc: usize) -> Vec<(Kind, usize, usize)> {
-    let total = angles_per_subcarrier(nr as u8, nc as u8) * 2;
+    let (nr8, nc8) = (u8::try_from(nr).expect("nr <= 4"), u8::try_from(nc).expect("nc <= 4"));
+    let total = angles_per_subcarrier(nr8, nc8) * 2;
     let mut specs = Vec::with_capacity(total);
     let (mut phi0, mut phi1) = (0usize, 0usize);
     let (mut psi0, mut psi1) = (1usize, 0usize);

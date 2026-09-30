@@ -18,8 +18,7 @@
 // stream counts where f64 precision loss cannot occur.
 #![allow(clippy::similar_names, clippy::cast_precision_loss)]
 
-use crate::capture::CapturedReport;
-use crate::cbr::VhtBeamform;
+use crate::capture::{CapturedReport, Report};
 
 /// Bounded per-report spatial summary.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,30 +34,31 @@ pub struct ReportFeatures {
 }
 
 impl ReportFeatures {
-    /// Summarize one decoded report.
+    /// Summarize one decoded report (VHT or HE).
     #[must_use]
-    pub fn from_report(r: &VhtBeamform) -> Self {
+    pub fn from_report(r: &Report) -> Self {
+        let (phi, psi, snr) = (r.phi(), r.psi(), r.avg_snr());
         let (mut sin_sum, mut cos_sum) = (0.0f64, 0.0f64);
-        for &c in &r.phi {
+        for &c in phi {
             let a = r.phi_radians(c);
             sin_sum += a.sin();
             cos_sum += a.cos();
         }
-        let n = r.phi.len().max(1) as f64;
+        let n = phi.len().max(1) as f64;
         let resultant = sin_sum.hypot(cos_sum) / n;
         let phi_mean = {
             let m = sin_sum.atan2(cos_sum);
             if m < 0.0 { m + core::f64::consts::TAU } else { m }
         };
-        let psi_mean = if r.psi.is_empty() {
+        let psi_mean = if psi.is_empty() {
             0.0
         } else {
-            r.psi.iter().map(|&c| r.psi_radians(c)).sum::<f64>() / r.psi.len() as f64
+            psi.iter().map(|&c| r.psi_radians(c)).sum::<f64>() / psi.len() as f64
         };
-        let mean_snr = if r.avg_snr.is_empty() {
+        let mean_snr = if snr.is_empty() {
             0.0
         } else {
-            r.avg_snr.iter().map(|&s| f64::from(s)).sum::<f64>() / r.avg_snr.len() as f64
+            snr.iter().map(|&s| f64::from(s)).sum::<f64>() / snr.len() as f64
         };
         Self { phi_circular_mean: phi_mean, phi_concentration: resultant, psi_mean, mean_snr }
     }
@@ -70,29 +70,30 @@ impl ReportFeatures {
 /// normalized to its own range. Returns `None` when the reports have different
 /// dimensions (a reconfiguration, not motion).
 #[must_use]
-pub fn motion_energy(prev: &VhtBeamform, cur: &VhtBeamform) -> Option<f64> {
-    if prev.phi.len() != cur.phi.len()
-        || prev.psi.len() != cur.psi.len()
-        || prev.phi_bits != cur.phi_bits
-        || prev.psi_bits != cur.psi_bits
+pub fn motion_energy(prev: &Report, cur: &Report) -> Option<f64> {
+    let (pphi, ppsi, cphi, cpsi) = (prev.phi(), prev.psi(), cur.phi(), cur.psi());
+    if pphi.len() != cphi.len()
+        || ppsi.len() != cpsi.len()
+        || prev.phi_bits() != cur.phi_bits()
+        || prev.psi_bits() != cur.psi_bits()
     {
         return None;
     }
-    let total = prev.phi.len() + prev.psi.len();
+    let total = pphi.len() + ppsi.len();
     if total == 0 {
         return Some(0.0);
     }
 
-    let phi_span = f64::from(1u32 << prev.phi_bits);
+    let phi_span = f64::from(1u32 << prev.phi_bits());
     let phi_half = phi_span / 2.0;
     let mut acc = 0.0f64;
-    for (&a, &b) in prev.phi.iter().zip(&cur.phi) {
+    for (&a, &b) in pphi.iter().zip(cphi) {
         let raw = f64::from(a) - f64::from(b);
         let d = raw.abs().min(phi_span - raw.abs()); // circular distance in code space
         acc += d / phi_half; // normalize to [0, 1]
     }
-    let psi_span = f64::from(1u32 << prev.psi_bits);
-    for (&a, &b) in prev.psi.iter().zip(&cur.psi) {
+    let psi_span = f64::from(1u32 << prev.psi_bits());
+    for (&a, &b) in ppsi.iter().zip(cpsi) {
         acc += (f64::from(a) - f64::from(b)).abs() / psi_span;
     }
     Some(acc / total as f64)
@@ -112,11 +113,11 @@ pub fn motion_series(reports: &[CapturedReport]) -> Vec<(u64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::{motion_energy, motion_series, ReportFeatures};
-    use crate::capture::CapturedReport;
-    use crate::cbr::{parse_vht_action, VhtBeamform};
+    use crate::capture::{CapturedReport, Report};
+    use crate::cbr::parse_vht_action;
 
     /// Build a decoded 2x2/80MHz/Ng1/SU-cb0 report with all angle codes = `code`.
-    fn report(code: u16) -> VhtBeamform {
+    fn report(code: u16) -> Report {
         let v: u32 = (2 - 1) | ((2 - 1) << 3) | (2 << 6) | (1 << 18);
         let ctl = &v.to_le_bytes()[..3];
         let ns = 234usize;
@@ -144,7 +145,7 @@ mod tests {
         body.extend_from_slice(ctl);
         body.extend_from_slice(&[0, 0]);
         body.extend_from_slice(&stream);
-        parse_vht_action(&body).unwrap()
+        Report::Vht(parse_vht_action(&body).unwrap())
     }
 
     #[test]

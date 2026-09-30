@@ -5,14 +5,112 @@
 //! exists (ADR-365). It parses the classic pcap container itself (no libpcap
 //! dependency — the crate stays dependency-light), skips the radiotap header by
 //! its length field, extracts management **Action** / **Action No Ack** frame
-//! bodies, and feeds each to the VHT decoder. Everything here is exercised on
-//! `SYNTHETIC` pcap bytes; it has not yet seen a real capture.
+//! bodies, and feeds each to the VHT (category 21) or HE (category 30) decoder.
+//! Everything here is exercised on `SYNTHETIC` pcap bytes; it has not yet seen a
+//! real capture.
 //!
 //! Only `LINKTYPE_IEEE802_11_RADIOTAP` (127) pcap files are handled.
 
 #![cfg(feature = "std")]
 
-use crate::cbr::{parse_vht_action, CbrError, VhtBeamform};
+use crate::cbr::{
+    dequant_phi, dequant_psi, parse_he_action, parse_vht_action, CbrError, HeBeamform, VhtBeamform,
+};
+
+/// A decoded beamforming report of either supported format.
+#[derive(Debug, Clone)]
+pub enum Report {
+    /// 802.11ac VHT compressed beamforming report.
+    Vht(VhtBeamform),
+    /// 802.11ax HE compressed beamforming report.
+    He(HeBeamform),
+}
+
+impl Report {
+    /// `Phi` codes, flattened `phi[sub * angles_per_sub + k]`.
+    #[must_use]
+    pub fn phi(&self) -> &[u16] {
+        match self {
+            Self::Vht(r) => &r.phi,
+            Self::He(r) => &r.phi,
+        }
+    }
+
+    /// `Psi` codes, same layout as [`Self::phi`].
+    #[must_use]
+    pub fn psi(&self) -> &[u16] {
+        match self {
+            Self::Vht(r) => &r.psi,
+            Self::He(r) => &r.psi,
+        }
+    }
+
+    /// `Phi` code bit width.
+    #[must_use]
+    pub const fn phi_bits(&self) -> u32 {
+        match self {
+            Self::Vht(r) => r.phi_bits,
+            Self::He(r) => r.phi_bits,
+        }
+    }
+
+    /// `Psi` code bit width.
+    #[must_use]
+    pub const fn psi_bits(&self) -> u32 {
+        match self {
+            Self::Vht(r) => r.psi_bits,
+            Self::He(r) => r.psi_bits,
+        }
+    }
+
+    /// Average SNR per space-time stream (raw `i8`).
+    #[must_use]
+    pub fn avg_snr(&self) -> &[i8] {
+        match self {
+            Self::Vht(r) => &r.avg_snr,
+            Self::He(r) => &r.avg_snr,
+        }
+    }
+
+    /// `(Nr, Nc)` feedback dimensions.
+    #[must_use]
+    pub const fn dims(&self) -> (u8, u8) {
+        match self {
+            Self::Vht(r) => (r.control.nr, r.control.nc),
+            Self::He(r) => (r.control.nr, r.control.nc),
+        }
+    }
+
+    /// Subcarriers carrying angles.
+    #[must_use]
+    pub const fn num_subcarriers(&self) -> usize {
+        match self {
+            Self::Vht(r) => r.num_subcarriers,
+            Self::He(r) => r.num_subcarriers,
+        }
+    }
+
+    /// Format label for logs and dashboards.
+    #[must_use]
+    pub const fn format(&self) -> &'static str {
+        match self {
+            Self::Vht(_) => "VHT",
+            Self::He(_) => "HE",
+        }
+    }
+
+    /// Dequantize a `Phi` code to radians.
+    #[must_use]
+    pub fn phi_radians(&self, code: u16) -> f64 {
+        dequant_phi(code, self.phi_bits())
+    }
+
+    /// Dequantize a `Psi` code to radians.
+    #[must_use]
+    pub fn psi_radians(&self, code: u16) -> f64 {
+        dequant_psi(code, self.psi_bits())
+    }
+}
 
 /// pcap link-layer type for radiotap-prefixed 802.11.
 pub const LINKTYPE_IEEE802_11_RADIOTAP: u32 = 127;
@@ -53,8 +151,8 @@ pub struct CapturedReport {
     pub ts_us: u64,
     /// 802.11 sequence number (12-bit) of the frame, for gap/dup detection.
     pub sequence: u16,
-    /// The decoded VHT report.
-    pub report: VhtBeamform,
+    /// The decoded report (VHT or HE).
+    pub report: Report,
 }
 
 /// Aggregate report-rate / integrity summary over a capture.
@@ -157,12 +255,18 @@ pub fn decode_pcap(buf: &[u8]) -> Result<(Vec<CapturedReport>, ReportRateSummary
 
         let Some((sequence, body)) = action_body(pkt) else { continue };
         summary.action_frames += 1;
-        match parse_vht_action(body) {
+        // Dispatch on the action category: 21 = VHT, 30 = HE.
+        let decoded = match body.first() {
+            Some(21) => parse_vht_action(body).map(Report::Vht),
+            Some(30) => parse_he_action(body).map(Report::He),
+            _ => continue, // some other action frame
+        };
+        match decoded {
             Ok(report) => {
                 summary.decoded += 1;
                 reports.push(CapturedReport { ts_us, sequence, report });
             }
-            Err(CbrError::NotBeamforming { .. }) => {} // some other action frame
+            Err(CbrError::NotBeamforming { .. }) => {} // right category, other action
             Err(_) => summary.decode_failures += 1,
         }
     }
@@ -264,6 +368,35 @@ mod tests {
         assert_eq!(s.span_us, 300_000);
         // 2 intervals over 0.3 s → ~6.67 reports/s
         assert!((s.reports_per_sec() - 6.667).abs() < 0.01);
+    }
+
+    /// Minimal HE compressed beamforming action body (2x2/80MHz/SU-cb0), with
+    /// 64 subcarriers of zeroed angles (6 bits each -> 48 bytes).
+    fn he_action_body() -> Vec<u8> {
+        // nc=2,nr=2,bw=2(80MHz),grouping=0,codebook=0,feedback=0(SU),ru 0..8
+        let v: u64 = (2 - 1) | ((2 - 1) << 3) | (2 << 6) | (8 << 23);
+        let mut body = vec![30u8, 0]; // category=30 HE, action=0
+        body.extend_from_slice(&v.to_le_bytes()[..5]);
+        body.extend_from_slice(&[0, 0]); // avg SNR, Nc=2
+        body.extend(std::iter::repeat_n(0u8, 64 * 6 / 8));
+        body
+    }
+
+    #[test]
+    fn he_reports_flow_through_pcap() {
+        let (vht, he) = (vht_action_body(), he_action_body());
+        let recs = vec![
+            (0u32, 0u32, radiotap(&mpdu(1, &vht))),
+            (0, 50_000, radiotap(&mpdu(2, &he))),
+            (0, 100_000, radiotap(&mpdu(3, &he))),
+        ];
+        let (reports, s) = decode_pcap(&pcap(&recs)).unwrap();
+        assert_eq!(s.decoded, 3);
+        assert_eq!(s.decode_failures, 0);
+        let formats: Vec<&str> = reports.iter().map(|r| r.report.format()).collect();
+        assert_eq!(formats, vec!["VHT", "HE", "HE"]);
+        assert_eq!(reports[1].report.dims(), (2, 2));
+        assert_eq!(reports[1].report.num_subcarriers(), 64);
     }
 
     #[test]

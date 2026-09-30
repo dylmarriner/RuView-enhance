@@ -46,17 +46,19 @@ fn main() -> ExitCode {
     println!("reports/sec:         {:.2}", summary.reports_per_sec());
 
     if let Some(first) = reports.first() {
-        let c = &first.report.control;
+        let r = &first.report;
+        let (nr, nc) = r.dims();
         println!(
-            "first report:        Nr{}xNc{} {}MHz Ng{:?} {} avg_snr={:?}",
-            c.nr,
-            c.nc,
-            c.width.mhz(),
-            c.grouping,
-            if c.mu { "MU" } else { "SU" },
-            first.report.avg_snr,
+            "first report:        {} Nr{nr}xNc{nc} subcarriers={} bits(phi,psi)=({},{}) avg_snr={:?}",
+            r.format(),
+            r.num_subcarriers(),
+            r.phi_bits(),
+            r.psi_bits(),
+            r.avg_snr(),
         );
     }
+    let he = reports.iter().filter(|c| c.report.format() == "HE").count();
+    println!("formats:             VHT={} HE={he}", reports.len() - he);
 
     let series = motion_series(&reports);
     if series.is_empty() {
