@@ -290,6 +290,37 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Unpack `ns` subcarriers of Givens angles from an LSB-first bitstream. Per
+/// subcarrier the order is, for each level i=1..min(Nc,Nr-1): (Nr-i) Phi codes
+/// then (Nr-i) Psi codes. Flattened into `phi`/`psi`; `(nr,nc)` recovers levels.
+fn unpack_angles(
+    stream: &[u8],
+    nr: u8,
+    nc: u8,
+    phi_bits: u32,
+    psi_bits: u32,
+    ns: usize,
+) -> Result<(Vec<u16>, Vec<u16>), CbrError> {
+    let per = angles_per_subcarrier(nr, nc);
+    let last = core::cmp::min(nc, nr.saturating_sub(1));
+    let mut reader = BitReader::new(stream);
+    let mut phi = Vec::with_capacity(ns * per);
+    let mut psi = Vec::with_capacity(ns * per);
+    for _ in 0..ns {
+        for i in 1..=last {
+            let level_count = nr - i;
+            for _ in 0..level_count {
+                phi.push(reader.read(phi_bits)?);
+            }
+            for _ in 0..level_count {
+                psi.push(reader.read(psi_bits)?);
+            }
+        }
+    }
+    debug_assert_eq!(phi.len(), ns * per);
+    Ok((phi, psi))
+}
+
 /// Parse a VHT Compressed Beamforming Action frame body.
 ///
 /// `body` starts at the Category octet:
@@ -329,30 +360,155 @@ pub fn parse_vht_report(rep: &[u8]) -> Result<VhtBeamform, CbrError> {
 
     let ns = num_subcarriers(control.width, control.grouping);
     let per = angles_per_subcarrier(control.nr, control.nc);
-    let mut reader = BitReader::new(&rep[snr_end..]);
-
-    let mut phi = Vec::with_capacity(ns * per);
-    let mut psi = Vec::with_capacity(ns * per);
-    // Per subcarrier the bitstream is grouped by Givens level i=1..min(Nc,Nr-1):
-    // (Nr-i) Phi codes then (Nr-i) Psi codes. Flattened here into phi[]/psi[]
-    // in that order; (nr,nc) recovers the level structure.
-    let last = core::cmp::min(control.nc, control.nr.saturating_sub(1));
-    for _ in 0..ns {
-        for i in 1..=last {
-            let level_count = control.nr - i;
-            for _ in 0..level_count {
-                phi.push(reader.read(phi_bits)?);
-            }
-            for _ in 0..level_count {
-                psi.push(reader.read(psi_bits)?);
-            }
-        }
-    }
-
-    debug_assert_eq!(phi.len(), ns * per);
-    debug_assert_eq!(psi.len(), ns * per);
+    let (phi, psi) =
+        unpack_angles(&rep[snr_end..], control.nr, control.nc, phi_bits, psi_bits, ns)?;
 
     Ok(VhtBeamform {
+        control,
+        avg_snr,
+        num_subcarriers: ns,
+        angles_per_sub: per,
+        psi_bits,
+        phi_bits,
+        phi,
+        psi,
+    })
+}
+
+// ---- HE (802.11ax) ----
+
+/// Parsed HE MIMO Control field (802.11ax §9.4.1.63): 40 bits / 5 octets,
+/// LSB-first. Field offsets confirmed against the WiPiCap reference decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeMimoControl {
+    /// Number of columns Nc, `1..=4`.
+    pub nc: u8,
+    /// Number of rows Nr, `1..=4`.
+    pub nr: u8,
+    /// Bandwidth code (0=20,1=40,2=80,3=160/80+80).
+    pub bw: u8,
+    /// Grouping: false = Ng4, true = Ng16.
+    pub grouping_ng16: bool,
+    /// Codebook-information bit.
+    pub codebook: bool,
+    /// Feedback type (0=SU, 1=MU, 2=CQI).
+    pub feedback_type: u8,
+    /// RU start index (7-bit).
+    pub ru_start: u8,
+    /// RU end index (7-bit).
+    pub ru_end: u8,
+}
+
+impl HeMimoControl {
+    fn parse(b: &[u8]) -> Result<Self, CbrError> {
+        if b.len() < 5 {
+            return Err(CbrError::Truncated { need: 5, have: b.len() });
+        }
+        let v = u64::from(b[0])
+            | (u64::from(b[1]) << 8)
+            | (u64::from(b[2]) << 16)
+            | (u64::from(b[3]) << 24)
+            | (u64::from(b[4]) << 32);
+        let take = |shift: u32, width: u32| -> u8 {
+            u8::try_from((v >> shift) & ((1u64 << width) - 1)).expect("field <= 8 bits")
+        };
+        let nc = take(0, 3) + 1;
+        let nr = take(3, 3) + 1;
+        if !(1..=4).contains(&nr) || !(1..=4).contains(&nc) || nc > nr {
+            return Err(CbrError::BadDimension { nr, nc });
+        }
+        Ok(Self {
+            nc,
+            nr,
+            bw: take(6, 2),
+            grouping_ng16: take(8, 1) == 1,
+            codebook: take(9, 1) == 1,
+            feedback_type: take(10, 2),
+            ru_start: take(16, 7),
+            ru_end: take(23, 7),
+        })
+    }
+
+    /// `(psi_bits, phi_bits)`. HE SU uses the same (2,4)/(4,6) widths as VHT SU
+    /// (Wi-BFI + WiPiCap). MU/CQI HE feedback is not decoded here.
+    fn angle_bits(self) -> Result<(u32, u32), CbrError> {
+        if self.feedback_type != 0 {
+            return Err(CbrError::Unsupported("HE MU/CQI feedback not decoded"));
+        }
+        Ok(if self.codebook { (4, 6) } else { (2, 4) })
+    }
+}
+
+/// A decoded HE compressed beamforming report. The subcarrier count is derived
+/// from the payload length (per WiPiCap) rather than an RU table, so it adapts
+/// to the reported RU range without hardcoding 802.11ax grouping tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeBeamform {
+    /// Parsed HE MIMO Control.
+    pub control: HeMimoControl,
+    /// Average SNR per space-time stream (raw `i8`).
+    pub avg_snr: Vec<i8>,
+    /// Subcarriers decoded (derived from payload length).
+    pub num_subcarriers: usize,
+    /// Phi (= Psi) angle count per subcarrier.
+    pub angles_per_sub: usize,
+    /// Psi code bit width.
+    pub psi_bits: u32,
+    /// Phi code bit width.
+    pub phi_bits: u32,
+    /// Phi codes, flattened `phi[sub * angles_per_sub + k]`.
+    pub phi: Vec<u16>,
+    /// Psi codes, same layout.
+    pub psi: Vec<u16>,
+}
+
+/// Parse an HE Compressed Beamforming/CQI Action frame body.
+///
+/// `body` starts at the Category octet: `[Category=30][HEAction][MIMO ctl x5]
+/// [avg SNR xNc][angle bitstream…]`.
+///
+/// # Errors
+/// Returns [`CbrError`] when truncated, not an HE beamforming report, carrying
+/// a bad dimension, or using MU/CQI feedback (not decoded).
+pub fn parse_he_action(body: &[u8]) -> Result<HeBeamform, CbrError> {
+    if body.len() < 2 {
+        return Err(CbrError::Truncated { need: 2, have: body.len() });
+    }
+    let (category, action) = (body[0], body[1]);
+    // Category 30 = HE; HE Action 0 = HE Compressed Beamforming/CQI.
+    if category != 30 || action != 0 {
+        return Err(CbrError::NotBeamforming { category, action });
+    }
+    parse_he_report(&body[2..])
+}
+
+/// Parse the HE report starting at the MIMO Control field (no Category/Action).
+///
+/// # Errors
+/// Same conditions as [`parse_he_action`].
+pub fn parse_he_report(rep: &[u8]) -> Result<HeBeamform, CbrError> {
+    let control = HeMimoControl::parse(rep)?;
+    let (psi_bits, phi_bits) = control.angle_bits()?;
+    let nc = usize::from(control.nc);
+
+    let snr_start = 5;
+    let snr_end = snr_start + nc;
+    if rep.len() < snr_end {
+        return Err(CbrError::Truncated { need: snr_end, have: rep.len() });
+    }
+    let avg_snr: Vec<i8> = rep[snr_start..snr_end].iter().map(|&b| b.cast_signed()).collect();
+
+    // Derive Ns from the angle-region length (WiPiCap approach): each subcarrier
+    // consumes `per * (phi_bits + psi_bits)` bits.
+    let per = angles_per_subcarrier(control.nr, control.nc);
+    let per_sub_bits = per * (phi_bits + psi_bits) as usize;
+    if per_sub_bits == 0 {
+        return Err(CbrError::Unsupported("degenerate HE dimensions"));
+    }
+    let ns = (rep[snr_end..].len() * 8) / per_sub_bits;
+    let (phi, psi) = unpack_angles(&rep[snr_end..], control.nr, control.nc, phi_bits, psi_bits, ns)?;
+
+    Ok(HeBeamform {
         control,
         avg_snr,
         num_subcarriers: ns,
@@ -367,7 +523,8 @@ pub fn parse_vht_report(rep: &[u8]) -> Result<VhtBeamform, CbrError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        angles_per_subcarrier, parse_vht_action, CbrError, ChannelWidth, Grouping, VhtMimoControl,
+        angles_per_subcarrier, parse_he_action, parse_vht_action, CbrError, ChannelWidth, Grouping,
+        HeMimoControl, VhtMimoControl,
     };
 
     /// Build a VHT MIMO Control (3 octets, LSB-first) from fields.
@@ -521,6 +678,69 @@ mod tests {
             let a = r.psi_radians(c);
             assert!(a > 0.0 && a < core::f64::consts::FRAC_PI_2, "psi {a} out of (0,pi/2)");
         }
+    }
+
+    /// Build a 5-octet HE MIMO Control (LSB-first) for SU.
+    fn mk_he_ctl(nc: u8, nr: u8, bw: u8, codebook: u8, ru_start: u8, ru_end: u8) -> [u8; 5] {
+        let v: u64 = u64::from(nc - 1)
+            | (u64::from(nr - 1) << 3)
+            | (u64::from(bw) << 6)
+            | (u64::from(codebook) << 9)
+            // feedback_type 0 = SU at bits 10-11
+            | (u64::from(ru_start) << 16)
+            | (u64::from(ru_end) << 23);
+        v.to_le_bytes()[..5].try_into().expect("5 bytes")
+    }
+
+    #[test]
+    fn he_mimo_control_parse() {
+        let raw = mk_he_ctl(2, 2, 2, 0, 0, 8); // 2x2, 80MHz, SU cb0
+        let c = HeMimoControl::parse(&raw).unwrap();
+        assert_eq!((c.nc, c.nr, c.bw), (2, 2, 2));
+        assert!(!c.codebook);
+        assert_eq!(c.feedback_type, 0);
+        assert_eq!(c.ru_end, 8);
+    }
+
+    #[test]
+    fn he_2x2_roundtrip_length_derived() {
+        let (nr, nc) = (2u8, 2u8);
+        let ctl = mk_he_ctl(nc, nr, 2, 0, 0, 8);
+        let per = angles_per_subcarrier(nr, nc); // 1
+        let (psi_bits, phi_bits) = (2u32, 4u32); // HE SU cb0
+        let ns = 64usize; // arbitrary; decoder derives it from length
+        let phi_codes: Vec<u16> = (0..ns).map(|i| u16::try_from(i % (1 << phi_bits)).unwrap()).collect();
+        let psi_codes: Vec<u16> = (0..ns).map(|i| u16::try_from(i % (1 << psi_bits)).unwrap()).collect();
+
+        let mut packer = BitPacker::default();
+        for s in 0..ns {
+            packer.push(phi_codes[s], phi_bits);
+            packer.push(psi_codes[s], psi_bits);
+        }
+        // pad to a whole number of subcarriers only (ns*6 bits = ns*6/8 bytes)
+        let mut body = vec![30u8, 0]; // category 30 HE, action 0
+        body.extend_from_slice(&ctl);
+        body.extend_from_slice(&[1i8.cast_unsigned(), 2i8.cast_unsigned()]); // avg SNR Nc=2
+        body.extend_from_slice(&packer.finish());
+
+        let r = parse_he_action(&body).unwrap();
+        assert_eq!(r.angles_per_sub, per);
+        assert_eq!((r.psi_bits, r.phi_bits), (2, 4));
+        assert_eq!(r.avg_snr, vec![1, 2]);
+        assert!(r.num_subcarriers >= ns); // length-derived, >= what we packed
+        assert_eq!(&r.phi[..ns], &phi_codes[..]);
+        assert_eq!(&r.psi[..ns], &psi_codes[..]);
+    }
+
+    #[test]
+    fn he_mu_feedback_unsupported() {
+        // feedback_type=1 (MU) at bits 10-11.
+        let mut raw = mk_he_ctl(2, 2, 2, 0, 0, 8);
+        raw[1] |= 1 << (10 - 8); // set bit 10
+        let mut body = vec![30u8, 0];
+        body.extend_from_slice(&raw);
+        body.extend_from_slice(&[0u8; 32]);
+        assert_eq!(parse_he_action(&body), Err(CbrError::Unsupported("HE MU/CQI feedback not decoded")));
     }
 
     #[test]

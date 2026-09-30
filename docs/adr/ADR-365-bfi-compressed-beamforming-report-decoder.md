@@ -49,13 +49,17 @@ Compressed Beamforming Action frame body into structured feedback:
 
 Honesty boundary encoded in the code and its tests:
 
-- **VHT SU** (codebook 0 and 1) is implemented and verified by round-trip and
-  spec-table unit tests on SYNTHETIC frames. Decoded angle *values* stay
-  `CLAIMED` until a captured frame decodes identically under an independent
-  tool (WiPiCap / Wi-BFI).
-- **VHT MU codebook 1** returns `Unsupported` rather than embed unverified
-  angle widths.
-- **HE and EHT** angle bitstreams return `Unsupported`.
+- **VHT SU + MU** (both codebooks) are implemented. The angle bit widths
+  (Table 9-92) are cross-checked against the Wi-BFI and WiPiCap reference
+  decoders, which agree: SU (2,4)/(4,6), MU (5,7)/(7,9) as (psi,phi). The
+  cross-check caught a real bug — an earlier draft used the MU widths for SU;
+  `angle_bits_match_reference_decoders` now pins all four rows.
+- **HE SU** (802.11ax) is decoded: 5-octet MIMO Control, SU widths as above,
+  subcarrier count derived from payload length (WiPiCap approach, no RU table).
+  HE MU/CQI feedback returns `Unsupported`.
+- **EHT** returns `Unsupported`.
+- Decoded angle *values* stay `CLAIMED` until a real captured frame decodes to
+  a unitary steering matrix (WiPiCap's own check) — no over-the-air capture yet.
 
 The decoder is allocation-light, `#![forbid(unsafe_code)]` (crate-wide), and
 passes the crate's `-D warnings` clippy gate (pedantic + nursery).
