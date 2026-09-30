@@ -46,9 +46,6 @@ impl Complex {
     fn conj(self) -> Self {
         Self { re: self.re, im: -self.im }
     }
-    fn norm_sq(self) -> f64 {
-        self.re * self.re + self.im * self.im
-    }
 }
 
 type Mat = Vec<Vec<Complex>>;
@@ -204,8 +201,9 @@ mod tests {
         for (nr, nc) in cfgs {
             let per = crate::cbr::angles_per_subcarrier(nr, nc);
             // deterministic pseudo-random codes within range
-            let phi: Vec<u16> = (0..per).map(|k| ((k as u16 * 37 + 11) % 16)).collect();
-            let psi: Vec<u16> = (0..per).map(|k| ((k as u16 * 19 + 3) % 4)).collect();
+            let code = |k: usize, m: u16, b: u16, modn: u16| (u16::try_from(k).unwrap() * m + b) % modn;
+            let phi: Vec<u16> = (0..per).map(|k| code(k, 37, 11, 16)).collect();
+            let psi: Vec<u16> = (0..per).map(|k| code(k, 19, 3, 4)).collect();
             let v = reconstruct_v(nr, nc, &phi, &psi, 4, 2);
             assert_eq!(v.len(), usize::from(nr));
             assert_eq!(v[0].len(), usize::from(nc));
