@@ -744,6 +744,33 @@ mod tests {
     }
 
     #[test]
+    fn dequant_matches_wipicap_formula() {
+        // WiPiCap quantized_angle_formulas:
+        //   phi = PI*a/2^(bphi-1) + PI/2^bphi
+        //   psi = PI*a/2^(bpsi+1) + PI/2^(bpsi+2)
+        // Our phi_radians/psi_radians must equal these for every code.
+        use core::f64::consts::PI;
+        let r = parse_vht_action(&{
+            let mut b = vec![21u8, 0];
+            b.extend_from_slice(&mk_ctl(2, 2, 2, 0, 0, 0, 0)); // SU cb0 -> phi=4, psi=2
+            b.extend_from_slice(&[0, 0]);
+            b.extend(std::iter::repeat_n(0u8, 234 * 6 / 8 + 1));
+            b
+        })
+        .unwrap();
+        let (bphi, bpsi) = (r.phi_bits, r.psi_bits);
+        for a in 0..(1u16 << bphi) {
+            let want = PI * f64::from(a) / 2f64.powi(bphi as i32 - 1) + PI / 2f64.powi(bphi as i32);
+            assert!((r.phi_radians(a) - want).abs() < 1e-12, "phi code {a}");
+        }
+        for a in 0..(1u16 << bpsi) {
+            let want =
+                PI * f64::from(a) / 2f64.powi(bpsi as i32 + 1) + PI / 2f64.powi(bpsi as i32 + 2);
+            assert!((r.psi_radians(a) - want).abs() < 1e-12, "psi code {a}");
+        }
+    }
+
+    #[test]
     fn truncated_stream_errs() {
         let ctl = mk_ctl(2, 2, 0, 0, 0, 0, 0); // 20MHz Ng1 -> 52 subs
         let mut body = vec![21u8, 0];
