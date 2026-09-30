@@ -36,6 +36,8 @@ pub mod cbr;
 pub mod capture;
 #[cfg(feature = "std")]
 pub mod features;
+#[cfg(feature = "std")]
+pub mod steering;
 pub mod frame;
 #[cfg(feature = "std")]
 pub mod ha_discovery;
