@@ -653,17 +653,53 @@ fn debounce_room_classification(state: &mut AppStateInner, raw: &RoomInference) 
 /// assemble the nodes array.
 const NODE_STALE_AFTER_MS: u64 = 10_000;
 
+/// Use the room vote's strict freshness boundary for every count contributor.
+fn node_is_fresh(n: &NodeState, now: std::time::Instant) -> bool {
+    n.last_frame_time
+        .and_then(|seen| now.checked_duration_since(seen))
+        .is_some_and(|age| age < Duration::from_millis(NODE_STALE_AFTER_MS))
+}
+
+/// Edge-only nodes must update the same node-local state used by the room vote.
+fn update_edge_node_classification(n: &mut NodeState, vitals: &Esp32VitalsPacket) {
+    let classification = classify_vitals(vitals.motion, vitals.presence, vitals.presence_score);
+    n.current_motion_level = classification.motion_level;
+    n.debounce_candidate = n.current_motion_level.clone();
+    n.debounce_counter = 0;
+    // Presence confidence is not the raw-CSI count score. Mixing those EMAs
+    // turns a high-confidence single-person edge report into multiple people
+    // when the next raw CSI packet arrives.
+    let presence_score = if vitals.presence_score.is_finite() {
+        (vitals.presence_score as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    n.latest_classification_confidence = Some(if classification.presence {
+        presence_score
+    } else if vitals.presence_score.is_finite() {
+        1.0 - presence_score
+    } else {
+        0.0
+    });
+    n.prev_person_count = if classification.presence {
+        (vitals.n_persons as usize).max(1)
+    } else {
+        0
+    };
+}
+
 /// Build a node's *own* [`NodeInference`] from its smoothed per-node state
 /// (ADR-297). Uses the node's own `current_motion_level` — never the room
-/// aggregate — with a confidence from its smoothed person score and freshness
-/// from its last frame time. Pure given the state snapshot + `now`.
+/// aggregate — with the latest classification confidence (or the legacy score
+/// fallback) and freshness from its last frame time. Pure for a snapshot + `now`.
 fn node_inference_for(n: &NodeState, now: std::time::Instant) -> NodeInference {
     let age_ms = n
         .last_frame_time
         .map(|t| now.duration_since(t).as_millis() as u64);
     let present = !matches!(n.current_motion_level.as_str(), "absent");
     let score = n.smoothed_person_score.clamp(0.0, 1.0);
-    let confidence = if present { score } else { 1.0 - score };
+    let confidence = n.latest_classification_confidence
+        .unwrap_or(if present { score } else { 1.0 - score });
     NodeInference::new(n.current_motion_level.clone(), confidence, age_ms)
 }
 
@@ -966,6 +1002,7 @@ struct NodeState {
     pub(crate) prev_person_count: usize,
     smoothed_motion: f64,
     current_motion_level: String,
+    latest_classification_confidence: Option<f64>,
     debounce_counter: u32,
     debounce_candidate: String,
     baseline_motion: f64,
@@ -1365,6 +1402,7 @@ impl NodeState {
             prev_person_count: 0,
             smoothed_motion: 0.0,
             current_motion_level: "absent".to_string(),
+            latest_classification_confidence: None,
             debounce_counter: 0,
             debounce_candidate: "absent".to_string(),
             baseline_motion: 0.0,
@@ -5646,19 +5684,53 @@ fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
 /// DynamicMinCut `corr_persons`) and stash it in `NodeState::prev_person_count`
 /// — but that value was being discarded by the aggregator.
 ///
-/// This takes the larger of the two. It can only ever *raise* the count when a
-/// node has positively estimated more occupants, so it never regresses the
-/// single-person case (a lone occupant yields `node_max == 1`).
+/// Only fresh node readings may raise the count. Retaining a node for diagnostics
+/// must not let its old occupancy outlive the room vote's freshness window.
 fn aggregate_person_count(
     activity_count: usize,
     node_states: &std::collections::HashMap<u8, NodeState>,
+    now: std::time::Instant,
 ) -> usize {
     let node_max = node_states
         .values()
+        .filter(|n| node_is_fresh(n, now))
         .map(|n| n.prev_person_count)
         .max()
         .unwrap_or(0);
     activity_count.max(node_max)
+}
+
+/// Count and classification describe the same debounced room state, independent
+/// of which node supplied the latest packet. Bootstrap suppression is already
+/// reflected in `classification` before this function is called.
+fn update_room_person_count(
+    state: &mut AppStateInner,
+    classification: &ClassificationInfo,
+    now: std::time::Instant,
+    observed_at_unix_ms: u64,
+) -> usize {
+    if !classification.presence || !state.node_states.values().any(|n| node_is_fresh(n, now)) {
+        state.prev_person_count = 0;
+        return 0;
+    }
+    let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
+        &state.multistatic_fuser,
+        &state.node_states,
+        state.dedup_factor,
+    );
+    let activity_count = match fused {
+        Some(ref frame) => {
+            let score = multistatic_bridge::compute_person_score_from_amplitudes(
+                &frame.fused_amplitude,
+            );
+            state.smoothed_person_score = state.smoothed_person_score * 0.90 + score * 0.10;
+            state.person_count_at(observed_at_unix_ms)
+        }
+        None => fallback_count.unwrap_or(0),
+    };
+    let count = aggregate_person_count(activity_count, &state.node_states, now).max(1);
+    state.prev_person_count = count;
+    count
 }
 
 #[cfg(test)]
@@ -5667,18 +5739,20 @@ mod aggregate_person_count_tests {
     //! count-aware per-node estimate back down to 1.
     use super::*;
     use std::collections::HashMap;
+    use std::time::Instant;
 
     fn node_with_count(c: usize) -> NodeState {
         let mut n = NodeState::new();
         n.prev_person_count = c;
+        n.last_frame_time = Some(std::time::Instant::now());
         n
     }
 
     #[test]
     fn empty_nodes_fall_back_to_activity_count() {
         let nodes: HashMap<u8, NodeState> = HashMap::new();
-        assert_eq!(aggregate_person_count(1, &nodes), 1);
-        assert_eq!(aggregate_person_count(0, &nodes), 0);
+        assert_eq!(aggregate_person_count(1, &nodes, Instant::now()), 1);
+        assert_eq!(aggregate_person_count(0, &nodes, Instant::now()), 0);
     }
 
     #[test]
@@ -5687,7 +5761,7 @@ mod aggregate_person_count_tests {
         let mut nodes = HashMap::new();
         nodes.insert(1u8, node_with_count(2));
         assert_eq!(
-            aggregate_person_count(1, &nodes),
+            aggregate_person_count(1, &nodes, Instant::now()),
             2,
             "a node reporting 2 must not be discarded by the activity count"
         );
@@ -5698,7 +5772,7 @@ mod aggregate_person_count_tests {
         // Never *lower* a confident activity-derived count to a stale node value.
         let mut nodes = HashMap::new();
         nodes.insert(1u8, node_with_count(1));
-        assert_eq!(aggregate_person_count(3, &nodes), 3);
+        assert_eq!(aggregate_person_count(3, &nodes, Instant::now()), 3);
     }
 
     #[test]
@@ -5707,7 +5781,7 @@ mod aggregate_person_count_tests {
         nodes.insert(1u8, node_with_count(1));
         nodes.insert(2u8, node_with_count(3));
         nodes.insert(3u8, node_with_count(2));
-        assert_eq!(aggregate_person_count(1, &nodes), 3);
+        assert_eq!(aggregate_person_count(1, &nodes, Instant::now()), 3);
     }
 
     #[test]
@@ -5716,7 +5790,181 @@ mod aggregate_person_count_tests {
         let mut nodes = HashMap::new();
         nodes.insert(1u8, node_with_count(1));
         nodes.insert(2u8, node_with_count(1));
-        assert_eq!(aggregate_person_count(1, &nodes), 1);
+        assert_eq!(aggregate_person_count(1, &nodes, Instant::now()), 1);
+    }
+
+    #[test]
+    fn stale_three_cannot_override_fresh_one() {
+        let now = Instant::now();
+        let mut fresh = node_with_count(1);
+        fresh.last_frame_time = Some(now);
+        let mut stale = node_with_count(3);
+        stale.last_frame_time = Some(now - Duration::from_secs(30));
+        let nodes = HashMap::from([(1, fresh), (2, stale)]);
+        assert_eq!(aggregate_person_count(1, &nodes, now), 1);
+    }
+
+    #[test]
+    fn counts_expire_at_the_room_votes_exact_boundary() {
+        let now = Instant::now();
+        let mut node = node_with_count(3);
+        node.last_frame_time = Some(now - Duration::from_millis(NODE_STALE_AFTER_MS));
+        let mut nodes = HashMap::from([(1, node)]);
+        assert_eq!(aggregate_person_count(0, &nodes, now), 0);
+        assert!(node_inference_for(&nodes[&1], now).is_stale(NODE_STALE_AFTER_MS));
+
+        nodes.get_mut(&1).unwrap().last_frame_time =
+            Some(now - Duration::from_millis(NODE_STALE_AFTER_MS - 1));
+        assert_eq!(aggregate_person_count(0, &nodes, now), 3);
+    }
+
+    #[test]
+    fn missing_or_future_timestamps_cannot_contribute() {
+        let now = Instant::now();
+        for timestamp in [None, Some(now + Duration::from_secs(1))] {
+            let mut node = node_with_count(3);
+            node.last_frame_time = timestamp;
+            assert_eq!(aggregate_person_count(1, &HashMap::from([(1, node)]), now), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod room_person_count_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn edge(presence: bool, motion: bool, count: u8) -> Esp32VitalsPacket {
+        Esp32VitalsPacket {
+            node_id: 1,
+            presence,
+            motion,
+            n_persons: count,
+            person_count_valid: true,
+            fall_detected: false,
+            breathing_rate_bpm: 0.0,
+            heartrate_bpm: 0.0,
+            rssi: -50,
+            motion_energy: 0.0,
+            presence_score: if presence || motion { 0.9 } else { 0.1 },
+            timestamp_ms: 0,
+        }
+    }
+
+    fn observe(state: &mut AppStateInner, id: u8, packet: Esp32VitalsPacket, now: Instant) {
+        let node = state.node_states.entry(id).or_insert_with(NodeState::new);
+        node.last_frame_time = Some(now);
+        update_edge_node_classification(node, &packet);
+    }
+
+    fn room(state: &AppStateInner, now: Instant) -> RoomInference {
+        let inferences: Vec<_> = state.node_states.values()
+            .map(|node| node_inference_for(node, now)).collect();
+        fuse_room(inferences.iter(), NODE_STALE_AFTER_MS)
+    }
+
+    #[test]
+    fn edge_only_nodes_supply_their_own_room_vote() {
+        let now = Instant::now();
+        let mut state = AppStateInner::minimal();
+        observe(&mut state, 1, edge(true, false, 2), now);
+        assert_eq!(room(&state, now).classification, "present_still");
+        observe(&mut state, 1, edge(false, true, 0), now);
+        assert_eq!(room(&state, now).classification, "present_moving");
+        assert_eq!(state.node_states[&1].prev_person_count, 1);
+        observe(&mut state, 1, edge(false, false, 0), now);
+        assert_eq!(room(&state, now).classification, "absent");
+        assert_eq!(state.node_states[&1].prev_person_count, 0);
+    }
+
+    #[test]
+    fn edge_confidence_does_not_inflate_the_raw_csi_count_score() {
+        for confidence in [0.9, f32::NAN] {
+            let mut node = NodeState::new();
+            node.smoothed_person_score = corr_persons_to_score(1);
+            let mut packet = edge(true, false, 1);
+            packet.presence_score = confidence;
+            update_edge_node_classification(&mut node, &packet);
+            node.smoothed_person_score = node.smoothed_person_score * 0.92
+                + corr_persons_to_score(1) * 0.08;
+            assert_eq!(score_to_person_count(node.smoothed_person_score, node.prev_person_count), 1);
+            assert!(node_inference_for(&node, Instant::now()).confidence.is_finite());
+        }
+    }
+
+    #[test]
+    fn legacy_edge_count_stays_local_when_another_node_keeps_room_present() {
+        let absent = edge_vitals_message_for_publication(&edge(false, false, 0), None, false, false, 2);
+        assert_eq!(absent["presence"], false);
+        assert_eq!(absent["n_persons"], 0);
+        let present = edge_vitals_message_for_publication(&edge(true, false, 1), None, false, false, 2);
+        assert_eq!(present["presence"], true);
+        assert_eq!(present["n_persons"], 1);
+        let suppressed = edge_vitals_message_for_publication(&edge(true, true, 3), None, false, false, 0);
+        assert_eq!(suppressed["presence"], false);
+        assert_eq!(suppressed["n_persons"], 0);
+    }
+
+    #[test]
+    fn pending_room_presence_cannot_publish_a_positive_count() {
+        let now = Instant::now();
+        let mut state = AppStateInner::minimal();
+        observe(&mut state, 1, edge(true, false, 2), now);
+        let inference = room(&state, now);
+        let pending = debounce_room_classification(&mut state, &inference);
+        assert!(!pending.presence);
+        assert_eq!(update_room_person_count(&mut state, &pending, now, 0), 0);
+        state.room_debounce_since = Some(now - Duration::from_secs(2));
+        let committed = debounce_room_classification(&mut state, &inference);
+        assert!(committed.presence);
+        assert_eq!(update_room_person_count(&mut state, &committed, now, 0), 2);
+    }
+
+    #[test]
+    fn alternating_absent_node_does_not_clear_present_room_count() {
+        let now = Instant::now();
+        let mut state = AppStateInner::minimal();
+        state.room_debounced_level = "present_still".to_string();
+        observe(&mut state, 1, edge(true, false, 2), now);
+        observe(&mut state, 2, edge(true, false, 2), now);
+        for id in [3, 1, 3, 2, 3] {
+            observe(&mut state, id, edge(id != 3, false, if id == 3 { 0 } else { 2 }), now);
+            let inference = room(&state, now);
+            let classification = debounce_room_classification(&mut state, &inference);
+            assert!(classification.presence);
+            assert_eq!(update_room_person_count(&mut state, &classification, now, 0), 2);
+            assert_eq!(state.prev_person_count, 2, "fallback updates room history too");
+        }
+    }
+
+    #[test]
+    fn absent_room_suppresses_a_fresh_positive_node() {
+        let now = Instant::now();
+        let mut state = AppStateInner::minimal();
+        observe(&mut state, 1, edge(false, false, 0), now);
+        observe(&mut state, 2, edge(false, false, 0), now);
+        observe(&mut state, 3, edge(true, false, 3), now);
+        let inference = room(&state, now);
+        let classification = debounce_room_classification(&mut state, &inference);
+        assert!(!classification.presence);
+        assert_eq!(update_room_person_count(&mut state, &classification, now, 0), 0);
+        assert_eq!(state.node_states[&3].prev_person_count, 3, "room must not overwrite node evidence");
+    }
+
+    #[test]
+    fn bootstrap_absence_and_stale_room_cannot_restore_a_positive_count() {
+        let now = Instant::now();
+        let mut state = AppStateInner::minimal();
+        observe(&mut state, 1, edge(true, false, 3), now);
+        state.prev_person_count = 3;
+        let suppressed = classification_from_room(&RoomInference::unavailable());
+        assert_eq!(update_room_person_count(&mut state, &suppressed, now, 0), 0);
+        assert_eq!(state.prev_person_count, 0);
+
+        let held_present = classify_vitals(false, true, 0.9);
+        let expired = now + Duration::from_millis(NODE_STALE_AFTER_MS);
+        assert_eq!(update_room_person_count(&mut state, &held_present, expired, 0), 0);
+        assert_eq!(room(&state, expired), RoomInference::unavailable());
     }
 }
 
@@ -7045,9 +7293,16 @@ fn edge_vitals_message_for_publication(
     } else {
         Some("vital_quality_gate_failed")
     };
-    let effective_presence = raw.presence && !bootstrap_empty;
-    let effective_motion = raw.motion && !bootstrap_empty;
-    let effective_person_count = if bootstrap_empty { 0 } else { person_count };
+    // This legacy message identifies one node. Room absence may suppress it,
+    // but another node's positive count must not be assigned to this node.
+    let local_presence = classify_vitals(raw.motion, raw.presence, raw.presence_score).presence;
+    let effective_presence = local_presence && !bootstrap_empty && person_count > 0;
+    let effective_motion = raw.motion && effective_presence;
+    let effective_person_count = if effective_presence {
+        (raw.n_persons as usize).max(1)
+    } else {
+        0
+    };
 
     serde_json::json!({
         "type": "edge_vitals",
@@ -9633,13 +9888,7 @@ async fn udp_receiver_task(
                         ns.rssi_history.back().copied().unwrap_or(0.0)
                     };
 
-                    // Store per-node person count from edge vitals.
-                    let node_est = if vitals.presence {
-                        (vitals.n_persons as usize).max(1)
-                    } else {
-                        0
-                    };
-                    ns.prev_person_count = node_est;
+                    update_edge_node_classification(ns, &vitals);
 
                     s.tick += 1;
                     let tick = s.tick;
@@ -9657,46 +9906,7 @@ async fn udp_receiver_task(
                     let bootstrap_empty =
                         s.bootstrap_empty_prior_applies(observed_at_unix_ms);
 
-                    // A startup prior has negative-only authority. Once a full
-                    // runtime window matches the stored background, raw edge
-                    // presence cannot force the count back to one.
                     let now = std::time::Instant::now();
-                    let total_persons = if bootstrap_empty {
-                        0
-                    } else if vitals.presence {
-                        let dedup = s.dedup_factor;
-                        let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
-                            &s.multistatic_fuser,
-                            &s.node_states,
-                            dedup,
-                        );
-                        match fused {
-                            Some(ref f) => {
-                                let score =
-                                    multistatic_bridge::compute_person_score_from_amplitudes(
-                                        &f.fused_amplitude,
-                                    );
-                                s.smoothed_person_score =
-                                    s.smoothed_person_score * 0.90 + score * 0.10;
-                                // #803: don't let the saturating activity score
-                                // discard count-aware per-node estimates.
-                                let count =
-                                    aggregate_person_count(
-                                        s.person_count_at(observed_at_unix_ms),
-                                        &s.node_states,
-                                    );
-                                s.prev_person_count = count;
-                                count.max(1) // presence=true => at least 1
-                            }
-                            None => {
-                                aggregate_person_count(fallback_count.unwrap_or(0), &s.node_states)
-                                    .max(1)
-                            }
-                        }
-                    } else {
-                        s.prev_person_count = 0;
-                        0
-                    };
 
                     // Governed trust cycle (ADR-135..146): run the same live
                     // frames through the privacy/provenance/witness control
@@ -9719,10 +9929,7 @@ async fn udp_receiver_task(
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
-                        .filter(|(_, n)| {
-                            n.last_frame_time
-                                .is_some_and(|t| now.duration_since(t).as_secs() < 10)
-                        })
+                        .filter(|(_, n)| node_is_fresh(n, now))
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
@@ -9780,6 +9987,12 @@ async fn udp_receiver_task(
                     } else {
                         debounce_room_classification(&mut s, &room_inference)
                     };
+                    let total_persons = update_room_person_count(
+                        &mut s,
+                        &classification,
+                        now,
+                        observed_at_unix_ms,
+                    );
 
                     let signal_field = generate_signal_field(
                         fused_features.mean_rssi,
@@ -10175,6 +10388,7 @@ async fn udp_receiver_task(
                     }
 
                     // Store latest features on node for cross-node fusion.
+                    ns.latest_classification_confidence = Some(classification.confidence);
                     ns.latest_features = Some(features.clone());
 
                     // Done with per-node mutable borrow; now read aggregated
@@ -10206,45 +10420,7 @@ async fn udp_receiver_task(
                     let bootstrap_empty =
                         s.bootstrap_empty_prior_applies(observed_at_unix_ms);
 
-                    // A restored prior can suppress a background-only raw
-                    // classification. It cannot authorize positive presence.
                     let now = std::time::Instant::now();
-                    let total_persons = if bootstrap_empty {
-                        0
-                    } else if classification.presence {
-                        let dedup = s.dedup_factor;
-                        let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
-                            &s.multistatic_fuser,
-                            &s.node_states,
-                            dedup,
-                        );
-                        match fused {
-                            Some(ref f) => {
-                                let score =
-                                    multistatic_bridge::compute_person_score_from_amplitudes(
-                                        &f.fused_amplitude,
-                                    );
-                                s.smoothed_person_score =
-                                    s.smoothed_person_score * 0.90 + score * 0.10;
-                                // #803: don't let the saturating activity score
-                                // discard count-aware per-node estimates.
-                                let count =
-                                    aggregate_person_count(
-                                        s.person_count_at(observed_at_unix_ms),
-                                        &s.node_states,
-                                    );
-                                s.prev_person_count = count;
-                                count.max(1)
-                            }
-                            None => {
-                                aggregate_person_count(fallback_count.unwrap_or(0), &s.node_states)
-                                    .max(1)
-                            }
-                        }
-                    } else {
-                        s.prev_person_count = 0;
-                        0
-                    };
 
                     // Governed trust cycle (ADR-135..146): run the same live
                     // frames through the privacy/provenance/witness control
@@ -10275,10 +10451,7 @@ async fn udp_receiver_task(
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
-                        .filter(|(_, n)| {
-                            n.last_frame_time
-                                .is_some_and(|t| now.duration_since(t).as_secs() < 10)
-                        })
+                        .filter(|(_, n)| node_is_fresh(n, now))
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
@@ -10321,6 +10494,12 @@ async fn udp_receiver_task(
                     } else {
                         debounce_room_classification(&mut s, &room_inference)
                     };
+                    let total_persons = update_room_person_count(
+                        &mut s,
+                        &room_classification,
+                        now,
+                        observed_at_unix_ms,
+                    );
                     let explicit_calibration_fresh =
                         s.explicit_calibration_fresh_at(observed_at_unix_ms);
                     let published_vitals = vitals_for_publication(
@@ -10343,9 +10522,8 @@ async fn udp_receiver_task(
                         features: fused_features.clone(),
                         // ADR-297 (issue #1554): top-level classification is the
                         // fused room aggregate, not this frame's single node.
-                        // `classification` (this node's own smoothed reading)
-                        // still drives `motion_score`/`total_persons` above,
-                        // which are legitimately this-packet-local.
+                        // The count uses this same room presence gate; only
+                        // `motion_score` remains local to the arriving packet.
                         classification: room_classification,
                         signal_field: generate_signal_field(
                             fused_features.mean_rssi,

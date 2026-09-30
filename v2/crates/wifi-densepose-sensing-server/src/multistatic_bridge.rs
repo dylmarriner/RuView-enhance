@@ -19,7 +19,7 @@ use wifi_densepose_signal::ruvsense::multistatic::{
 use super::NodeState;
 
 /// Maximum age for a node frame to be considered active (10 seconds).
-const STALE_THRESHOLD: Duration = Duration::from_secs(10);
+const STALE_THRESHOLD: Duration = Duration::from_millis(super::NODE_STALE_AFTER_MS);
 
 /// Default WiFi channel frequency (MHz) used for single-channel frames.
 const DEFAULT_FREQ_MHZ: u32 = 2437; // Channel 6
@@ -123,8 +123,7 @@ pub fn node_frames_from_states_with_guard(
     let mut active: Vec<(u8, &NodeState)> = node_states
         .iter()
         .filter_map(|(&node_id, ns)| {
-            let last_time = ns.last_frame_time.as_ref()?;
-            (now.duration_since(*last_time) <= STALE_THRESHOLD).then_some((node_id, ns))
+            super::node_is_fresh(ns, now).then_some((node_id, ns))
         })
         .collect();
     active.sort_unstable_by_key(|(node_id, _)| *node_id);
@@ -214,13 +213,10 @@ pub fn fuse_or_fallback(
             // Sum per-node counts then divide by dedup_factor (assumed average
             // visibility per body across nodes).  ADR-044 §5.1.
             // dedup_factor is runtime-configurable; default 3.0.
+            let now = Instant::now();
             let total: usize = node_states
                 .values()
-                .filter(|ns| {
-                    ns.last_frame_time
-                        .map(|t| t.elapsed() <= STALE_THRESHOLD)
-                        .unwrap_or(false)
-                })
+                .filter(|ns| super::node_is_fresh(ns, now))
                 .map(|ns| ns.prev_person_count)
                 .sum();
             let estimated = ((total as f64) / dedup_factor).ceil() as usize;
