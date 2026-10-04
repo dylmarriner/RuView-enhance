@@ -4634,6 +4634,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         ),
         vital_signs: None,
         calibrated_presence_evidence: None,
+        detector_diagnostics: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
