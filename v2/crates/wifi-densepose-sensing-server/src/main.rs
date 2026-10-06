@@ -3718,6 +3718,44 @@ mod issue_928_magic_collision_tests {
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
 
+/// Valid LLTF tones in a 20 MHz legacy training field (-26..-1, 1..26).
+const LLTF_TONES: usize = 52;
+
+/// LLTF byte ranges inside the first 128 CSI bytes of an ESP32/S2/S3/C3 frame,
+/// for the two layouts the driver emits. Ported from esp-radar
+/// `csi_sub_carrier_table.c` (SPDX-FileCopyrightText: 2025 Espressif Systems
+/// (Shanghai) CO LTD, Apache-2.0; modified: table reduced to LLTF ranges).
+/// - no secondary channel (HT20): tones stored 0..31, -32..-1
+/// - secondary channel above/below (HT40): tones stored contiguously
+const LLTF_LAYOUT_NO_SECONDARY: [(usize, usize); 2] = [(76, 128), (2, 54)];
+const LLTF_LAYOUT_SECONDARY: [(usize, usize); 2] = [(12, 64), (66, 118)];
+
+/// Extract the 52 LLTF tones as (I, Q) pairs ordered -26..-1, 1..26.
+/// The frame header does not say which layout was used, so pick the one whose
+/// own guard bins are quietest. Returns `None` for frames shorter than 128 bytes.
+fn lltf_iq_pairs(iq: &[u8]) -> Option<Vec<(i8, i8)>> {
+    if iq.len() < 128 {
+        return None;
+    }
+    let energy = |r: std::ops::Range<usize>| -> u32 {
+        iq[r].iter().map(|&b| (b as i8).unsigned_abs() as u32).sum()
+    };
+    // Bytes that are guard/DC under one layout but data under the other.
+    let guards_if_no_secondary = energy(54..76) + energy(0..2);
+    let guards_if_secondary = energy(0..12) + energy(118..128) + energy(64..66);
+    let layout = if guards_if_secondary < guards_if_no_secondary {
+        LLTF_LAYOUT_SECONDARY
+    } else {
+        LLTF_LAYOUT_NO_SECONDARY
+    };
+    let pairs: Vec<(i8, i8)> = layout
+        .iter()
+        .flat_map(|&(a, b)| iq[a..b].chunks_exact(2).map(|c| (c[0] as i8, c[1] as i8)))
+        .collect();
+    debug_assert_eq!(pairs.len(), LLTF_TONES);
+    Some(pairs)
+}
+
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     if buf.len() < 20 {
         return None;
@@ -3779,12 +3817,27 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         return None;
     }
 
-    let mut amplitudes = Vec::with_capacity(n_pairs);
-    let mut phases = Vec::with_capacity(n_pairs);
-
-    for k in 0..n_pairs {
-        let i_val = buf[iq_start + k * 2] as i8 as f64;
-        let q_val = buf[iq_start + k * 2 + 1] as i8 as f64;
+    let iq = &buf[iq_start..expected_len];
+    // HT/legacy single-antenna frames carry the 52-tone LLTF in their first
+    // 128 bytes regardless of HT20/HT40/STBC. Using only those tones gives
+    // every node the same grid and drops guard/DC bins (Phase 1 / esp-radar).
+    // 256 bins is an HE20 grid even when old C6 firmware labels it HtLegacy.
+    let lltf = (ppdu_type == wifi_densepose_hardware::PpduType::HtLegacy
+        && n_antennas == 1
+        && n_subcarriers < 256)
+        .then(|| lltf_iq_pairs(iq))
+        .flatten();
+    let (pairs, n_subcarriers): (Vec<(i8, i8)>, u16) = match lltf {
+        Some(p) => (p, LLTF_TONES as u16),
+        None => (
+            iq.chunks_exact(2).map(|c| (c[0] as i8, c[1] as i8)).collect(),
+            n_subcarriers,
+        ),
+    };
+    let mut amplitudes = Vec::with_capacity(pairs.len());
+    let mut phases = Vec::with_capacity(pairs.len());
+    for (i, q) in pairs {
+        let (i_val, q_val) = (i as f64, q as f64);
         amplitudes.push((i_val * i_val + q_val * q_val).sqrt());
         phases.push(q_val.atan2(i_val));
     }
@@ -3803,6 +3856,43 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         amplitudes,
         phases,
     })
+}
+
+#[cfg(test)]
+mod lltf_extraction_tests {
+    use super::{lltf_iq_pairs, LLTF_TONES};
+
+    /// Fill `ranges` with distinct non-zero I/Q, everything else zero.
+    fn frame(len: usize, ranges: [(usize, usize); 2]) -> Vec<u8> {
+        let mut iq = vec![0u8; len];
+        for (a, b) in ranges {
+            for (k, byte) in iq[a..b].iter_mut().enumerate() {
+                *byte = (k % 60 + 10) as u8;
+            }
+        }
+        iq
+    }
+
+    #[test]
+    fn ht20_layout_yields_52_tones_from_both_halves() {
+        let iq = frame(256, super::LLTF_LAYOUT_NO_SECONDARY);
+        let p = lltf_iq_pairs(&iq).unwrap();
+        assert_eq!(p.len(), LLTF_TONES);
+        assert!(p.iter().all(|&(i, q)| i != 0 || q != 0), "no guard/DC zeros leak in");
+    }
+
+    #[test]
+    fn ht40_layout_is_detected_and_yields_52_tones() {
+        let iq = frame(384, super::LLTF_LAYOUT_SECONDARY);
+        let p = lltf_iq_pairs(&iq).unwrap();
+        assert_eq!(p.len(), LLTF_TONES);
+        assert!(p.iter().all(|&(i, q)| i != 0 || q != 0));
+    }
+
+    #[test]
+    fn short_frames_are_left_alone() {
+        assert!(lltf_iq_pairs(&[1u8; 112]).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3860,8 +3950,9 @@ mod issue_1009_n_subcarriers_u16_tests {
         // Regression guard for the common single-byte (≤255) case.
         let buf = build_csi_frame(64);
         let frame = parse_esp32_frame(&buf).expect("64-bin HT20 frame must parse");
-        assert_eq!(frame.n_subcarriers, 64);
-        assert_eq!(frame.amplitudes.len(), 64);
+        // Phase 1: HT/legacy frames are reduced to the 52 LLTF tones.
+        assert_eq!(frame.n_subcarriers, super::LLTF_TONES as u16);
+        assert_eq!(frame.amplitudes.len(), super::LLTF_TONES);
     }
 }
 
@@ -3918,8 +4009,9 @@ mod esp32_frame_structure_tests {
     fn well_formed_frame_still_parses() {
         let parsed = parse_esp32_frame(&frame(64)).expect("HT20 frame parses");
         assert_eq!(parsed.n_antennas, 1);
-        assert_eq!(parsed.n_subcarriers, 64);
-        assert_eq!(parsed.amplitudes.len(), 64);
+        // Phase 1: HT/legacy frames are reduced to the 52 LLTF tones.
+        assert_eq!(parsed.n_subcarriers, super::LLTF_TONES as u16);
+        assert_eq!(parsed.amplitudes.len(), super::LLTF_TONES);
     }
 }
 
