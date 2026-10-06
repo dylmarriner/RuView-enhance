@@ -3979,12 +3979,27 @@ async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<ser
     Json(serde_json::json!({ "learning": false, "templates": templates, "persisted": persisted.is_ok() }))
 }
 
-/// Minimum strongest-link weight before the map reports a peak. Empty-room
-/// weights measured 0.02-0.11 on the deployed 4-node array.
-const MAP_MIN_LINK_WEIGHT: f64 = 0.3;
-/// Weight of a wander value relative to motion excess in the activity map.
-// ponytail: fixed blend; fit from labelled data once still/moving logs exist.
-const MAP_WANDER_GAIN: f64 = 3.0;
+/// Map weights are in units of "sigmas over the link's own noise" / this
+/// scale, so 1.0 = a 3-sigma event on one link.
+const MAP_SIGMA_SCALE: f64 = 3.0;
+/// Minimum strongest-link weight before the map reports a peak (a 3-sigma
+/// event on at least one link).
+const MAP_MIN_LINK_WEIGHT: f64 = 1.0;
+/// Wander floor used when a link has fewer than 2 empty-room templates.
+const MAP_DEFAULT_WANDER_FLOOR: f64 = 0.05;
+
+/// Per-link map weight, normalised by that link's own empty-room variability
+/// so noisy links (or links sharing a busy node) do not dominate:
+/// motion z-score from the detector's noise envelope, plus wander beyond the
+/// link's natural template spread in units of that spread.
+fn link_map_weight(l: &PeerLinkState) -> f64 {
+    let motion = l.fsm.z_score().unwrap_or(0.0).max(0.0);
+    let wander = l.subspace.wander().map_or(0.0, |w| {
+        let floor = l.subspace.wander_floor().unwrap_or(MAP_DEFAULT_WANDER_FLOOR).max(0.02);
+        ((w - floor) / floor).max(0.0)
+    });
+    (motion + wander) / MAP_SIGMA_SCALE
+}
 
 /// GET /api/v1/peer-links/map — RTI activity image over the room from the
 /// fresh peer links and the configured `--node-positions`.
@@ -4004,7 +4019,7 @@ async fn peer_links_map(State(state): State<SharedState>) -> Json<serde_json::Va
             continue;
         }
         let (Some(a), Some(b)) = (pos(tx), pos(rx)) else { continue };
-        let w = l.fsm.excess().unwrap_or(0.0).max(0.0) + MAP_WANDER_GAIN * l.subspace.wander().unwrap_or(0.0);
+        let w = link_map_weight(l);
         used.push(serde_json::json!({ "tx": tx, "rx": rx, "weight": w }));
         links.push((a, b, w));
     }

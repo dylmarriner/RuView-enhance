@@ -103,6 +103,16 @@ impl PresenceFsm {
             .then(|| (self.smooth - self.baseline) / self.baseline)
     }
 
+    /// Excess over the baseline in units of this channel's own noise
+    /// envelope (floored at 5% of baseline). Comparable across channels with
+    /// different natural variability; `None` until stable.
+    pub fn z_score(&self) -> Option<f64> {
+        (self.stage == Stage::Stable).then(|| {
+            let scale = self.noise.max(0.05 * self.baseline).max(1e-9);
+            (self.smooth - self.baseline) / scale
+        })
+    }
+
     fn within_band(&self, diff: f64) -> bool {
         diff <= NOISE_BAND_P * self.baseline && diff >= -NOISE_BAND_N * self.baseline
     }
@@ -246,6 +256,18 @@ mod tests {
         run(&mut fsm, INIT_SAMPLES + 20, quiet);
         assert_eq!(fsm.stage(), Stage::Stable);
         assert!((fsm.baseline().unwrap() - 0.105).abs() < 0.02);
+    }
+
+    #[test]
+    fn z_score_normalises_by_channel_noise() {
+        // Same absolute excursion on a quiet and on a noisy channel.
+        let mut quiet_ch = PresenceFsm::default();
+        let mut noisy_ch = PresenceFsm::default();
+        run(&mut quiet_ch, INIT_SAMPLES + 60, quiet);
+        run(&mut noisy_ch, INIT_SAMPLES + 60, |i| 0.10 + f64::from(i % 2) * 0.03);
+        quiet_ch.update(0.16);
+        noisy_ch.update(0.16);
+        assert!(quiet_ch.z_score().unwrap() > noisy_ch.z_score().unwrap());
     }
 
     #[test]

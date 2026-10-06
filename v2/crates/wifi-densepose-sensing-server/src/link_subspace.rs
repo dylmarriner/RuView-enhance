@@ -135,6 +135,20 @@ impl LinkSubspace {
             .collect();
     }
 
+    /// Natural empty-room shape spread: 1 - the lowest similarity between
+    /// any two templates. A link whose empty shape already varies a lot needs
+    /// more wander before it means anything. `None` with < 2 templates.
+    pub fn wander_floor(&self) -> Option<f64> {
+        let mut min_sim: Option<f64> = None;
+        for (i, a) in self.templates.iter().enumerate() {
+            for b in &self.templates[i + 1..] {
+                let s = dot(a, b).abs();
+                min_sim = Some(min_sim.map_or(s, |m| m.min(s)));
+            }
+        }
+        min_sim.map(|s| 1.0 - s)
+    }
+
     pub fn template_count(&self) -> usize {
         self.templates.len()
     }
@@ -190,6 +204,19 @@ mod tests {
         assert!(s.jitter().is_some());
         s.push(&[1.0; 10]);
         assert!(columns(&[1.0; 10]).is_none());
+    }
+
+    #[test]
+    fn wander_floor_reflects_template_spread() {
+        let mut s = LinkSubspace::default();
+        assert!(s.wander_floor().is_none());
+        let mut a = [0.0; COLUMNS];
+        a[0] = 1.0;
+        let mut b = [0.0; COLUMNS];
+        b[0] = 0.8;
+        b[1] = 0.6;
+        s.templates = vec![a, b];
+        assert!((s.wander_floor().unwrap() - 0.2).abs() < 1e-9);
     }
 
     #[test]
