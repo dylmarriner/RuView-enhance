@@ -87,6 +87,7 @@ CONFIG_VALUE_CHECKS = [
     ("zone", lambda value: value is not None),
     ("swarm_hb", lambda value: value is not None),
     ("swarm_ingest", lambda value: value is not None),
+    ("ota_psk", lambda value: value is not None),
 ]
 
 
@@ -115,7 +116,7 @@ MERGEABLE_ATTRS = [
     "vital_win", "vital_int", "subk_count",
     "channel", "filter_mac",
     "hop_channels", "hop_dwell",
-    "seed_url", "seed_token", "zone", "swarm_hb", "swarm_ingest",
+    "seed_url", "seed_token", "zone", "swarm_hb", "swarm_ingest", "ota_psk",
 ]
 
 
@@ -143,7 +144,7 @@ STATE_DIR_MODE = 0o700
 STATE_FILE_MODE = 0o600
 
 # Values `--state` hides unless `--show-secrets` is passed (#1754).
-SECRET_ATTRS = ("password", "seed_token")
+SECRET_ATTRS = ("password", "seed_token", "ota_psk")
 
 
 def _restrict_mode(path: str, mode: int) -> None:
@@ -490,6 +491,11 @@ def build_nvs_csv(args):
         writer.writerow(["swarm_hb", "data", "u16", str(args.swarm_hb)])
     if args.swarm_ingest is not None:
         writer.writerow(["swarm_ingest", "data", "u16", str(args.swarm_ingest)])
+    # ADR-050: OTA pre-shared key lives in its own namespace (ota_update.c
+    # reads security/ota_psk). Without it the OTA server rejects every upload.
+    if args.ota_psk is not None:
+        writer.writerow(["security", "namespace", "", ""])
+        writer.writerow(["ota_psk", "data", "string", args.ota_psk])
     return buf.getvalue()
 
 
@@ -622,6 +628,8 @@ def main():
     parser.add_argument("--seed-url", type=str, help="Cognitum Seed base URL (e.g. http://10.1.10.236)")
     parser.add_argument("--seed-token", type=str, help="Seed Bearer token (from pairing)")
     parser.add_argument("--zone", type=str, help="Zone name for this node (e.g. lobby, hallway)")
+    parser.add_argument("--ota-psk", type=str, dest="ota_psk",
+                        help="OTA pre-shared key: 64 hex chars (ADR-050). Required for OTA updates.")
     parser.add_argument("--swarm-hb", type=int, help="Swarm heartbeat interval in seconds (default 30)")
     parser.add_argument("--swarm-ingest", type=int, help="Swarm vector ingest interval in seconds (default 5)")
     parser.add_argument("--dry-run", action="store_true", help="Generate NVS binary but don't flash")
@@ -648,6 +656,8 @@ def main():
                         help="With --state, print the WiFi password and seed token in clear.")
 
     args = parser.parse_args()
+    if args.ota_psk is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", args.ota_psk):
+        parser.error("--ota-psk must be 64 hex characters (e.g. `openssl rand -hex 32`)")
 
     # State written by older versions may be 0644. Tighten it before any read
     # or early exit (#1754).
