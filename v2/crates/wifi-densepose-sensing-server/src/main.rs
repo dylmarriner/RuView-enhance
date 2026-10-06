@@ -3781,8 +3781,10 @@ struct PeerLinkState {
     frames: u64,
     rssi_dbm: f64,
     n_subcarriers: u16,
-    /// Mean LLTF amplitude per frame; its spread is the link's motion signal.
-    mean_amplitude: VecDeque<f64>,
+    /// Gain-normalised LLTF amplitudes per frame (each divided by its own
+    /// mean). Receiver AGC steps scale every tone equally and cancel out; a
+    /// body reshaping the multipath does not.
+    normalized: VecDeque<Vec<f64>>,
     /// Espressif-style adaptive detector fed with `motion_score` (ADR: Phase 1 #3).
     fsm: presence_fsm::PresenceFsm,
     /// Channel-shape jitter/wander against empty-room templates.
@@ -3799,7 +3801,7 @@ impl PeerLinkState {
             frames: 0,
             rssi_dbm: 0.0,
             n_subcarriers: 0,
-            mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
+            normalized: VecDeque::with_capacity(PEER_LINK_WINDOW),
             fsm: presence_fsm::PresenceFsm::default(),
             subspace: link_subspace::LinkSubspace::default(),
             calibration_rssi: None,
@@ -3832,32 +3834,42 @@ impl PeerLinkState {
         let rssi = f64::from(frame.rssi);
         self.rssi_dbm = if self.frames == 1 { rssi } else { 0.9 * self.rssi_dbm + 0.1 * rssi };
         self.n_subcarriers = frame.n_subcarriers;
-        if !frame.amplitudes.is_empty() {
-            let mean = frame.amplitudes.iter().sum::<f64>() / frame.amplitudes.len() as f64;
-            if self.mean_amplitude.len() == PEER_LINK_WINDOW {
-                self.mean_amplitude.pop_front();
+        let mean = if frame.amplitudes.is_empty() {
+            0.0
+        } else {
+            frame.amplitudes.iter().sum::<f64>() / frame.amplitudes.len() as f64
+        };
+        if mean > 1e-9 {
+            if self.normalized.len() == PEER_LINK_WINDOW {
+                self.normalized.pop_front();
             }
-            self.mean_amplitude.push_back(mean);
+            self.normalized.push_back(frame.amplitudes.iter().map(|a| a / mean).collect());
         }
-        if self.mean_amplitude.len() == PEER_LINK_WINDOW {
+        if self.normalized.len() == PEER_LINK_WINDOW {
             self.fsm.update(self.motion_score());
         }
         self.subspace.push(&frame.amplitudes);
     }
 
-    /// Coefficient of variation of per-frame mean amplitude: ~0 for a still
-    /// path, rising as a body perturbs it.
+    /// Mean over tones of the temporal standard deviation of gain-normalised
+    /// amplitude: ~0 for a still path, rising as a body reshapes it. Invariant
+    /// to receiver gain steps (esp-csi gain compensation, done without the
+    /// closed esp_csi_gain_ctrl blob).
     fn motion_score(&self) -> f64 {
-        let n = self.mean_amplitude.len();
+        let n = self.normalized.len();
+        let Some(tones) = self.normalized.iter().map(Vec::len).min().filter(|&t| t > 0) else {
+            return 0.0;
+        };
         if n < 2 {
             return 0.0;
         }
-        let mean = self.mean_amplitude.iter().sum::<f64>() / n as f64;
-        if mean <= 0.0 {
-            return 0.0;
+        let mut total = 0.0;
+        for k in 0..tones {
+            let mean = self.normalized.iter().map(|f| f[k]).sum::<f64>() / n as f64;
+            let var = self.normalized.iter().map(|f| (f[k] - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+            total += var.sqrt();
         }
-        let var = self.mean_amplitude.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-        var.sqrt() / mean
+        total / tones as f64
     }
 
     fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
@@ -4253,6 +4265,44 @@ mod peer_calibration_persistence_tests {
         assert!(!l.recalibration_recommended(), "small RSSI change is normal");
         l.rssi_dbm = -60.0;
         assert!(l.recalibration_recommended(), "15 dB shift means the node moved");
+    }
+}
+
+#[cfg(test)]
+mod peer_link_gain_tests {
+    use super::*;
+
+    fn frame_with(amps: Vec<f64>) -> Esp32Frame {
+        let mut f = parse_esp32_frame(&{
+            let mut b = vec![0u8; 20 + 128];
+            b[0..4].copy_from_slice(&0xC511_0001u32.to_le_bytes());
+            b[5] = 1;
+            b[6..8].copy_from_slice(&64u16.to_le_bytes());
+            b
+        })
+        .unwrap();
+        f.amplitudes = amps;
+        f
+    }
+
+    fn score(gain: impl Fn(usize) -> f64, shape: impl Fn(usize, usize) -> f64) -> f64 {
+        let now = std::time::Instant::now();
+        let mut l = PeerLinkState::new(now);
+        for t in 0..PEER_LINK_WINDOW {
+            let amps = (0..52).map(|k| gain(t) * shape(t, k)).collect();
+            l.observe(&frame_with(amps), now);
+        }
+        l.motion_score()
+    }
+
+    #[test]
+    fn gain_steps_do_not_look_like_motion_but_reshaping_does() {
+        let still = |_t: usize, k: usize| 10.0 + (k as f64 / 5.0).sin();
+        let quiet = score(|_| 1.0, still);
+        let agc_steps = score(|t| if t % 10 < 5 { 1.0 } else { 1.6 }, still);
+        let body = score(|_| 1.0, |t: usize, k: usize| 10.0 + ((k as f64 + t as f64) / 5.0).sin());
+        assert!(agc_steps < quiet + 1e-9, "AGC steps must cancel ({agc_steps} vs {quiet})");
+        assert!(body > 0.02, "multipath reshaping must register ({body})");
     }
 }
 
