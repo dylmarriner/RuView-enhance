@@ -21,6 +21,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_event.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -46,6 +47,9 @@ static bool s_node_id_early_set = false;
  * LoadProhibited panics (observed: Core 0 panic after ~2400 callbacks). */
 static uint8_t s_filter_mac[6] = {0};
 static bool    s_filter_mac_set = false;
+/* Associated AP (see ap_bssid_tracking_start). */
+static uint8_t s_ap_bssid[6];
+static volatile bool s_ap_bssid_set = false;
 
 /* ADR-057: Build-time guard — fail early if CSI is not enabled in sdkconfig.
  * Without this, the firmware compiles but crashes at runtime with:
@@ -359,6 +363,9 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         if (memcmp(info->mac, s_filter_mac, 6) != 0 && peer_lookup(info->mac) < 0) {
             return;  /* Source MAC doesn't match filter — skip frame. */
         }
+    } else if (s_ap_bssid_set && memcmp(info->mac, s_ap_bssid, 6) != 0 &&
+               peer_lookup(info->mac) < 0) {
+        return;  /* Not our AP and not a known peer: other networks/mesh units. */
     }
 
     s_cb_count++;
@@ -499,6 +506,37 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 #define PEER_TABLE_SIZE       8
 #define PEER_BEACON_PERIOD_US (100 * 1000) /* 10 Hz per node */
 static const uint8_t s_peer_tag[5] = {0x02, 0x52, 0x56, 'R', 'V'}; /* locally administered OUI + "RV" */
+
+/* AP-path CSI comes only from the AP this station is associated with (the
+ * self-ping replies), so the host sees one transmitter per node instead of
+ * every Orbi unit's and neighbour's beacons mixed together. Refreshed on every
+ * (re)connect so mesh roaming keeps working. An explicit NVS filter_mac takes
+ * precedence. */
+
+static void ap_bssid_event_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base;
+    if (id == WIFI_EVENT_STA_CONNECTED && data != NULL) {
+        const wifi_event_sta_connected_t *ev = (const wifi_event_sta_connected_t *)data;
+        memcpy(s_ap_bssid, ev->bssid, 6);
+        s_ap_bssid_set = true;
+    } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_ap_bssid_set = false;   /* accept everything until associated again */
+    }
+}
+
+static void ap_bssid_tracking_start(void)
+{
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        memcpy(s_ap_bssid, ap.bssid, 6);
+        s_ap_bssid_set = true;
+        ESP_LOGI(TAG, "AP-path CSI locked to BSSID %02x:%02x:%02x:%02x:%02x:%02x (+ known peers)",
+                 ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+    }
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED, ap_bssid_event_cb, NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, ap_bssid_event_cb, NULL);
+}
 
 typedef struct { uint8_t mac[6]; uint8_t node_id; } peer_entry_t;
 static peer_entry_t s_peers[PEER_TABLE_SIZE];
@@ -801,6 +839,7 @@ void csi_collector_init(void)
      * receives a guaranteed OFDM unicast floor even when promiscuous capture is
      * starved (display builds / quiet networks). Additive to #396/#893. */
     csi_start_self_ping();
+    ap_bssid_tracking_start();
     peer_beacon_start();
 }
 

@@ -161,6 +161,16 @@ typedef struct {
     uint8_t payload[];
 } wifi_promiscuous_pkt_t;
 
+/* Event loop + AP info (associated-BSSID tracking in csi_collector.c). */
+typedef const char *esp_event_base_t;
+#define WIFI_EVENT "WIFI_EVENT"
+#define WIFI_EVENT_STA_CONNECTED    4
+#define WIFI_EVENT_STA_DISCONNECTED 5
+typedef void (*esp_event_handler_t)(void *, esp_event_base_t, int32_t, void *);
+typedef struct { uint8_t bssid[6]; } wifi_event_sta_connected_t;
+static inline esp_err_t esp_event_handler_register(esp_event_base_t b, int32_t id, esp_event_handler_t h, void *a) {
+    (void)b; (void)id; (void)h; (void)a; return ESP_OK;
+}
 static inline esp_err_t esp_wifi_get_mac(wifi_interface_t ifx, uint8_t mac[6]) {
     (void)ifx; for (int i = 0; i < 6; i++) mac[i] = (uint8_t)(0x10 + i); return ESP_OK;
 }
@@ -179,6 +189,7 @@ typedef struct {
 
 typedef struct {
     uint8_t primary;
+    uint8_t bssid[6];
 } wifi_ap_record_t;
 
 typedef enum {
