@@ -14,7 +14,7 @@ const translations = {
     'nav.training': 'Training',
 
     // Dashboard
-    'dashboard.title': 'Revolutionary WiFi-Based Human Pose Detection',
+    'dashboard.title': 'Live Sensing Dashboard',
     'dashboard.subtitle': 'Human Tracking Through Walls Using WiFi Signals',
     'dashboard.description': 'AI can track your full-body movement through walls using just WiFi signals. Researchers at Carnegie Mellon have trained a neural network to turn basic WiFi signals into detailed wireframe models of human bodies.',
     'dashboard.status': 'System Status',
@@ -92,7 +92,7 @@ const translations = {
     'nav.training': 'Trening',
 
     // Dashboard
-    'dashboard.title': 'Rewolucyjne wykrywanie pozy czlowieka przez WiFi',
+    'dashboard.title': 'Panel czujnikow na zywo',
     'dashboard.subtitle': 'Sledzenie ludzi przez sciany za pomoca sygnalow WiFi',
     'dashboard.description': 'AI moze sledzic ruchy calego ciala przez sciany uzywajac jedynie sygnalow WiFi. Badacze z Carnegie Mellon wytrenowali siec neuronowa do zamiany sygnalow WiFi w szczegolowe modele szkieletowe.',
     'dashboard.status': 'Status systemu',

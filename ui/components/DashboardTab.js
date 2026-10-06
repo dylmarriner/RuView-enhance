@@ -72,9 +72,12 @@ export class DashboardTab {
       this._refreshStreamHealthOn(state);
     });
     // Also update on data — catches source changes mid-stream
-    this._sensingDataUnsub = sensingService.onData(() => {
+    this._sensingDataUnsub = sensingService.onData((data) => {
       this.updateDataSourceIndicator();
+      this.updateLiveSensing(data);
     });
+    // Mark the panel stale when frames stop arriving
+    this._freshnessInterval = setInterval(() => this.updateFreshness(), 1000);
     // Initial update
     this.updateDataSourceIndicator();
 
@@ -123,6 +126,104 @@ export class DashboardTab {
     el.className = `component-status status-${cfg.status}`;
     if (statusText) statusText.textContent = cfg.text;
     if (statusMsg)  statusMsg.textContent = cfg.msg;
+  }
+
+  // Render the latest sensing frame into the Live Sensing panel
+  updateLiveSensing(data) {
+    if (!data) return;
+    const f = data.features || {};
+    const c = data.classification || {};
+    const v = data.vital_signs || {};
+    const now = performance.now();
+
+    // Smoothed frame rate from inter-arrival time
+    if (this._lastFrameAt) {
+      const inst = 1000 / Math.max(1, now - this._lastFrameAt);
+      this._fps = this._fps ? this._fps * 0.9 + inst * 0.1 : inst;
+    }
+    this._lastFrameAt = now;
+
+    const level = c.motion_level || (c.presence ? 'present_still' : 'absent');
+    const levelText = { absent: 'Empty', present_still: 'Present · still', present_moving: 'Present · moving', active: 'Present · moving' };
+    const card = this.container.querySelector('#lsPresenceCard');
+    if (card) card.className = `ls-card ls-presence ${level === 'present_moving' ? 'active' : level}`;
+    this.setText('lsPresence', levelText[level] || level);
+    this.setText('lsPresenceConf', `confidence ${this.pct(c.confidence)}`);
+
+    const persons = data.estimated_persons ?? data.persons?.length;
+    this.setText('lsPersons', persons != null ? String(persons) : '—');
+    this.setText('lsPosture', data.posture ? `posture ${data.posture}` : 'posture —');
+
+    this.setText('lsBreathing', v.breathing_rate_bpm != null ? `${v.breathing_rate_bpm.toFixed(1)} bpm` : '—');
+    this.setText('lsBreathingConf', `confidence ${this.pct(v.breathing_confidence)}`);
+    this.setText('lsHeart', v.heart_rate_bpm != null ? `${v.heart_rate_bpm.toFixed(0)} bpm` : '—');
+    this.setText('lsHeartConf', `confidence ${this.pct(v.heartbeat_confidence)}`);
+
+    this.setText('lsRssi', f.mean_rssi != null ? `${f.mean_rssi.toFixed(1)} dBm` : '—');
+    this.drawSparkline(this.container.querySelector('#lsRssiSpark'), sensingService.getRssiHistory());
+
+    const q = data.signal_quality_score ?? v.signal_quality;
+    this.setText('lsQuality', q != null ? this.pct(q) : '—');
+    this.setText('lsVerdict', data.quality_verdict || '—');
+    this.setText('lsFps', this._fps ? `${this._fps.toFixed(1)} Hz` : '—');
+    this.setText('lsSource', `source ${data.source || '—'}`);
+
+    this.updateNodeList(data.node_features || []);
+    this.updateFreshness();
+
+    // Pose API is optional; fall back to the sensing estimate for the live stats
+    const personCount = this.container.querySelector('.person-count');
+    if (personCount && persons != null && !this._poseApiActive) personCount.textContent = String(persons);
+  }
+
+  // Per-node chips: id, RSSI, rate, stale flag
+  updateNodeList(nodes) {
+    const el = this.container.querySelector('#lsNodes');
+    if (!el) return;
+    el.textContent = '';
+    for (const n of nodes) {
+      const chip = document.createElement('span');
+      chip.className = `ls-node ${n.stale ? 'stale' : 'active'}`;
+      chip.textContent = `Node ${n.node_id} · ${n.rssi_dbm?.toFixed(0) ?? '—'} dBm · ${n.frame_rate_hz?.toFixed(0) ?? '—'} Hz${n.stale ? ' · stale' : ''}`;
+      el.appendChild(chip);
+    }
+  }
+
+  updateFreshness() {
+    const el = this.container.querySelector('#lsFreshness');
+    if (!el || !this._lastFrameAt) return;
+    const age = (performance.now() - this._lastFrameAt) / 1000;
+    const stale = age > 3;
+    el.textContent = stale ? `no data for ${age.toFixed(0)}s` : 'live';
+    el.className = `ls-freshness ${stale ? 'stale' : 'fresh'}`;
+    this.container.querySelector('.live-sensing-panel')?.classList.toggle('is-stale', stale);
+  }
+
+  drawSparkline(canvas, history) {
+    if (!canvas || history.length < 2) return;
+    const ctx = canvas.getContext('2d');
+    const { width: w, height: h } = canvas;
+    const min = Math.min(...history) - 1;
+    const range = (Math.max(...history) + 1 - min) || 1;
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.strokeStyle = getComputedStyle(canvas).color;
+    ctx.lineWidth = 2;
+    history.forEach((val, i) => {
+      const x = (i / (history.length - 1)) * w;
+      const y = h - ((val - min) / range) * (h - 4) - 2;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  setText(id, text) {
+    const el = this.container.querySelector('#' + id);
+    if (el) el.textContent = text;
+  }
+
+  pct(x) {
+    return x != null ? `${(x * 100).toFixed(0)}%` : '—';
   }
 
   // Update API info display
@@ -310,6 +411,7 @@ export class DashboardTab {
   // Update pose statistics
   updatePoseStats(poseData) {
     if (!poseData) return;
+    this._poseApiActive = true;
 
     // Update person count
     const personCount = this.container.querySelector('.person-count');
@@ -352,25 +454,11 @@ export class DashboardTab {
       zones = zonesSummary;
     }
     
-    // If no zones data, show default zones
     if (Object.keys(zones).length === 0) {
-      ['zone_1', 'zone_2', 'zone_3', 'zone_4'].forEach(zoneId => {
-        const zoneElement = document.createElement('div');
-        zoneElement.className = 'zone-item';
-        
-        // Use textContent instead of innerHTML to prevent XSS
-        const zoneNameSpan = document.createElement('span');
-        zoneNameSpan.className = 'zone-name';
-        zoneNameSpan.textContent = zoneId;
-        
-        const zoneCountSpan = document.createElement('span');
-        zoneCountSpan.className = 'zone-count';
-        zoneCountSpan.textContent = 'undefined';
-        
-        zoneElement.appendChild(zoneNameSpan);
-        zoneElement.appendChild(zoneCountSpan);
-        zonesContainer.appendChild(zoneElement);
-      });
+      const empty = document.createElement('div');
+      empty.className = 'zone-empty';
+      empty.textContent = 'No zone data (pose API not running)';
+      zonesContainer.appendChild(empty);
       return;
     }
     
@@ -454,6 +542,7 @@ export class DashboardTab {
     if (this.statsInterval) {
       clearInterval(this.statsInterval);
     }
+    if (this._freshnessInterval) clearInterval(this._freshnessInterval);
 
     healthService.stopHealthMonitoring();
   }
