@@ -3979,6 +3979,9 @@ async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<ser
     Json(serde_json::json!({ "learning": false, "templates": templates, "persisted": persisted.is_ok() }))
 }
 
+/// Minimum strongest-link weight before the map reports a peak. Empty-room
+/// weights measured 0.02-0.11 on the deployed 4-node array.
+const MAP_MIN_LINK_WEIGHT: f64 = 0.3;
 /// Weight of a wander value relative to motion excess in the activity map.
 // ponytail: fixed blend; fit from labelled data once still/moving logs exist.
 const MAP_WANDER_GAIN: f64 = 3.0;
@@ -4005,10 +4008,16 @@ async fn peer_links_map(State(state): State<SharedState>) -> Json<serde_json::Va
         used.push(serde_json::json!({ "tx": tx, "rx": rx, "weight": w }));
         links.push((a, b, w));
     }
+    // The image is normalised, so it always has a maximum; only call it a
+    // location when some link is actually perturbed.
+    let strongest = links.iter().map(|l| l.2).fold(0.0, f64::max);
     match link_map::build(&nodes, &links) {
         Some(m) => Json(serde_json::json!({
             "origin": m.origin, "cell_m": m.cell_m, "width": m.width, "height": m.height,
-            "cells": m.cells, "peak": m.peak, "links": used,
+            "cells": m.cells,
+            "peak": if strongest >= MAP_MIN_LINK_WEIGHT { m.peak } else { None },
+            "strongest_link_weight": strongest,
+            "links": used,
             "node_positions": s.node_positions_config.iter().map(|(id, p)| (id.to_string(), p.to_vec())).collect::<std::collections::BTreeMap<_, _>>(),
         })),
         None => Json(serde_json::json!({ "error": "need --node-positions for at least 2 nodes" })),
