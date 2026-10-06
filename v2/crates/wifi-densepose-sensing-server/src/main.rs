@@ -15,6 +15,7 @@ pub mod csi;
 mod engine_bridge;
 mod presence_fsm;
 mod link_subspace;
+mod link_map;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -3976,6 +3977,42 @@ async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<ser
     s.peer_calibration = saved.into_iter().map(|c| ((c.tx, c.rx), c)).collect();
     info!("peer-link empty-room calibration stopped ({templates} templates)");
     Json(serde_json::json!({ "learning": false, "templates": templates, "persisted": persisted.is_ok() }))
+}
+
+/// Weight of a wander value relative to motion excess in the activity map.
+// ponytail: fixed blend; fit from labelled data once still/moving logs exist.
+const MAP_WANDER_GAIN: f64 = 3.0;
+
+/// GET /api/v1/peer-links/map — RTI activity image over the room from the
+/// fresh peer links and the configured `--node-positions`.
+async fn peer_links_map(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let pos = |id: u8| s.node_positions_config.get(&id).map(|p| [f64::from(p[0]), f64::from(p[1])]);
+    let nodes: Vec<[f64; 2]> = {
+        let mut ids: Vec<_> = s.node_positions_config.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().filter_map(pos).collect()
+    };
+    let mut used = Vec::new();
+    let mut links = Vec::new();
+    for (&(tx, rx), l) in &s.peer_links {
+        if now.duration_since(l.last_seen).as_millis() > PEER_LINK_FRESH_MS {
+            continue;
+        }
+        let (Some(a), Some(b)) = (pos(tx), pos(rx)) else { continue };
+        let w = l.fsm.excess().unwrap_or(0.0).max(0.0) + MAP_WANDER_GAIN * l.subspace.wander().unwrap_or(0.0);
+        used.push(serde_json::json!({ "tx": tx, "rx": rx, "weight": w }));
+        links.push((a, b, w));
+    }
+    match link_map::build(&nodes, &links) {
+        Some(m) => Json(serde_json::json!({
+            "origin": m.origin, "cell_m": m.cell_m, "width": m.width, "height": m.height,
+            "cells": m.cells, "peak": m.peak, "links": used,
+            "node_positions": s.node_positions_config.iter().map(|(id, p)| (id.to_string(), p.to_vec())).collect::<std::collections::BTreeMap<_, _>>(),
+        })),
+        None => Json(serde_json::json!({ "error": "need --node-positions for at least 2 nodes" })),
+    }
 }
 
 /// Fuse fresh links into a room-level presence vote.
@@ -15760,6 +15797,7 @@ async fn main() {
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
         .route("/api/v1/peer-links", get(peer_links_endpoint))
+        .route("/api/v1/peer-links/map", get(peer_links_map))
         .route("/api/v1/peer-links/calibrate/start", post(peer_links_calibrate_start))
         .route("/api/v1/peer-links/calibrate/stop", post(peer_links_calibrate_stop))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
