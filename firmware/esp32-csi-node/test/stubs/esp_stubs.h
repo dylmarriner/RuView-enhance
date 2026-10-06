@@ -84,6 +84,7 @@ typedef struct {
     unsigned stbc          : 1;   /**< STBC flag */
     /* Padding to keep alignment predictable. */
     unsigned _pad          : 18;
+    unsigned sig_len       : 12;  /**< frame length incl. FCS (peer-beacon parse) */
 } wifi_pkt_rx_ctrl_t;
 
 /** Minimal wifi_csi_info_t needed by csi_serialize_frame. */
@@ -151,6 +152,18 @@ typedef struct {
 } wifi_promiscuous_filter_t;
 
 typedef int wifi_promiscuous_pkt_type_t;
+#define WIFI_PKT_MGMT 0
+#define WIFI_PKT_DATA 2
+
+/* Promiscuous packet (peer-beacon learning in csi_collector.c). */
+typedef struct {
+    wifi_pkt_rx_ctrl_t rx_ctrl;
+    uint8_t payload[];
+} wifi_promiscuous_pkt_t;
+
+static inline esp_err_t esp_wifi_get_mac(wifi_interface_t ifx, uint8_t mac[6]) {
+    (void)ifx; for (int i = 0; i < 6; i++) mac[i] = (uint8_t)(0x10 + i); return ESP_OK;
+}
 #define WIFI_PROMIS_FILTER_MASK_MGMT 1
 #define WIFI_PROMIS_FILTER_MASK_DATA 2
 

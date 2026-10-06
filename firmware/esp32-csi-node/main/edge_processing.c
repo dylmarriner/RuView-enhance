@@ -396,6 +396,8 @@ static float    s_calib_sum;
 static float    s_calib_sum_sq;
 static uint32_t s_calib_count;
 static float    s_adaptive_threshold;
+static float    s_amb_mean;   /* rolling ambient motion mean (post-boot) */
+static float    s_amb_var;    /* rolling ambient motion variance */
 
 /** Last vitals send timestamp. */
 static int64_t s_last_vitals_send_us;
@@ -539,7 +541,23 @@ static bool presence_flag_update(bool prev, float score, float threshold,
 
 static void calibration_update(float motion)
 {
-    if (s_calibrated) return;
+    if (s_calibrated) {
+        /* Rolling recalibration: follow quiet ambient quickly, busy samples
+         * 20x slower so a moving person does not become the new normal. */
+        float a = (motion < s_adaptive_threshold) ? EDGE_CALIB_ALPHA : EDGE_CALIB_ALPHA / 20.0f;
+        float d = motion - s_amb_mean;
+        s_amb_mean += a * d;
+        s_amb_var = (1.0f - a) * (s_amb_var + a * d * d);
+        float sigma = (s_amb_var > 0.0f) ? sqrtf(s_amb_var) : 0.001f;
+        s_adaptive_threshold = s_amb_mean + EDGE_CALIB_SIGMA_MULT * sigma;
+        if (s_adaptive_threshold < 0.01f) s_adaptive_threshold = 0.01f;
+        static uint32_t s_rolling_n;
+        if (++s_rolling_n % 600 == 0) {
+            ESP_LOGI(TAG, "rolling calibration: ambient=%.4f sigma=%.4f threshold=%.4f",
+                     s_amb_mean, sigma, s_adaptive_threshold);
+        }
+        return;
+    }
 
     s_calib_sum += motion;
     s_calib_sum_sq += motion * motion;
@@ -555,6 +573,8 @@ static void calibration_update(float motion)
             s_adaptive_threshold = 0.01f;
         }
 
+        s_amb_mean = mean;
+        s_amb_var = sigma * sigma;
         s_calibrated = true;
         ESP_LOGI(TAG, "Adaptive calibration complete: mean=%.4f sigma=%.4f "
                  "threshold=%.4f (from %lu frames)",
@@ -1190,7 +1210,7 @@ static void process_frame(const edge_ring_slot_t *slot)
     s_presence_score = s_motion_energy;
 
     /* Adaptive calibration: learn ambient noise level from first N frames. */
-    if (!s_calibrated && s_cfg.presence_thresh == 0.0f) {
+    if (s_cfg.presence_thresh == 0.0f) {
         calibration_update(s_motion_energy);
     }
 

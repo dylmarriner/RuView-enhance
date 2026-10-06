@@ -136,6 +136,11 @@ static inline uint8_t edge_evidence_person_count(bool presence, uint8_t active_c
 /* ---- Calibration ---- */
 #define EDGE_CALIB_FRAMES     1200  /**< Frames for adaptive calibration (~60s at 20 Hz). */
 #define EDGE_CALIB_SIGMA_MULT 3.0f  /**< Threshold = mean + 3*sigma of ambient. */
+/** Rolling recalibration after boot (port of esp_wifi_sensing's drift-following
+ *  baseline, Apache-2.0 Espressif): ambient mean/variance keep updating with
+ *  this weight for samples below the threshold, and 1/20 of it above. A busy
+ *  room at boot no longer freezes an inflated threshold for the whole uptime. */
+#define EDGE_CALIB_ALPHA      0.002f
 
 /* ---- Fall detection ---- */
 #define EDGE_FALL_COOLDOWN_MS 5000  /**< Minimum ms between fall alerts (debounce). */
