@@ -14,6 +14,7 @@ pub mod cli;
 pub mod csi;
 mod engine_bridge;
 mod presence_fsm;
+mod link_subspace;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -3759,6 +3760,10 @@ const ESP32_FLAG_PEER_TX: u8 = 1 << 6;
 const PEER_LINK_WINDOW: usize = 50;
 /// Room presence needs at least this fraction of fresh links perturbed.
 const PEER_PRESENCE_FRACTION: f64 = 0.25;
+/// A link's channel shape counts as changed beyond this wander (1 - best
+/// template similarity).
+// ponytail: starting value; set from empty-vs-occupied wander distributions.
+const PEER_WANDER_THRESHOLD: f64 = 0.15;
 /// A link with no frame for this long is ignored.
 const PEER_LINK_FRESH_MS: u128 = 3000;
 
@@ -3773,6 +3778,8 @@ struct PeerLinkState {
     mean_amplitude: VecDeque<f64>,
     /// Espressif-style adaptive detector fed with `motion_score` (ADR: Phase 1 #3).
     fsm: presence_fsm::PresenceFsm,
+    /// Channel-shape jitter/wander against empty-room templates.
+    subspace: link_subspace::LinkSubspace,
 }
 
 impl PeerLinkState {
@@ -3785,6 +3792,7 @@ impl PeerLinkState {
             n_subcarriers: 0,
             mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
             fsm: presence_fsm::PresenceFsm::default(),
+            subspace: link_subspace::LinkSubspace::default(),
         }
     }
 
@@ -3804,6 +3812,7 @@ impl PeerLinkState {
         if self.mean_amplitude.len() == PEER_LINK_WINDOW {
             self.fsm.update(self.motion_score());
         }
+        self.subspace.push(&frame.amplitudes);
     }
 
     /// Coefficient of variation of per-frame mean amplitude: ~0 for a still
@@ -3835,6 +3844,9 @@ impl PeerLinkState {
             "excess": self.fsm.excess(),
             "active": self.fsm.is_active(),
             "stage": format!("{:?}", self.fsm.stage()).to_lowercase(),
+            "jitter": self.subspace.jitter(),
+            "wander": self.subspace.wander(),
+            "templates": self.subspace.template_count(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
     }
@@ -3848,6 +3860,30 @@ async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_jso
     keys.sort_unstable();
     let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
     Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+}
+
+/// POST /api/v1/peer-links/calibrate/start — the room is empty: clear
+/// templates and re-learn every link's baseline from now.
+async fn peer_links_calibrate_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    for l in s.peer_links.values_mut() {
+        l.fsm = presence_fsm::PresenceFsm::default();
+        l.subspace.set_learning(true);
+    }
+    info!("peer-link empty-room calibration started ({} links)", s.peer_links.len());
+    Json(serde_json::json!({ "learning": true, "links": s.peer_links.len() }))
+}
+
+/// POST /api/v1/peer-links/calibrate/stop — freeze the learned templates.
+async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    let mut templates = 0;
+    for l in s.peer_links.values_mut() {
+        l.subspace.set_learning(false);
+        templates += l.subspace.template_count();
+    }
+    info!("peer-link empty-room calibration stopped ({templates} templates)");
+    Json(serde_json::json!({ "learning": false, "templates": templates }))
 }
 
 /// Fuse fresh links into a room-level presence vote.
@@ -3866,7 +3902,14 @@ fn peer_room_summary(
         .collect();
     let perturbed = scored.iter().filter(|&&a| a).count();
     let fraction = if scored.is_empty() { 0.0 } else { perturbed as f64 / scored.len() as f64 };
+    let wanders: Vec<f64> = fresh.iter().filter_map(|l| l.subspace.wander()).collect();
+    let wandering = wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count();
+    let still_presence = !wanders.is_empty()
+        && wandering as f64 / wanders.len() as f64 >= PEER_PRESENCE_FRACTION;
     serde_json::json!({
+        "templated_links": wanders.len(),
+        "wandering_links": wandering,
+        "still_presence": still_presence,
         "fresh_links": fresh.len(),
         "calibrated_links": scored.len(),
         "perturbed_links": perturbed,
@@ -15540,6 +15583,8 @@ async fn main() {
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
         .route("/api/v1/peer-links", get(peer_links_endpoint))
+        .route("/api/v1/peer-links/calibrate/start", post(peer_links_calibrate_start))
+        .route("/api/v1/peer-links/calibrate/stop", post(peer_links_calibrate_stop))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
         .route("/api/v1/nodes/:id/sync", get(node_sync_endpoint))
         .route("/api/v1/mesh", get(mesh_endpoint))
