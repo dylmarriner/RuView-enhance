@@ -423,6 +423,42 @@ The mesh uses a **Time-Division Multiplexing (TDM)** protocol so nodes take turn
 
 See [ADR-029](adr/ADR-029-ruvsense-multistatic-sensing-mode.md) and [ADR-032](adr/ADR-032-multistatic-mesh-security-hardening.md) for the full design.
 
+### ESP32 node-to-node links, calibration and OTA
+
+With four or more ESP32-S3 nodes on firmware with peer beacons, each node also senses every other node, not only the router. The server keeps one stream per transmitter→receiver pair (12 for 4 nodes):
+
+```bash
+curl http://<server>:<http-port>/api/v1/peer-links      # per-link rate, RSSI, motion, wander + room vote
+```
+
+**Empty-room calibration (after the nodes are in their permanent places).** With the room empty:
+
+```bash
+curl -X POST http://<server>:<http-port>/api/v1/peer-links/calibrate/start
+sleep 120
+curl -X POST http://<server>:<http-port>/api/v1/peer-links/calibrate/stop   # saved to <data-dir>/peer_link_calibration.json
+```
+
+The calibration survives restarts and firmware updates. Moving a node changes its links, so recalibrate after moving. Links whose RSSI moved more than 6 dB report `recalibration_recommended: true`.
+
+**Thresholds from data.** Label empty and occupied periods in a link log and sweep thresholds:
+
+```bash
+python scripts/eval_peer_links.py links.jsonl --empty <start>-<end> --occupied <start>-<end>
+```
+
+**Over-the-air updates.** Provision every node once over USB with a shared key (64 hex characters), then update over WiFi:
+
+```bash
+openssl rand -hex 32 > ~/.config/ruview/ota_psk && chmod 600 ~/.config/ruview/ota_psk
+python firmware/esp32-csi-node/provision.py --port /dev/ttyACM0 ... --ota-psk "$(cat ~/.config/ruview/ota_psk)"
+scripts/ota_update_nodes.sh build/esp32-csi-node.bin 192.168.1.71 192.168.1.72
+```
+
+Each node reboots into the other slot and must pass its health check, or the bootloader rolls back. Uploads without the key are rejected (HTTP 403).
+
+**Privacy profile.** In a private home, `--privacy-profile care-with-consent` (or `RUVIEW_PRIVACY_PROFILE`) keeps per-node amplitudes published when the trust engine demotes one step. The default `private-home` withholds them at `Restricted`.
+
 ### MediaTek Router CSI (Experimental)
 
 An OpenWrt router with an MT7981B + MT7976C radio (tested on a Wavlink WL-WN586X3 Rev A) can report CSI through MediaTek's vendor CSI patch. A host-side bridge converts it to MTC1 (ADR-267) for the sensing server:
