@@ -20,6 +20,11 @@
 /** ADR-018 byte 19: ESP-IDF reported and firmware sanitized invalid CSI prefix. */
 #define CSI_FLAG_FIRST_WORD_SANITIZED (1U << 5)
 
+/** Byte 19 bit 6: this CSI was measured on a peer node's beacon. The peer's
+ *  node_id follows the I/Q data as one trailing byte (frame_len + 1), so
+ *  servers that read exactly 20 + 2*n_subcarriers bytes are unaffected. */
+#define CSI_FLAG_PEER_TX (1U << 6)
+
 /** Maximum frame buffer size (header + 4 antennas * 256 subcarriers * 2 bytes). */
 #define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE + 4 * 256 * 2)
 
