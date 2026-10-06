@@ -299,15 +299,28 @@ pub fn tracker_update(
         }
     }
 
-    // Create new tracks for unmatched detections
+    // Render only tracks that correspond to detections observed in this frame.
+    // Unmatched tracks stay alive internally for the re-identification window,
+    // but publishing them here creates ghost people when the current detector
+    // reports fewer occupants than the tracker still remembers.
+    let mut visible_track_ids: Vec<TrackId> = matched.iter().filter_map(|id| *id).collect();
+
+    // Create new tracks for unmatched detections and mark those new tracks visible.
     for (det_idx, track_id_opt) in matched.iter().enumerate() {
         if track_id_opt.is_none() {
-            tracker.create_track(&all_keypoints[det_idx], timestamp_us);
+            let id = tracker.create_track(&all_keypoints[det_idx], timestamp_us);
+            visible_track_ids.push(id);
         }
     }
 
     tracker.prune_terminated();
-    tracker_to_person_detections(tracker)
+    let mut current = tracker_to_person_detections(tracker);
+    current.retain(|person| {
+        visible_track_ids
+            .iter()
+            .any(|track_id| track_id.0 as u32 == person.id)
+    });
+    current
 }
 
 #[cfg(test)]
@@ -437,6 +450,37 @@ mod tests {
         // All three updates should return the same track ID
         assert_eq!(id1, id2, "Track ID should be stable across updates");
         assert_eq!(id2, id3, "Track ID should be stable across updates");
+    }
+
+    #[test]
+    fn unmatched_active_tracks_are_not_rendered_as_current_people() {
+        let mut tracker = PoseTracker::new();
+        let mut last_instant: Option<Instant> = None;
+
+        let p1 = make_person(1, vec![make_keypoint("nose", 1.0, 2.0, 0.0)]);
+        let p2 = make_person(2, vec![make_keypoint("nose", 10.0, 2.0, 0.0)]);
+
+        // Two frames establish two live tracks.
+        let _ = tracker_update(
+            &mut tracker,
+            &mut last_instant,
+            vec![p1.clone(), p2.clone()],
+        );
+        let two = tracker_update(
+            &mut tracker,
+            &mut last_instant,
+            vec![p1.clone(), p2.clone()],
+        );
+        assert_eq!(two.len(), 2, "test setup requires two rendered tracks");
+
+        // Only p1 is observed now. p2 may remain internally alive for re-ID,
+        // but it must not be emitted as a second current person.
+        let one = tracker_update(&mut tracker, &mut last_instant, vec![p1]);
+        assert_eq!(
+            one.len(),
+            1,
+            "unmatched active tracks must not be rendered as current people"
+        );
     }
 
     /// Regression test for #420 (ADR-082): tracks that have transitioned to
