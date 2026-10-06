@@ -384,6 +384,9 @@ struct Esp32Frame {
     /// ADR-110 byte 19 metadata, including whether this frame was captured
     /// while the node had a valid IEEE 802.15.4 mesh-time solution.
     adr018_flags: wifi_densepose_hardware::Adr018Flags,
+    /// Peer-link CSI: the transmitting node, when byte-19 bit 6 is set and a
+    /// trailing tx node_id byte follows the I/Q data. `None` = AP/router frame.
+    peer_tx: Option<u8>,
     amplitudes: Vec<f64>,
     phases: Vec<f64>,
 }
@@ -2222,6 +2225,8 @@ struct AppStateInner {
     /// Per-node sensing state for multi-node deployments.
     /// Keyed by `node_id` from the ESP32 frame header.
     node_states: HashMap<u8, NodeState>,
+    /// Node-to-node sensing links keyed by (tx node, rx node).
+    peer_links: HashMap<(u8, u8), PeerLinkState>,
     /// Debounced room-level classification state — see
     /// `debounce_room_classification`. `fuse_room` is a fresh, memoryless
     /// plurality vote every cycle with no debounce of its own (unlike each
@@ -3110,6 +3115,7 @@ impl AppStateInner {
             training_progress_tx: broadcast::channel::<String>(256).0,
             adaptive_model: None,
             node_states: HashMap::new(),
+            peer_links: HashMap::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
             room_debounce_since: None,
@@ -3744,6 +3750,91 @@ mod issue_928_magic_collision_tests {
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
 
+/// Byte-19 bit 6 (firmware `CSI_FLAG_PEER_TX`): CSI measured on a peer
+/// node's beacon; the tx node_id trails the I/Q data.
+const ESP32_FLAG_PEER_TX: u8 = 1 << 6;
+
+/// Frames kept per peer link for the motion statistic (~5 s at 10 Hz).
+const PEER_LINK_WINDOW: usize = 50;
+
+/// Rolling state for one node-to-node link.
+struct PeerLinkState {
+    first_seen: std::time::Instant,
+    last_seen: std::time::Instant,
+    frames: u64,
+    rssi_dbm: f64,
+    n_subcarriers: u16,
+    /// Mean LLTF amplitude per frame; its spread is the link's motion signal.
+    mean_amplitude: VecDeque<f64>,
+}
+
+impl PeerLinkState {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            first_seen: now,
+            last_seen: now,
+            frames: 0,
+            rssi_dbm: 0.0,
+            n_subcarriers: 0,
+            mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
+        }
+    }
+
+    fn observe(&mut self, frame: &Esp32Frame, now: std::time::Instant) {
+        self.last_seen = now;
+        self.frames += 1;
+        let rssi = f64::from(frame.rssi);
+        self.rssi_dbm = if self.frames == 1 { rssi } else { 0.9 * self.rssi_dbm + 0.1 * rssi };
+        self.n_subcarriers = frame.n_subcarriers;
+        if !frame.amplitudes.is_empty() {
+            let mean = frame.amplitudes.iter().sum::<f64>() / frame.amplitudes.len() as f64;
+            if self.mean_amplitude.len() == PEER_LINK_WINDOW {
+                self.mean_amplitude.pop_front();
+            }
+            self.mean_amplitude.push_back(mean);
+        }
+    }
+
+    /// Coefficient of variation of per-frame mean amplitude: ~0 for a still
+    /// path, rising as a body perturbs it.
+    fn motion_score(&self) -> f64 {
+        let n = self.mean_amplitude.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let mean = self.mean_amplitude.iter().sum::<f64>() / n as f64;
+        if mean <= 0.0 {
+            return 0.0;
+        }
+        let var = self.mean_amplitude.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        var.sqrt() / mean
+    }
+
+    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
+        let span = self.last_seen.duration_since(self.first_seen).as_secs_f64();
+        serde_json::json!({
+            "tx": tx,
+            "rx": rx,
+            "frames": self.frames,
+            "rate_hz": if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 },
+            "rssi_dbm": self.rssi_dbm,
+            "subcarrier_count": self.n_subcarriers,
+            "motion_score": self.motion_score(),
+            "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
+        })
+    }
+}
+
+/// GET /api/v1/peer-links — node-to-node sensing links (tx -> rx).
+async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let mut keys: Vec<_> = s.peer_links.keys().copied().collect();
+    keys.sort_unstable();
+    let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
+    Json(serde_json::json!({ "links": links }))
+}
+
 /// Parse `--privacy-profile`. `raw-research` is refused: its class is
 /// local-only and would block every networked output.
 fn parse_privacy_profile(v: &str) -> Result<wifi_densepose_bfld::PrivacyMode, String> {
@@ -3872,6 +3963,8 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     }
 
     let iq = &buf[iq_start..expected_len];
+    let peer_tx = (buf[19] & ESP32_FLAG_PEER_TX != 0 && buf.len() > expected_len)
+        .then(|| buf[expected_len]);
     // HT/legacy single-antenna frames carry the 52-tone LLTF in their first
     // 128 bytes regardless of HT20/HT40/STBC. Using only those tones gives
     // every node the same grid and drops guard/DC bins (Phase 1 / esp-radar).
@@ -3907,9 +4000,41 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         noise_floor,
         ppdu_type,
         adr018_flags,
+        peer_tx,
         amplitudes,
         phases,
     })
+}
+
+#[cfg(test)]
+mod peer_tx_parse_tests {
+    use super::{parse_esp32_frame, ESP32_FLAG_PEER_TX};
+
+    fn frame(flags: u8, trailer: Option<u8>) -> Vec<u8> {
+        let mut b = vec![0u8; 20 + 128];
+        b[0..4].copy_from_slice(&0xC511_0001u32.to_le_bytes());
+        b[4] = 3; // rx node
+        b[5] = 1;
+        b[6..8].copy_from_slice(&64u16.to_le_bytes());
+        b[19] = flags;
+        for (k, v) in b[20..].iter_mut().enumerate() {
+            *v = (k % 50 + 1) as u8;
+        }
+        b.extend(trailer);
+        b
+    }
+
+    #[test]
+    fn flagged_frame_with_trailer_carries_tx_node() {
+        let f = parse_esp32_frame(&frame(ESP32_FLAG_PEER_TX, Some(2))).unwrap();
+        assert_eq!((f.peer_tx, f.node_id), (Some(2), 3));
+    }
+
+    #[test]
+    fn unflagged_or_truncated_frames_are_ap_frames() {
+        assert_eq!(parse_esp32_frame(&frame(0, Some(2))).unwrap().peer_tx, None);
+        assert_eq!(parse_esp32_frame(&frame(ESP32_FLAG_PEER_TX, None)).unwrap().peer_tx, None);
+    }
 }
 
 #[cfg(test)]
@@ -5146,6 +5271,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
             noise_floor: -90,
             ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
             adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+            peer_tx: None,
             amplitudes: multi_ap_frame.amplitudes.clone(),
             phases: multi_ap_frame.phases.clone(),
         };
@@ -5340,6 +5466,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         noise_floor: -90,
         ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
         adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+        peer_tx: None,
         amplitudes: vec![signal_pct],
         phases: vec![0.0],
     };
@@ -5944,6 +6071,7 @@ fn generate_simulated_frame(tick: u64) -> Esp32Frame {
         noise_floor: -90,
         ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
         adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+        peer_tx: None,
         amplitudes,
         phases,
     }
@@ -13030,6 +13158,15 @@ async fn udp_receiver_task(
                     s.source = "esp32".to_string();
                     let observed_at = std::time::Instant::now();
                     s.last_esp32_frame = Some(observed_at);
+                    // Peer links have their own geometry; keep them out of the
+                    // receiving node's AP-path statistics.
+                    if let Some(tx) = frame.peer_tx {
+                        s.peer_links
+                            .entry((tx, frame.node_id))
+                            .or_insert_with(|| PeerLinkState::new(observed_at))
+                            .observe(&frame, observed_at);
+                        continue;
+                    }
                     let grid_key = CsiGridKey::from_frame(&frame);
                     s.node_states
                         .entry(frame.node_id)
@@ -14927,6 +15064,7 @@ async fn main() {
                 );
             }),
         node_states: HashMap::new(),
+        peer_links: HashMap::new(),
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
         room_debounce_since: None,
@@ -15318,6 +15456,7 @@ async fn main() {
         .route("/api/v1/rf/vendors/:vendor/events", post(ingest_vendor_events))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
+        .route("/api/v1/peer-links", get(peer_links_endpoint))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
         .route("/api/v1/nodes/:id/sync", get(node_sync_endpoint))
         .route("/api/v1/mesh", get(mesh_endpoint))

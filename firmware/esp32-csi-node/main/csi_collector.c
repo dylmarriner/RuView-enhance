@@ -22,6 +22,8 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 #include "esp_netif.h"          /* #954: STA gateway lookup for self-ping CSI source */
 #include "ping/ping_sock.h"     /* #954: esp_ping gateway traffic generator */
@@ -151,6 +153,8 @@ static esp_timer_handle_t s_hop_timer = NULL;
  *   [18..19] Reserved
  *   [20..]   I/Q data (raw bytes from ESP-IDF callback)
  */
+static int peer_lookup(const uint8_t *mac);
+
 size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf_len)
 {
     if (info == NULL || buf == NULL || info->buf == NULL) {
@@ -277,6 +281,12 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
         buf[19] |= CSI_FLAG_FIRST_WORD_SANITIZED;
     }
 
+    int peer = peer_lookup(info->mac);
+    if (peer >= 0 && frame_size < buf_len) {
+        buf[19] |= CSI_FLAG_PEER_TX;
+        buf[frame_size++] = (uint8_t)peer;
+    }
+
     return frame_size;
 }
 
@@ -344,7 +354,7 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
      * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
      * be corrupted by wifi_init_sta — same root cause as the node_id clobber). */
     if (s_filter_mac_set) {
-        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
+        if (memcmp(info->mac, s_filter_mac, 6) != 0 && peer_lookup(info->mac) < 0) {
             return;  /* Source MAC doesn't match filter — skip frame. */
         }
     }
@@ -468,11 +478,88 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
  * Promiscuous mode callback — required for CSI to fire on all received frames.
  * We don't need the packet content, just the CSI triggered by reception.
  */
+/* ---- Peer sensing: node-to-node links ----
+ *
+ * Each node broadcasts a small vendor-specific action frame (a "peer beacon")
+ * carrying its node_id. Receivers learn MAC -> node_id from the beacon payload
+ * here, and wifi_csi_callback tags CSI measured on a known peer's frames with
+ * that node_id, so the server can separate N*(N-1) peer links from AP traffic.
+ * Action frames are MGMT, so they pass the #396 promiscuous filter. */
+#define PEER_BEACON_CATEGORY  127          /* vendor-specific action */
+#define PEER_BEACON_LEN       32
+#define PEER_TABLE_SIZE       8
+#define PEER_BEACON_PERIOD_US (100 * 1000) /* 10 Hz per node */
+static const uint8_t s_peer_tag[5] = {0x02, 0x52, 0x56, 'R', 'V'}; /* locally administered OUI + "RV" */
+
+typedef struct { uint8_t mac[6]; uint8_t node_id; } peer_entry_t;
+static peer_entry_t s_peers[PEER_TABLE_SIZE];
+static uint8_t s_peer_count = 0;
+static esp_timer_handle_t s_peer_timer = NULL;
+
+/* Both WiFi callbacks run in the WiFi task, so the table needs no lock. */
+static int peer_lookup(const uint8_t *mac)
+{
+    for (uint8_t i = 0; i < s_peer_count; i++) {
+        if (memcmp(s_peers[i].mac, mac, 6) == 0) return s_peers[i].node_id;
+    }
+    return -1;
+}
+
+static void peer_learn(const uint8_t *mac, uint8_t node_id)
+{
+    if (node_id == s_node_id) return;
+    for (uint8_t i = 0; i < s_peer_count; i++) {
+        if (memcmp(s_peers[i].mac, mac, 6) == 0) { s_peers[i].node_id = node_id; return; }
+    }
+    if (s_peer_count < PEER_TABLE_SIZE) {
+        memcpy(s_peers[s_peer_count].mac, mac, 6);
+        s_peers[s_peer_count].node_id = node_id;
+        s_peer_count++;
+        ESP_LOGI(TAG, "peer learned: node %u = %02x:%02x:%02x:%02x:%02x:%02x", (unsigned)node_id,
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+}
+
 static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 {
-    /* No-op: CSI callback is registered separately and fires in parallel. */
-    (void)buf;
-    (void)type;
+    if (type != WIFI_PKT_MGMT || buf == NULL) return;
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *f = pkt->payload;
+    /* 24-byte header, then category, tag, node_id (FCS may follow). */
+    if (pkt->rx_ctrl.sig_len < 24 + 1 + sizeof(s_peer_tag) + 1) return;
+    if (f[0] != 0xD0) return;                         /* action frame */
+    if (f[24] != PEER_BEACON_CATEGORY) return;
+    if (memcmp(&f[25], s_peer_tag, sizeof(s_peer_tag)) != 0) return;
+    peer_learn(&f[10], f[25 + sizeof(s_peer_tag)]);   /* addr2 = transmitter */
+}
+
+static void peer_beacon_timer_cb(void *arg)
+{
+    (void)arg;
+    uint8_t frame[PEER_BEACON_LEN] = {0};
+    frame[0] = 0xD0;                                  /* FC: mgmt / action */
+    memset(&frame[4], 0xFF, 6);                       /* addr1: broadcast */
+    esp_wifi_get_mac(WIFI_IF_STA, &frame[10]);        /* addr2: own MAC */
+    memset(&frame[16], 0xFF, 6);                      /* addr3: wildcard BSSID */
+    frame[24] = PEER_BEACON_CATEGORY;
+    memcpy(&frame[25], s_peer_tag, sizeof(s_peer_tag));
+    frame[25 + sizeof(s_peer_tag)] = s_node_id;
+    (void)esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
+}
+
+/* Stagger nodes by TDM slot so beacons from different nodes don't collide.
+ * ponytail: free-running timers, no shared clock; CSMA absorbs drift. Lock
+ * to the ESP-NOW/15.4 epoch if collisions show up in peer-link frame rates. */
+static void peer_beacon_start(void)
+{
+    if (s_peer_timer != NULL) return;
+    uint8_t slots = g_nvs_config.tdm_node_count ? g_nvs_config.tdm_node_count : 1;
+    uint8_t slot = g_nvs_config.tdm_slot_index < slots ? g_nvs_config.tdm_slot_index : 0;
+    const esp_timer_create_args_t args = { .callback = peer_beacon_timer_cb, .name = "peer_bcn" };
+    if (esp_timer_create(&args, &s_peer_timer) != ESP_OK) return;
+    vTaskDelay(pdMS_TO_TICKS((uint32_t)slot * (PEER_BEACON_PERIOD_US / 1000) / slots));
+    esp_timer_start_periodic(s_peer_timer, PEER_BEACON_PERIOD_US);
+    ESP_LOGI(TAG, "peer beacons on: 10 Hz, slot %u/%u", (unsigned)slot, (unsigned)slots);
 }
 
 /* ---- RuView#521/#954: connected-STA CSI traffic source (additive) ----
@@ -705,6 +792,7 @@ void csi_collector_init(void)
      * receives a guaranteed OFDM unicast floor even when promiscuous capture is
      * starved (display builds / quiet networks). Additive to #396/#893. */
     csi_start_self_ping();
+    peer_beacon_start();
 }
 
 /* Accessor for other modules that need the authoritative runtime node_id. */
