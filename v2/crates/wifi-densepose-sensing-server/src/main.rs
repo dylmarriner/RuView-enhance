@@ -3756,6 +3756,13 @@ const ESP32_FLAG_PEER_TX: u8 = 1 << 6;
 
 /// Frames kept per peer link for the motion statistic (~5 s at 10 Hz).
 const PEER_LINK_WINDOW: usize = 50;
+/// A link counts as perturbed above this multiple of its quiet baseline.
+// ponytail: fixed ratio; tune from empty-vs-occupied captures per room.
+const PEER_PERTURBED_RATIO: f64 = 2.0;
+/// Room presence needs at least this fraction of fresh links perturbed.
+const PEER_PRESENCE_FRACTION: f64 = 0.25;
+/// A link with no frame for this long is ignored.
+const PEER_LINK_FRESH_MS: u128 = 3000;
 
 /// Rolling state for one node-to-node link.
 struct PeerLinkState {
@@ -3766,6 +3773,10 @@ struct PeerLinkState {
     n_subcarriers: u16,
     /// Mean LLTF amplitude per frame; its spread is the link's motion signal.
     mean_amplitude: VecDeque<f64>,
+    /// Slow quiet-level estimate of `motion_score`. Learns quickly downward and
+    /// slowly upward, and ignores clear excursions, so occupancy does not
+    /// become the new normal.
+    baseline: Option<f64>,
 }
 
 impl PeerLinkState {
@@ -3777,6 +3788,7 @@ impl PeerLinkState {
             rssi_dbm: 0.0,
             n_subcarriers: 0,
             mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
+            baseline: None,
         }
     }
 
@@ -3793,6 +3805,20 @@ impl PeerLinkState {
             }
             self.mean_amplitude.push_back(mean);
         }
+        if self.mean_amplitude.len() == PEER_LINK_WINDOW {
+            let m = self.motion_score();
+            self.baseline = Some(match self.baseline {
+                None => m,
+                Some(b) if m < b => 0.9 * b + 0.1 * m,
+                Some(b) if m < PEER_PERTURBED_RATIO * b => 0.999 * b + 0.001 * m,
+                Some(b) => b,
+            });
+        }
+    }
+
+    /// Current motion relative to the link's quiet baseline (1.0 = normal).
+    fn perturbation(&self) -> Option<f64> {
+        self.baseline.filter(|b| *b > 1e-6).map(|b| self.motion_score() / b)
     }
 
     /// Coefficient of variation of per-frame mean amplitude: ~0 for a still
@@ -3820,6 +3846,8 @@ impl PeerLinkState {
             "rssi_dbm": self.rssi_dbm,
             "subcarrier_count": self.n_subcarriers,
             "motion_score": self.motion_score(),
+            "baseline": self.baseline,
+            "perturbation": self.perturbation(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
     }
@@ -3832,7 +3860,28 @@ async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_jso
     let mut keys: Vec<_> = s.peer_links.keys().copied().collect();
     keys.sort_unstable();
     let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
-    Json(serde_json::json!({ "links": links }))
+    Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+}
+
+/// Fuse fresh links into a room-level presence vote.
+fn peer_room_summary(
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> serde_json::Value {
+    let fresh: Vec<&PeerLinkState> = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .collect();
+    let scored: Vec<f64> = fresh.iter().filter_map(|l| l.perturbation()).collect();
+    let perturbed = scored.iter().filter(|&&p| p >= PEER_PERTURBED_RATIO).count();
+    let fraction = if scored.is_empty() { 0.0 } else { perturbed as f64 / scored.len() as f64 };
+    serde_json::json!({
+        "fresh_links": fresh.len(),
+        "calibrated_links": scored.len(),
+        "perturbed_links": perturbed,
+        "perturbed_fraction": fraction,
+        "presence": !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION,
+    })
 }
 
 /// Parse `--privacy-profile`. `raw-research` is refused: its class is
@@ -4004,6 +4053,49 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         amplitudes,
         phases,
     })
+}
+
+#[cfg(test)]
+mod peer_link_fusion_tests {
+    use super::*;
+
+    fn link_with(amps: &[f64], now: std::time::Instant) -> PeerLinkState {
+        let mut l = PeerLinkState::new(now);
+        l.mean_amplitude.extend(amps.iter().copied());
+        l
+    }
+
+    #[test]
+    fn baseline_ignores_excursions_and_flags_perturbation() {
+        let now = std::time::Instant::now();
+        let quiet: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 0.2).collect();
+        let mut l = link_with(&quiet, now);
+        l.baseline = Some(l.motion_score());
+        let b = l.baseline.unwrap();
+        // A body in the path: large swings.
+        l.mean_amplitude = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 3.0).collect();
+        assert!(l.perturbation().unwrap() >= PEER_PERTURBED_RATIO);
+        assert_eq!(l.baseline.unwrap(), b, "excursion must not move the baseline");
+    }
+
+    #[test]
+    fn room_presence_needs_enough_perturbed_links() {
+        let now = std::time::Instant::now();
+        let quiet: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 0.2).collect();
+        let busy: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 3.0).collect();
+        let base = link_with(&quiet, now).motion_score();
+        let mut links = HashMap::new();
+        for k in 0..4u8 {
+            let mut l = link_with(if k == 0 { &busy } else { &quiet }, now);
+            l.baseline = Some(base);
+            links.insert((k, k + 1), l);
+        }
+        let r = peer_room_summary(&links, now);
+        assert_eq!(r["perturbed_links"], 1);
+        assert_eq!(r["presence"], true, "1 of 4 = 25% meets the threshold");
+        links.get_mut(&(0, 1)).unwrap().mean_amplitude = quiet.iter().copied().collect();
+        assert_eq!(peer_room_summary(&links, now)["presence"], false);
+    }
 }
 
 #[cfg(test)]
