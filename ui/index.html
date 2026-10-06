@@ -44,13 +44,54 @@
         <!-- Dashboard Tab -->
         <section id="dashboard" class="tab-content active" role="tabpanel" aria-labelledby="dashboard">
             <div class="hero-section">
-                <h2 data-i18n="dashboard.title">Revolutionary WiFi-Based Human Pose Detection</h2>
-                <p class="hero-description">
-                    AI can track your full-body movement through walls using just WiFi signals. 
-                    Researchers at Carnegie Mellon have trained a neural network to turn basic WiFi 
-                    signals into detailed wireframe models of human bodies.
-                </p>
-                
+                <h2 data-i18n="dashboard.title">Live Sensing Dashboard</h2>
+
+                <!-- Live Sensing (fed by the sensing WebSocket) -->
+                <div class="live-sensing-panel">
+                    <div class="ls-header">
+                        <h3>Live Sensing</h3>
+                        <span class="ls-freshness" id="lsFreshness">waiting for data…</span>
+                    </div>
+                    <div class="ls-grid">
+                        <div class="ls-card ls-presence absent" id="lsPresenceCard">
+                            <span class="ls-label">Presence</span>
+                            <span class="ls-value" id="lsPresence">—</span>
+                            <span class="ls-sub" id="lsPresenceConf">confidence —</span>
+                        </div>
+                        <div class="ls-card">
+                            <span class="ls-label">People (est.)</span>
+                            <span class="ls-value" id="lsPersons">—</span>
+                            <span class="ls-sub" id="lsPosture">posture —</span>
+                        </div>
+                        <div class="ls-card">
+                            <span class="ls-label">Breathing</span>
+                            <span class="ls-value" id="lsBreathing">—</span>
+                            <span class="ls-sub" id="lsBreathingConf">confidence —</span>
+                        </div>
+                        <div class="ls-card">
+                            <span class="ls-label">Heart rate</span>
+                            <span class="ls-value" id="lsHeart">—</span>
+                            <span class="ls-sub" id="lsHeartConf">confidence —</span>
+                        </div>
+                        <div class="ls-card ls-wide">
+                            <span class="ls-label">Mean RSSI</span>
+                            <span class="ls-value" id="lsRssi">—</span>
+                            <canvas id="lsRssiSpark" class="ls-spark" width="320" height="48" aria-label="RSSI trend"></canvas>
+                        </div>
+                        <div class="ls-card">
+                            <span class="ls-label">Signal quality</span>
+                            <span class="ls-value" id="lsQuality">—</span>
+                            <span class="ls-sub" id="lsVerdict">—</span>
+                        </div>
+                        <div class="ls-card">
+                            <span class="ls-label">Frame rate</span>
+                            <span class="ls-value" id="lsFps">—</span>
+                            <span class="ls-sub" id="lsSource">source —</span>
+                        </div>
+                    </div>
+                    <div class="ls-nodes" id="lsNodes"></div>
+                </div>
+
                 <!-- Error container -->
                 <div class="error-container" style="display: none;"></div>
 
@@ -144,47 +185,55 @@
                     </div>
                 </div>
                 
-                <div class="key-benefits">
-                    <div class="benefit-card">
-                        <div class="benefit-icon">🏠</div>
-                        <h3>Through Walls</h3>
-                        <p>Works through solid barriers with no line of sight required</p>
+                <details class="about-section">
+                    <summary>About WiFi pose detection <span class="claim-tag">CLAIMED</span></summary>
+                    <p class="hero-description">
+                        Research (Carnegie Mellon) shows a neural network can turn WiFi CSI into
+                        body wireframes. Figures below are published research claims, not
+                        measurements from this deployment.
+                    </p>
+                    <div class="key-benefits">
+                        <div class="benefit-card">
+                            <div class="benefit-icon">🏠</div>
+                            <h3>Through Walls</h3>
+                            <p>Works through solid barriers with no line of sight required</p>
+                        </div>
+                        <div class="benefit-card">
+                            <div class="benefit-icon">🔒</div>
+                            <h3>Privacy-Preserving</h3>
+                            <p>No cameras or visual recording - just WiFi signal analysis</p>
+                        </div>
+                        <div class="benefit-card">
+                            <div class="benefit-icon">⚡</div>
+                            <h3>Real-Time</h3>
+                            <p>Maps 24 body regions in real-time at 100Hz sampling rate</p>
+                        </div>
+                        <div class="benefit-card">
+                            <div class="benefit-icon">💰</div>
+                            <h3>Low Cost</h3>
+                            <p>Built using $30 commercial WiFi hardware</p>
+                        </div>
                     </div>
-                    <div class="benefit-card">
-                        <div class="benefit-icon">🔒</div>
-                        <h3>Privacy-Preserving</h3>
-                        <p>No cameras or visual recording - just WiFi signal analysis</p>
-                    </div>
-                    <div class="benefit-card">
-                        <div class="benefit-icon">⚡</div>
-                        <h3>Real-Time</h3>
-                        <p>Maps 24 body regions in real-time at 100Hz sampling rate</p>
-                    </div>
-                    <div class="benefit-card">
-                        <div class="benefit-icon">💰</div>
-                        <h3>Low Cost</h3>
-                        <p>Built using $30 commercial WiFi hardware</p>
-                    </div>
-                </div>
 
-                <div class="system-stats">
-                    <div class="stat" data-stat="body-regions">
-                        <span class="stat-value">24</span>
-                        <span class="stat-label">Body Regions</span>
+                    <div class="system-stats">
+                        <div class="stat" data-stat="body-regions">
+                            <span class="stat-value">24</span>
+                            <span class="stat-label">Body Regions</span>
+                        </div>
+                        <div class="stat" data-stat="sampling-rate">
+                            <span class="stat-value">100Hz</span>
+                            <span class="stat-label">Sampling Rate</span>
+                        </div>
+                        <div class="stat" data-stat="accuracy">
+                            <span class="stat-value">87.2%</span>
+                            <span class="stat-label">Accuracy (AP@50)</span>
+                        </div>
+                        <div class="stat" data-stat="hardware-cost">
+                            <span class="stat-value">$30</span>
+                            <span class="stat-label">Hardware Cost</span>
+                        </div>
                     </div>
-                    <div class="stat" data-stat="sampling-rate">
-                        <span class="stat-value">100Hz</span>
-                        <span class="stat-label">Sampling Rate</span>
-                    </div>
-                    <div class="stat" data-stat="accuracy">
-                        <span class="stat-value">87.2%</span>
-                        <span class="stat-label">Accuracy (AP@50)</span>
-                    </div>
-                    <div class="stat" data-stat="hardware-cost">
-                        <span class="stat-value">$30</span>
-                        <span class="stat-label">Hardware Cost</span>
-                    </div>
-                </div>
+                </details>
             </div>
         </section>
 

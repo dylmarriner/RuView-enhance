@@ -855,6 +855,57 @@ mod classify_vitals_tests {
 }
 
 #[cfg(test)]
+mod count_jsonl_frames_tests {
+    use super::count_jsonl_frames;
+
+    fn frames(content: &[u8]) -> usize {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), content).unwrap();
+        count_jsonl_frames(f.path())
+    }
+
+    #[test]
+    fn matches_lines_semantics() {
+        assert_eq!(frames(b""), 0);
+        assert_eq!(frames(b"{}\n{}\n"), 2);
+        assert_eq!(frames(b"{}\n{}"), 2, "unterminated final frame counts");
+    }
+
+    #[test]
+    fn counts_across_buffer_boundaries() {
+        let line = format!("{}\n", "x".repeat(1000));
+        assert_eq!(frames(line.repeat(200).as_bytes()), 200);
+    }
+
+    #[test]
+    fn missing_file_is_zero() {
+        assert_eq!(count_jsonl_frames(std::path::Path::new("/nonexistent/rec.jsonl")), 0);
+    }
+}
+
+#[cfg(test)]
+mod finish_recording_tests {
+    use super::{finish_recording, AppStateInner};
+
+    #[test]
+    fn clears_active_state_and_completes_entry() {
+        let mut s = AppStateInner::minimal();
+        s.recording_active = true;
+        s.recording_start_time = Some(std::time::Instant::now());
+        s.recording_current_id = Some("rec_1".into());
+        s.recording_stop_tx = Some(tokio::sync::watch::channel(false).0);
+        s.recordings.push(serde_json::json!({ "id": "rec_1", "status": "recording" }));
+
+        let (id, _) = finish_recording(&mut s);
+
+        assert_eq!(id, "rec_1");
+        assert!(!s.recording_active, "a capped/failed writer must not leave the server 'recording'");
+        assert!(s.recording_current_id.is_none() && s.recording_stop_tx.is_none());
+        assert_eq!(s.recordings[0]["status"], "completed");
+    }
+}
+
+#[cfg(test)]
 mod issue_1554_room_classification_tests {
     //! Issue #1554 — the top-level `classification` in `SensingUpdate` (served
     //! by `GET /api/v1/sensing/latest`) used to be `classify_vitals(...)` on
@@ -8277,10 +8328,13 @@ async fn start_recording(
     let rec_id = id.clone();
 
     // Spawn writer task in background
+    let writer_state = state.clone();
     tokio::spawn(async move {
         use std::io::Write;
         let mut writer = std::io::BufWriter::new(file);
         let mut frame_count: u64 = 0;
+        let mut bytes_written: u64 = 0;
+        let mut stopped_by_request = false;
         loop {
             tokio::select! {
                 result = rx.recv() => {
@@ -8299,6 +8353,11 @@ async fn start_recording(
                                 break;
                             }
                             frame_count += 1;
+                            bytes_written += frame_json.len() as u64 + 1;
+                            if bytes_written >= MAX_RECORDING_BYTES {
+                                warn!("Recording {rec_id}: reached {MAX_RECORDING_BYTES} byte cap, stopping");
+                                break;
+                            }
                             // Flush every 100 frames
                             if frame_count % 100 == 0 {
                                 let _ = writer.flush();
@@ -8316,6 +8375,7 @@ async fn start_recording(
                 _ = stop_rx.changed() => {
                     if *stop_rx.borrow() {
                         info!("Recording {rec_id}: stop signal received ({frame_count} frames)");
+                        stopped_by_request = true;
                         break;
                     }
                 }
@@ -8323,6 +8383,12 @@ async fn start_recording(
         }
         let _ = writer.flush();
         info!("Recording {rec_id} finished: {frame_count} frames written");
+        if !stopped_by_request {
+            let mut s = writer_state.write().await;
+            if s.recording_current_id.as_deref() == Some(rec_id.as_str()) {
+                finish_recording(&mut s);
+            }
+        }
     });
 
     match watermark {
@@ -8331,6 +8397,32 @@ async fn start_recording(
     }
     Json(serde_json::json!({ "success": true, "recording_id": id, "watermark": watermark }))
 }
+
+/// Clear the active-recording state and mark its entry completed. Shared by
+/// `stop_recording` and the writer task when it stops itself (size cap or
+/// write error), so the server never reports a recording that is not writing.
+fn finish_recording(s: &mut AppStateInner) -> (String, u64) {
+    let duration_secs = s
+        .recording_start_time
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let rec_id = s.recording_current_id.take().unwrap_or_default();
+    s.recording_active = false;
+    s.recording_start_time = None;
+    s.recording_stop_tx = None;
+    for rec in s.recordings.iter_mut() {
+        if rec.get("id").and_then(|v| v.as_str()) == Some(rec_id.as_str()) {
+            rec["status"] = serde_json::json!("completed");
+            rec["duration_secs"] = serde_json::json!(duration_secs);
+        }
+    }
+    (rec_id, duration_secs)
+}
+
+/// Hard cap on one recording file. An uncapped recording reached 11.9 GB in
+/// ~3 h on a Pi 5 and filled RAM on the next start.
+// ponytail: fixed 2 GiB; make it configurable if long captures need more.
+const MAX_RECORDING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// POST /api/v1/recording/stop — stop recording CSI data.
 async fn stop_recording(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -8345,21 +8437,7 @@ async fn stop_recording(State(state): State<SharedState>) -> Json<serde_json::Va
     if let Some(tx) = s.recording_stop_tx.take() {
         let _ = tx.send(true);
     }
-    let duration_secs = s
-        .recording_start_time
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
-    let rec_id = s.recording_current_id.take().unwrap_or_default();
-    s.recording_active = false;
-    s.recording_start_time = None;
-
-    // Update the recording entry status
-    for rec in s.recordings.iter_mut() {
-        if rec.get("id").and_then(|v| v.as_str()) == Some(rec_id.as_str()) {
-            rec["status"] = serde_json::json!("completed");
-            rec["duration_secs"] = serde_json::json!(duration_secs);
-        }
-    }
+    let (rec_id, duration_secs) = finish_recording(&mut s);
 
     info!("Recording stopped: {rec_id} ({duration_secs}s)");
     Json(serde_json::json!({
@@ -8398,6 +8476,31 @@ async fn delete_recording(
     }
 }
 
+/// Count newline-terminated frames in a JSONL recording with a fixed-size
+/// buffer. Recordings are unbounded (an 11.9 GB one OOM-killed a Pi 5 when
+/// this used `read_to_string`), so never load the file to count it.
+fn count_jsonl_frames(path: &std::path::Path) -> usize {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut lines, mut last) = (0usize, b'\n');
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                lines += buf[..n].iter().filter(|&&b| b == b'\n').count();
+                last = buf[n - 1];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    // A final frame without a trailing newline still counts, as with `lines()`.
+    lines + usize::from(last != b'\n')
+}
+
 /// Scan the recordings directory for `.jsonl` files and return metadata.
 fn scan_recording_files(dir: &std::path::Path) -> Vec<serde_json::Value> {
     let mut recordings = Vec::new();
@@ -8418,10 +8521,7 @@ fn scan_recording_files(dir: &std::path::Path) -> Vec<serde_json::Value> {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                // Count lines (frames) — approximate for large files
-                let frame_count = std::fs::read_to_string(&path)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0);
+                let frame_count = count_jsonl_frames(&path);
                 recordings.push(serde_json::json!({
                     "id": name,
                     "name": name,
