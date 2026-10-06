@@ -13,6 +13,7 @@ mod adaptive_classifier;
 pub mod cli;
 pub mod csi;
 mod engine_bridge;
+mod presence_fsm;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -3756,9 +3757,6 @@ const ESP32_FLAG_PEER_TX: u8 = 1 << 6;
 
 /// Frames kept per peer link for the motion statistic (~5 s at 10 Hz).
 const PEER_LINK_WINDOW: usize = 50;
-/// A link counts as perturbed above this multiple of its quiet baseline.
-// ponytail: fixed ratio; tune from empty-vs-occupied captures per room.
-const PEER_PERTURBED_RATIO: f64 = 2.0;
 /// Room presence needs at least this fraction of fresh links perturbed.
 const PEER_PRESENCE_FRACTION: f64 = 0.25;
 /// A link with no frame for this long is ignored.
@@ -3773,10 +3771,8 @@ struct PeerLinkState {
     n_subcarriers: u16,
     /// Mean LLTF amplitude per frame; its spread is the link's motion signal.
     mean_amplitude: VecDeque<f64>,
-    /// Slow quiet-level estimate of `motion_score`. Learns quickly downward and
-    /// slowly upward, and ignores clear excursions, so occupancy does not
-    /// become the new normal.
-    baseline: Option<f64>,
+    /// Espressif-style adaptive detector fed with `motion_score` (ADR: Phase 1 #3).
+    fsm: presence_fsm::PresenceFsm,
 }
 
 impl PeerLinkState {
@@ -3788,7 +3784,7 @@ impl PeerLinkState {
             rssi_dbm: 0.0,
             n_subcarriers: 0,
             mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
-            baseline: None,
+            fsm: presence_fsm::PresenceFsm::default(),
         }
     }
 
@@ -3806,19 +3802,8 @@ impl PeerLinkState {
             self.mean_amplitude.push_back(mean);
         }
         if self.mean_amplitude.len() == PEER_LINK_WINDOW {
-            let m = self.motion_score();
-            self.baseline = Some(match self.baseline {
-                None => m,
-                Some(b) if m < b => 0.9 * b + 0.1 * m,
-                Some(b) if m < PEER_PERTURBED_RATIO * b => 0.999 * b + 0.001 * m,
-                Some(b) => b,
-            });
+            self.fsm.update(self.motion_score());
         }
-    }
-
-    /// Current motion relative to the link's quiet baseline (1.0 = normal).
-    fn perturbation(&self) -> Option<f64> {
-        self.baseline.filter(|b| *b > 1e-6).map(|b| self.motion_score() / b)
     }
 
     /// Coefficient of variation of per-frame mean amplitude: ~0 for a still
@@ -3846,8 +3831,10 @@ impl PeerLinkState {
             "rssi_dbm": self.rssi_dbm,
             "subcarrier_count": self.n_subcarriers,
             "motion_score": self.motion_score(),
-            "baseline": self.baseline,
-            "perturbation": self.perturbation(),
+            "baseline": self.fsm.baseline(),
+            "excess": self.fsm.excess(),
+            "active": self.fsm.is_active(),
+            "stage": format!("{:?}", self.fsm.stage()).to_lowercase(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
     }
@@ -3872,8 +3859,12 @@ fn peer_room_summary(
         .values()
         .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
         .collect();
-    let scored: Vec<f64> = fresh.iter().filter_map(|l| l.perturbation()).collect();
-    let perturbed = scored.iter().filter(|&&p| p >= PEER_PERTURBED_RATIO).count();
+    let scored: Vec<bool> = fresh
+        .iter()
+        .filter(|l| l.fsm.stage() == presence_fsm::Stage::Stable)
+        .map(|l| l.fsm.is_active())
+        .collect();
+    let perturbed = scored.iter().filter(|&&a| a).count();
     let fraction = if scored.is_empty() { 0.0 } else { perturbed as f64 / scored.len() as f64 };
     serde_json::json!({
         "fresh_links": fresh.len(),
@@ -4059,42 +4050,42 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
 mod peer_link_fusion_tests {
     use super::*;
 
-    fn link_with(amps: &[f64], now: std::time::Instant) -> PeerLinkState {
+    fn link(active: bool) -> PeerLinkState {
+        let now = std::time::Instant::now();
         let mut l = PeerLinkState::new(now);
-        l.mean_amplitude.extend(amps.iter().copied());
+        for i in 0..presence_fsm::INIT_SAMPLES + 20 {
+            l.fsm.update(0.10 + f64::from(i % 3) * 0.005);
+        }
+        if active {
+            for _ in 0..10 {
+                l.fsm.update(0.30);
+            }
+        }
         l
     }
 
     #[test]
-    fn baseline_ignores_excursions_and_flags_perturbation() {
+    fn room_presence_needs_enough_active_links() {
         let now = std::time::Instant::now();
-        let quiet: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 0.2).collect();
-        let mut l = link_with(&quiet, now);
-        l.baseline = Some(l.motion_score());
-        let b = l.baseline.unwrap();
-        // A body in the path: large swings.
-        l.mean_amplitude = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 3.0).collect();
-        assert!(l.perturbation().unwrap() >= PEER_PERTURBED_RATIO);
-        assert_eq!(l.baseline.unwrap(), b, "excursion must not move the baseline");
+        let mut links = HashMap::new();
+        for k in 0..4u8 {
+            links.insert((k, k + 1), link(k == 0));
+        }
+        let r = peer_room_summary(&links, now);
+        assert_eq!((r["calibrated_links"].as_u64(), r["perturbed_links"].as_u64()), (Some(4), Some(1)));
+        assert_eq!(r["presence"], true, "1 of 4 = 25% meets the threshold");
+        links.insert((0, 1), link(false));
+        assert_eq!(peer_room_summary(&links, now)["presence"], false);
     }
 
     #[test]
-    fn room_presence_needs_enough_perturbed_links() {
+    fn uncalibrated_links_do_not_vote() {
         let now = std::time::Instant::now();
-        let quiet: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 0.2).collect();
-        let busy: Vec<f64> = (0..PEER_LINK_WINDOW).map(|i| 10.0 + (i % 2) as f64 * 3.0).collect();
-        let base = link_with(&quiet, now).motion_score();
         let mut links = HashMap::new();
-        for k in 0..4u8 {
-            let mut l = link_with(if k == 0 { &busy } else { &quiet }, now);
-            l.baseline = Some(base);
-            links.insert((k, k + 1), l);
-        }
+        links.insert((1, 2), PeerLinkState::new(now));
         let r = peer_room_summary(&links, now);
-        assert_eq!(r["perturbed_links"], 1);
-        assert_eq!(r["presence"], true, "1 of 4 = 25% meets the threshold");
-        links.get_mut(&(0, 1)).unwrap().mean_amplitude = quiet.iter().copied().collect();
-        assert_eq!(peer_room_summary(&links, now)["presence"], false);
+        assert_eq!(r["calibrated_links"], 0);
+        assert_eq!(r["presence"], false);
     }
 }
 
