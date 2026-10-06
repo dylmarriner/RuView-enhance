@@ -80,6 +80,14 @@ impl Default for PresenceFsm {
 }
 
 impl PresenceFsm {
+    /// Start already calibrated from a persisted empty-room baseline.
+    pub fn with_baseline(baseline: f64) -> Self {
+        if !baseline.is_finite() || baseline <= 0.0 {
+            return Self::default();
+        }
+        Self { stage: Stage::Stable, smooth: baseline, baseline, ..Self::default() }
+    }
+
     pub fn stage(&self) -> Stage {
         self.stage
     }

@@ -121,6 +121,20 @@ impl LinkSubspace {
         self.learning = on;
     }
 
+    pub fn templates(&self) -> Vec<Vec<f64>> {
+        self.templates.iter().map(|t| t.to_vec()).collect()
+    }
+
+    /// Restore persisted templates; malformed entries are dropped.
+    pub fn set_templates(&mut self, saved: &[Vec<f64>]) {
+        self.templates = saved
+            .iter()
+            .filter_map(|t| <[f64; COLUMNS]>::try_from(t.as_slice()).ok())
+            .filter(|t| t.iter().all(|x| x.is_finite()))
+            .take(MAX_TEMPLATES)
+            .collect();
+    }
+
     pub fn template_count(&self) -> usize {
         self.templates.len()
     }

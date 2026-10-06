@@ -2229,6 +2229,8 @@ struct AppStateInner {
     node_states: HashMap<u8, NodeState>,
     /// Node-to-node sensing links keyed by (tx node, rx node).
     peer_links: HashMap<(u8, u8), PeerLinkState>,
+    /// Persisted empty-room calibration, applied to links as they appear.
+    peer_calibration: HashMap<(u8, u8), CalibratedLink>,
     /// Debounced room-level classification state — see
     /// `debounce_room_classification`. `fuse_room` is a fresh, memoryless
     /// plurality vote every cycle with no debounce of its own (unlike each
@@ -3118,6 +3120,7 @@ impl AppStateInner {
             adaptive_model: None,
             node_states: HashMap::new(),
             peer_links: HashMap::new(),
+            peer_calibration: HashMap::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
             room_debounce_since: None,
@@ -3764,6 +3767,10 @@ const PEER_PRESENCE_FRACTION: f64 = 0.25;
 /// template similarity).
 // ponytail: starting value; set from empty-vs-occupied wander distributions.
 const PEER_WANDER_THRESHOLD: f64 = 0.15;
+/// RSSI shift (dB) from the calibration value that flags a moved node.
+const PEER_RELOCATION_DB: f64 = 6.0;
+/// File (under --data-dir) holding the persisted empty-room calibration.
+const PEER_CALIBRATION_FILE: &str = "peer_link_calibration.json";
 /// A link with no frame for this long is ignored.
 const PEER_LINK_FRESH_MS: u128 = 3000;
 
@@ -3780,6 +3787,8 @@ struct PeerLinkState {
     fsm: presence_fsm::PresenceFsm,
     /// Channel-shape jitter/wander against empty-room templates.
     subspace: link_subspace::LinkSubspace,
+    /// Link RSSI when the empty-room calibration was taken.
+    calibration_rssi: Option<f64>,
 }
 
 impl PeerLinkState {
@@ -3793,7 +3802,28 @@ impl PeerLinkState {
             mean_amplitude: VecDeque::with_capacity(PEER_LINK_WINDOW),
             fsm: presence_fsm::PresenceFsm::default(),
             subspace: link_subspace::LinkSubspace::default(),
+            calibration_rssi: None,
         }
+    }
+
+    /// New link state, seeded from a persisted empty-room calibration.
+    fn restored(now: std::time::Instant, saved: Option<&CalibratedLink>) -> Self {
+        let mut l = Self::new(now);
+        if let Some(c) = saved {
+            if let Some(b) = c.baseline {
+                l.fsm = presence_fsm::PresenceFsm::with_baseline(b);
+            }
+            l.subspace.set_templates(&c.templates);
+            l.calibration_rssi = Some(c.rssi_dbm);
+        }
+        l
+    }
+
+    /// The link's RSSI moved far from its calibration value: a node was
+    /// probably moved, so the empty-room calibration no longer applies.
+    fn recalibration_recommended(&self) -> bool {
+        self.frames > 0
+            && self.calibration_rssi.is_some_and(|c| (self.rssi_dbm - c).abs() > PEER_RELOCATION_DB)
     }
 
     fn observe(&mut self, frame: &Esp32Frame, now: std::time::Instant) {
@@ -3847,6 +3877,7 @@ impl PeerLinkState {
             "jitter": self.subspace.jitter(),
             "wander": self.subspace.wander(),
             "templates": self.subspace.template_count(),
+            "recalibration_recommended": self.recalibration_recommended(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
     }
@@ -3860,6 +3891,41 @@ async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_jso
     keys.sort_unstable();
     let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
     Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+}
+
+/// One link's persisted empty-room calibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedLink {
+    tx: u8,
+    rx: u8,
+    baseline: Option<f64>,
+    templates: Vec<Vec<f64>>,
+    rssi_dbm: f64,
+}
+
+fn load_peer_calibration(data_dir: &std::path::Path) -> HashMap<(u8, u8), CalibratedLink> {
+    let path = data_dir.join(PEER_CALIBRATION_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<Vec<CalibratedLink>>(&text) {
+        Ok(links) => {
+            info!("loaded empty-room calibration for {} peer links", links.len());
+            links.into_iter().map(|c| ((c.tx, c.rx), c)).collect()
+        }
+        Err(e) => {
+            warn!("ignoring unreadable {PEER_CALIBRATION_FILE}: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Write atomically (temp file + rename) so a crash never leaves half a file.
+fn save_peer_calibration(data_dir: &std::path::Path, links: &[CalibratedLink]) -> std::io::Result<()> {
+    let path = data_dir.join(PEER_CALIBRATION_FILE);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(links)?)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// POST /api/v1/peer-links/calibrate/start — the room is empty: clear
@@ -3878,12 +3944,26 @@ async fn peer_links_calibrate_start(State(state): State<SharedState>) -> Json<se
 async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut s = state.write().await;
     let mut templates = 0;
-    for l in s.peer_links.values_mut() {
+    let mut saved = Vec::new();
+    for (&(tx, rx), l) in s.peer_links.iter_mut() {
         l.subspace.set_learning(false);
+        l.calibration_rssi = Some(l.rssi_dbm);
         templates += l.subspace.template_count();
+        saved.push(CalibratedLink {
+            tx,
+            rx,
+            baseline: l.fsm.baseline(),
+            templates: l.subspace.templates(),
+            rssi_dbm: l.rssi_dbm,
+        });
     }
+    let persisted = save_peer_calibration(&s.data_dir, &saved);
+    if let Err(e) = &persisted {
+        warn!("failed to persist peer-link calibration: {e}");
+    }
+    s.peer_calibration = saved.into_iter().map(|c| ((c.tx, c.rx), c)).collect();
     info!("peer-link empty-room calibration stopped ({templates} templates)");
-    Json(serde_json::json!({ "learning": false, "templates": templates }))
+    Json(serde_json::json!({ "learning": false, "templates": templates, "persisted": persisted.is_ok() }))
 }
 
 /// Fuse fresh links into a room-level presence vote.
@@ -4129,6 +4209,50 @@ mod peer_link_fusion_tests {
         let r = peer_room_summary(&links, now);
         assert_eq!(r["calibrated_links"], 0);
         assert_eq!(r["presence"], false);
+    }
+}
+
+#[cfg(test)]
+mod peer_calibration_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_round_trips_and_restores_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = vec![CalibratedLink {
+            tx: 1,
+            rx: 2,
+            baseline: Some(0.12),
+            templates: vec![vec![0.1; link_subspace::COLUMNS]],
+            rssi_dbm: -45.0,
+        }];
+        save_peer_calibration(dir.path(), &saved).unwrap();
+        let loaded = load_peer_calibration(dir.path());
+        let c = loaded.get(&(1, 2)).expect("persisted link must load");
+
+        let l = PeerLinkState::restored(std::time::Instant::now(), Some(c));
+        assert_eq!(l.fsm.stage(), presence_fsm::Stage::Stable, "restored link needs no re-learning");
+        assert_eq!(l.fsm.baseline(), Some(0.12));
+        assert_eq!(l.subspace.template_count(), 1);
+    }
+
+    #[test]
+    fn missing_or_corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_peer_calibration(dir.path()).is_empty());
+        std::fs::write(dir.path().join(PEER_CALIBRATION_FILE), b"{not json").unwrap();
+        assert!(load_peer_calibration(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn moved_node_flags_recalibration() {
+        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0 };
+        let mut l = PeerLinkState::restored(std::time::Instant::now(), Some(&c));
+        l.frames = 10;
+        l.rssi_dbm = -47.0;
+        assert!(!l.recalibration_recommended(), "small RSSI change is normal");
+        l.rssi_dbm = -60.0;
+        assert!(l.recalibration_recommended(), "15 dB shift means the node moved");
     }
 }
 
@@ -13287,9 +13411,11 @@ async fn udp_receiver_task(
                     // Peer links have their own geometry; keep them out of the
                     // receiving node's AP-path statistics.
                     if let Some(tx) = frame.peer_tx {
+                        let key = (tx, frame.node_id);
+                        let saved = s.peer_calibration.get(&key).cloned();
                         s.peer_links
-                            .entry((tx, frame.node_id))
-                            .or_insert_with(|| PeerLinkState::new(observed_at))
+                            .entry(key)
+                            .or_insert_with(|| PeerLinkState::restored(observed_at, saved.as_ref()))
                             .observe(&frame, observed_at);
                         continue;
                     }
@@ -15191,6 +15317,7 @@ async fn main() {
             }),
         node_states: HashMap::new(),
         peer_links: HashMap::new(),
+        peer_calibration: load_peer_calibration(&args.data_dir),
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
         room_debounce_since: None,
