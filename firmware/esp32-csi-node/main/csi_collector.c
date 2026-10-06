@@ -89,6 +89,8 @@ static uint32_t s_rate_skip = 0;
 
 #define EDGE_DSP_MIN_INTERVAL_US (1000000U / CONFIG_EDGE_DSP_SAMPLE_HZ)
 static int64_t s_next_edge_enqueue_us = 0;
+/* LLTF block of an ESP32/S2/S3/C3 CSI buffer: 64 bins x (I,Q). */
+#define EDGE_LLTF_BYTES 128
 static uint32_t s_edge_rate_skip = 0;
 
 /**
@@ -395,7 +397,12 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
      * while the on-device Tier 1/2 pipeline receives a uniform, sustainable
      * stream. Enqueuing every burst frame overloaded the unicore C6 DSP and
      * turned 30-40 callback pps into an irregular approximately 8 Hz subset. */
-    if (frame_len > CSI_HEADER_SIZE) {
+    /* The on-device pipeline keeps per-subcarrier statistics, so it must see
+     * one transmitter and one grid. Peer-link frames (other nodes' beacons)
+     * stay host-only, and only the 128-byte LLTF block (64 bins), present in
+     * every HT20/HT40/STBC frame, is enqueued. Mixed 64/128/192-bin frames
+     * otherwise corrupted the edge statistics. */
+    if (frame_len > CSI_HEADER_SIZE && !(frame_buf[19] & CSI_FLAG_PEER_TX)) {
         if (s_next_edge_enqueue_us == 0) {
             s_next_edge_enqueue_us = now_us;
         }
@@ -403,8 +410,10 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         if (now_us >= s_next_edge_enqueue_us) {
             /* Reuse the sanitized ADR-018 payload. Feeding info->buf here
              * would reintroduce first_word_invalid artifacts on device. */
+            size_t edge_len = frame_len - CSI_HEADER_SIZE;
+            if (edge_len > EDGE_LLTF_BYTES) edge_len = EDGE_LLTF_BYTES;
             (void)edge_enqueue_csi(&frame_buf[CSI_HEADER_SIZE],
-                                   (uint16_t)(frame_len - CSI_HEADER_SIZE),
+                                   (uint16_t)edge_len,
                                    (int8_t)info->rx_ctrl.rssi, info->rx_ctrl.channel);
 
             /* Preserve the configured sample clock instead of resetting it to
