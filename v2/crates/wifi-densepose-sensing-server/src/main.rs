@@ -215,6 +215,14 @@ struct Args {
     #[arg(long, env = "RUVIEW_PRIVACY_MODE", value_parser = cli::parse_env_bool)]
     privacy_mode: bool,
 
+    /// Base ADR-141 privacy profile for the trust engine: private-home
+    /// (default, Anonymous), care-with-consent (Derived), enterprise-anonymous,
+    /// strict-no-identity (Restricted). A quality contradiction demotes one step;
+    /// per-node raw amplitudes are withheld only at Restricted.
+    #[arg(long, env = "RUVIEW_PRIVACY_PROFILE", default_value = "private-home",
+          value_parser = parse_privacy_profile)]
+    privacy_profile: wifi_densepose_bfld::PrivacyMode,
+
     /// MQTT publisher (HA auto-discovery) flags (ADR-115).
     /// Flattened so `--mqtt*` reach the binary's parser and the publisher
     /// in `mqtt::` is actually started (fixes #872). Uses the *lib* crate's
@@ -1164,6 +1172,24 @@ struct BoundingBox {
 /// Per-node sensing state for multi-node deployments (issue #249).
 /// Each ESP32 node gets its own frame history, smoothing buffers, and vital
 /// sign detector so that data from different nodes is never mixed.
+/// Last CSI frame's amplitudes for a node, as exposed on `nodes[].amplitude`
+/// (empty when raw outputs are suppressed or no CSI frame has arrived).
+fn node_raw_amplitude(n: &NodeState, suppress_raw: bool) -> Vec<f64> {
+    if suppress_raw {
+        return vec![];
+    }
+    n.frame_history
+        .back()
+        .map(|a| a.iter().take(adaptive_classifier::RECORDED_AMPLITUDE_LEN).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Tone count of the node's last CSI frame. Grid metadata, not signal, so it
+/// stays visible even when the ADR-141 gate withholds the amplitudes.
+fn node_subcarrier_count(n: &NodeState) -> usize {
+    n.frame_history.back().map_or(0, |a| a.len())
+}
+
 struct NodeState {
     pub(crate) frame_history: VecDeque<Vec<f64>>,
     smoothed_person_score: f64,
@@ -3717,6 +3743,34 @@ mod issue_928_magic_collision_tests {
 }
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
+
+/// Parse `--privacy-profile`. `raw-research` is refused: its class is
+/// local-only and would block every networked output.
+fn parse_privacy_profile(v: &str) -> Result<wifi_densepose_bfld::PrivacyMode, String> {
+    use wifi_densepose_bfld::PrivacyMode as M;
+    match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "private-home" => Ok(M::PrivateHome),
+        "care-with-consent" => Ok(M::CareWithConsent),
+        "enterprise-anonymous" => Ok(M::EnterpriseAnonymous),
+        "strict-no-identity" => Ok(M::StrictNoIdentity),
+        other => Err(format!(
+            "unknown privacy profile '{other}' (private-home, care-with-consent, enterprise-anonymous, strict-no-identity)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod privacy_profile_tests {
+    use super::parse_privacy_profile;
+    use wifi_densepose_bfld::PrivacyMode;
+
+    #[test]
+    fn parses_profiles_and_refuses_raw() {
+        assert_eq!(parse_privacy_profile("care_with_consent").unwrap(), PrivacyMode::CareWithConsent);
+        assert_eq!(parse_privacy_profile("private-home").unwrap(), PrivacyMode::PrivateHome);
+        assert!(parse_privacy_profile("raw-research").is_err());
+    }
+}
 
 /// Valid LLTF tones in a 20 MHz legacy training field (-26..-1, 1..26).
 const LLTF_TONES: usize = 52;
@@ -12696,6 +12750,7 @@ async fn udp_receiver_task(
                             now,
                         );
                     }
+                    let suppress_raw = s.engine_bridge.suppress_raw_outputs();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -12708,8 +12763,10 @@ async fn udp_receiver_task(
                                 .get(&id)
                                 .copied()
                                 .unwrap_or(DEFAULT_NODE_POSITION),
-                            amplitude: vec![],
-                            subcarrier_count: 0,
+                            // Vitals packets interleave with CSI frames; report the
+                            // node's last CSI frame so `latest` does not flap to empty.
+                            amplitude: node_raw_amplitude(n, suppress_raw),
+                            subcarrier_count: node_subcarrier_count(n),
                             // Vitals-only path; still expose the sync snapshot
                             // if the node also speaks ESP-NOW.
                             sync: n.sync_snapshot(),
@@ -13237,24 +13294,8 @@ async fn udp_receiver_task(
                                 .get(&id)
                                 .copied()
                                 .unwrap_or(DEFAULT_NODE_POSITION),
-                            amplitude: if suppress_raw {
-                                vec![]
-                            } else {
-                                n.frame_history
-                                    .back()
-                                    .map(|a| {
-                                        a.iter()
-                                            .take(adaptive_classifier::RECORDED_AMPLITUDE_LEN)
-                                            .cloned()
-                                            .collect()
-                                    })
-                                    .unwrap_or_default()
-                            },
-                            subcarrier_count: if suppress_raw {
-                                0
-                            } else {
-                                n.frame_history.back().map_or(0, |a| a.len())
-                            },
+                            amplitude: node_raw_amplitude(n, suppress_raw),
+                            subcarrier_count: node_subcarrier_count(n),
                             // ADR-110 iter 23 / iter 30 — single source of truth.
                             sync: n.sync_snapshot(),
                             // ADR-297 — each node carries its own inference.
@@ -14950,7 +14991,7 @@ async fn main() {
         node_positions_config,
         default_position_noted: std::collections::HashSet::new(),
         engine_bridge: engine_bridge::EngineBridge::new(
-            wifi_densepose_bfld::PrivacyMode::PrivateHome,
+            args.privacy_profile,
             1,
             "default",
             "Default Room",
