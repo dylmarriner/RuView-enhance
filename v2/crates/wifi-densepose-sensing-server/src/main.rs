@@ -3774,6 +3774,13 @@ const PEER_RELOCATION_DB: f64 = 6.0;
 const PEER_CALIBRATION_FILE: &str = "peer_link_calibration.json";
 /// A link with no frame for this long is ignored.
 const PEER_LINK_FRESH_MS: u128 = 3000;
+/// Minimum independent, stable peer links required before the calibrated mesh
+/// is allowed to contradict the raw per-node room vote.
+const PEER_ABSENCE_MIN_STABLE_LINKS: usize = 4;
+/// Never let the mesh absence guard suppress a strong raw presence signal.
+/// The guard exists to reject marginal activity-energy false positives after
+/// an explicit empty-room calibration, not to overrule decisive detections.
+const PEER_ABSENCE_MAX_RAW_CONFIDENCE: f64 = 0.65;
 
 /// Rolling state for one node-to-node link.
 struct PeerLinkState {
@@ -4039,6 +4046,59 @@ async fn peer_links_map(State(state): State<SharedState>) -> Json<serde_json::Va
     }
 }
 
+/// Reconcile the raw per-node room inference with the explicitly calibrated
+/// peer-link mesh. The peer mesh may only veto a *low-confidence* raw presence
+/// when it has enough fresh stable motion links and enough fresh channel-shape
+/// templates to independently support "nothing changed from empty room".
+fn peer_guard_room_inference(
+    raw: &RoomInference,
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> RoomInference {
+    if matches!(raw.classification.as_str(), "absent" | "unavailable")
+        || raw.confidence >= PEER_ABSENCE_MAX_RAW_CONFIDENCE
+    {
+        return raw.clone();
+    }
+
+    let fresh: Vec<&PeerLinkState> = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .collect();
+
+    let stable: Vec<&PeerLinkState> = fresh
+        .iter()
+        .copied()
+        .filter(|l| l.fsm.stage() == presence_fsm::Stage::Stable)
+        .collect();
+    if stable.len() < PEER_ABSENCE_MIN_STABLE_LINKS {
+        return raw.clone();
+    }
+
+    let perturbed_fraction =
+        stable.iter().filter(|l| l.fsm.is_active()).count() as f64 / stable.len() as f64;
+
+    let wanders: Vec<f64> = fresh.iter().filter_map(|l| l.subspace.wander()).collect();
+    if wanders.len() < PEER_ABSENCE_MIN_STABLE_LINKS {
+        return raw.clone();
+    }
+    let wandering_fraction =
+        wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count() as f64
+            / wanders.len() as f64;
+
+    if perturbed_fraction >= PEER_PRESENCE_FRACTION
+        || wandering_fraction >= PEER_PRESENCE_FRACTION
+    {
+        return raw.clone();
+    }
+
+    RoomInference {
+        classification: "absent".to_string(),
+        confidence: (1.0 - perturbed_fraction.max(wandering_fraction)).clamp(0.0, 1.0),
+        contributing_nodes: raw.contributing_nodes,
+    }
+}
+
 /// Fuse fresh links into a room-level presence vote.
 fn peer_room_summary(
     links: &HashMap<(u8, u8), PeerLinkState>,
@@ -4282,6 +4342,76 @@ mod peer_link_fusion_tests {
         let r = peer_room_summary(&links, now);
         assert_eq!(r["calibrated_links"], 0);
         assert_eq!(r["presence"], false);
+    }
+
+    fn empty_room_link() -> PeerLinkState {
+        let mut l = link(false);
+        l.subspace.set_learning(true);
+        for i in 0..(link_subspace::WINDOW + 8) {
+            let gain = ((i as f64) * 0.37).sin();
+            let amps: Vec<f64> = (0..52)
+                .map(|k| 10.0 + gain * ((k as f64) / 7.0).sin())
+                .collect();
+            l.subspace.push(&amps);
+        }
+        l.subspace.set_learning(false);
+        l
+    }
+
+    fn empty_peer_mesh(n: u8) -> HashMap<(u8, u8), PeerLinkState> {
+        (0..n).map(|k| ((k + 1, k + 2), empty_room_link())).collect()
+    }
+
+    #[test]
+    fn calibrated_empty_peer_mesh_vetoes_low_confidence_raw_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.52,
+            contributing_nodes: 4,
+        };
+        let guarded = peer_guard_room_inference(&raw, &empty_peer_mesh(4), now);
+        assert_eq!(guarded.classification, "absent");
+        assert!(guarded.confidence > 0.5);
+    }
+
+    #[test]
+    fn strong_raw_presence_is_not_vetoed_by_empty_peer_mesh() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.90,
+            contributing_nodes: 4,
+        };
+        assert_eq!(peer_guard_room_inference(&raw, &empty_peer_mesh(4), now), raw);
+    }
+
+    #[test]
+    fn sparse_peer_mesh_cannot_veto_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_still".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        assert_eq!(peer_guard_room_inference(&raw, &empty_peer_mesh(3), now), raw);
+    }
+
+    #[test]
+    fn perturbed_peer_mesh_cannot_veto_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        let mut links = empty_peer_mesh(4);
+        let mut active = empty_room_link();
+        for _ in 0..10 {
+            active.fsm.update(0.30);
+        }
+        links.insert((1, 2), active);
+        assert_eq!(peer_guard_room_inference(&raw, &links, now), raw);
     }
 }
 
@@ -13268,10 +13398,12 @@ async fn udp_receiver_task(
                     // ADR-297 — explicit, deterministic room aggregate over the
                     // per-node inferences (freshness-weighted vote). Not the
                     // latest-writer classification (issue #1555).
-                    let room_inference = fuse_room(
+                    let raw_room_inference = fuse_room(
                         active_nodes.iter().filter_map(|ni| ni.node_inference.as_ref()),
                         NODE_STALE_AFTER_MS,
                     );
+                    let room_inference =
+                        peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
 
                     let features = FeatureInfo {
                         mean_rssi: mean_rssi_dbm,
@@ -13806,10 +13938,12 @@ async fn udp_receiver_task(
 
                     // ADR-297 — explicit deterministic room aggregate over the
                     // per-node inferences (not last-writer; issue #1555).
-                    let room_inference = fuse_room(
+                    let raw_room_inference = fuse_room(
                         active_nodes.iter().filter_map(|ni| ni.node_inference.as_ref()),
                         NODE_STALE_AFTER_MS,
                     );
+                    let room_inference =
+                        peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
                     let room_classification = if bootstrap_empty {
                         ClassificationInfo {
                             motion_level: "absent".to_string(),
