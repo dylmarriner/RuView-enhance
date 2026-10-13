@@ -40,6 +40,8 @@ mod csi_frame;
 mod error;
 pub mod esp32;
 mod esp32_parser;
+/// Multi-format CSI file ingest (Intel 5300, Atheros, Nexmon, ESP32 CSV).
+pub mod formats;
 // ADR-153: IEEE 802.11bf-2025 forward-compatibility protocol model
 // (sensing setup / measurement instance / report / SBP / termination).
 // Simulation-tested; no commodity silicon implements the standard yet —
