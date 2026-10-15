@@ -72,6 +72,27 @@ menu "CSI Node Configuration"
             are intentionally rejected because sustained callback load above
             50 Hz has caused WiFi ISR and packet-buffer failures on S3 and C6.
 
+    choice CSI_PEER_TX_RATE
+        prompt "PHY rate for peer beacons and other raw 802.11 frames"
+        default CSI_PEER_TX_RATE_6M
+        help
+            Rate used by esp_wifi_80211_tx() (peer beacons, NDP probes).
+            Receivers only get CSI from frames they decode, and a fast rate
+            needs a strong signal. On the 4-node mesh, links at -63..-68 dBm
+            delivered 3-9 of 10 beacons/s while links at -80..-87 dBm
+            delivered 0.01-0.3/s (MEASURED 2026-10-15, /api/v1/peer-links),
+            which points to a fast inherited rate. 6 Mbps OFDM decodes
+            ~15-20 dB weaker signals than 54 Mbps and still carries the
+            L-LTF the server uses.
+
+        config CSI_PEER_TX_RATE_6M
+            bool "6 Mbps OFDM (legacy, L-LTF only)"
+        config CSI_PEER_TX_RATE_MCS0
+            bool "HT MCS0 long GI (L-LTF + HT-LTF)"
+        config CSI_PEER_TX_RATE_DEFAULT
+            bool "Leave the driver default"
+    endchoice
+
     config CSI_GAIN_LOCK
         bool "Lock receiver AGC/FFT gain after a short collection (experimental)"
         default n
