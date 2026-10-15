@@ -72,6 +72,34 @@ menu "CSI Node Configuration"
             are intentionally rejected because sustained callback load above
             50 Hz has caused WiFi ISR and packet-buffer failures on S3 and C6.
 
+    config CSI_GAIN_LOCK
+        bool "Lock receiver AGC/FFT gain after a short collection (experimental)"
+        default n
+        depends on IDF_TARGET_ESP32S3
+        help
+            Collect the receiver's AGC and FFT-scale gains over the first
+            CSI_GAIN_LOCK_SAMPLES frames, take their median, and force the
+            receiver to hold it (Espressif esp_csi_gain_ctrl, Apache-2.0).
+            CSI amplitudes then no longer jump with automatic gain.
+
+            Default OFF. The sensing server already cancels gain steps by
+            normalising every frame, and ESPectre's current releases dropped
+            gain locking for the same reason. One forced gain applies to every
+            transmitter, so weak peer-beacon frames can fall under the noise
+            floor or strong ones can clip, which costs frames. The lock
+            releases itself after 5 s without frames and on every channel
+            change. Frame header byte 19 bit 7 is set while the lock holds.
+            Validate on the real mesh (frame rate per peer link must not drop)
+            before leaving it on.
+
+    config CSI_GAIN_LOCK_SAMPLES
+        int "Frames collected before the gain is locked"
+        default 100
+        range 20 256
+        depends on CSI_GAIN_LOCK
+        help
+            Number of CSI frames whose gains are medianed into the locked value.
+
 endmenu
 
 menu "Edge Intelligence (ADR-039)"

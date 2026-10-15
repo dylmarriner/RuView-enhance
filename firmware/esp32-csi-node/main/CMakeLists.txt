@@ -72,6 +72,13 @@ if(CONFIG_DISPLAY_ENABLE)
     list(APPEND REQUIRES esp_lcd esp_lcd_touch lvgl)
 endif()
 
+# Optional receiver gain lock (ESP32-S3). The managed component is declared in
+# idf_component.yml for esp32s3 only; sources link in only when enabled.
+if(CONFIG_CSI_GAIN_LOCK)
+    list(APPEND SRCS "csi_gain_lock.c" "csi_gain_lock_hw.c")
+    list(APPEND REQUIRES espressif__esp_csi_gain_ctrl)
+endif()
+
 if(CONFIG_WASM_ENABLE)
     list(APPEND REQUIRES wasm3)
 endif()

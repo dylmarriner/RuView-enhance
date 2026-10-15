@@ -25,6 +25,11 @@
  *  servers that read exactly 20 + 2*n_subcarriers bytes are unaffected. */
 #define CSI_FLAG_PEER_TX (1U << 6)
 
+/** Byte 19 bit 7: the receiver AGC/FFT gain was locked (CONFIG_CSI_GAIN_LOCK)
+ *  when this frame was captured. Clear on every build that leaves the option
+ *  off, so readers that ignore the bit are unaffected. */
+#define CSI_FLAG_GAIN_LOCKED (1U << 7)
+
 /** Maximum frame buffer size (header + 4 antennas * 256 subcarriers * 2 bytes). */
 #define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE + 4 * 256 * 2)
 

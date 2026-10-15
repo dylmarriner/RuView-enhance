@@ -146,7 +146,9 @@ impl PpduType {
 ///   bit 3   : LDPC (reserved — not yet populated by firmware)
 ///   bit 4   : 802.15.4 time-sync valid (C6 only)
 ///   bit 5   : ESP-IDF invalid first CSI word was zeroed by firmware
-///   bit 6-7 : reserved
+///   bit 6   : peer-node frame (node id follows the I/Q data; see sensing server)
+///   bit 7   : receiver AGC/FFT gain was locked when this frame was captured
+///             (firmware `CONFIG_CSI_GAIN_LOCK`, default off)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Adr018Flags {
     pub bw40: bool,
@@ -155,6 +157,9 @@ pub struct Adr018Flags {
     pub ieee802154_sync_valid: bool,
     #[serde(default)]
     pub first_word_sanitized: bool,
+    /// Receiver gain was locked for this frame (bit 7). Absent = unlocked.
+    #[serde(default)]
+    pub gain_locked: bool,
 }
 
 impl Adr018Flags {
@@ -165,6 +170,7 @@ impl Adr018Flags {
             ldpc: (b & 0x08) != 0,
             ieee802154_sync_valid: (b & 0x10) != 0,
             first_word_sanitized: (b & 0x20) != 0,
+            gain_locked: (b & 0x80) != 0,
         }
     }
     pub fn to_byte(self) -> u8 {
@@ -174,6 +180,7 @@ impl Adr018Flags {
         if self.ldpc { b |= 0x08; }
         if self.ieee802154_sync_valid { b |= 0x10; }
         if self.first_word_sanitized { b |= 0x20; }
+        if self.gain_locked { b |= 0x80; }
         b
     }
 }

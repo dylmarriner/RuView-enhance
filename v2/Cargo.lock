@@ -13516,6 +13516,7 @@ dependencies = [
  "wifi-densepose-physics",
  "wifi-densepose-rufield",
  "wifi-densepose-signal",
+ "wifi-densepose-vitals",
  "wifi-densepose-wifiscan",
  "wifi-densepose-worldgraph",
 ]
