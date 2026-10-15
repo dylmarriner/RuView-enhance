@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Integrated WiFi-sensing techniques (fork: RuView-enhance, ADR-419)
+
+Figures for this section are SYNTHETIC or unit-level unless marked. No board has run this branch yet. Everything new is off or advisory by default.
+
+- **Still-person cues.** Per-link stable-tone selection (NBVI), moving-variance segmentation, a calibrated baseline-shift score with an absolute floor, and a breathing cue. These are clean-room implementations from ESPectre's public documentation (GPL-3.0; no code copied). `--peer-presence-mode advisory|active|off` controls them; they are reported under `room.advisory` by default.
+- **Occupancy hold.** `--occupancy-hold-secs` latches room occupancy after motion. Still-body evidence that persists for 3 s keeps it, and it is released only after the hold time with no evidence. In a SYNTHETIC 10-minute sit, a 180 s hold raised the still-person coverage from 19% to 65% (ADR-419 table). While held, an `absent` room reports `present_still`; an `unavailable` room is never overridden. One link alone can keep an occupancy but not start one. Off by default.
+- **Peer beacon PHY rate (firmware).** Raw 802.11 frames (peer beacons, NDPs) now go out at a fixed 6 Mbps OFDM by default (`CONFIG_CSI_PEER_TX_RATE`; HT MCS0 or the driver default are options). On the live mesh, links below -80 dBm delivered 0.01-0.3 of 10 beacons/s (MEASURED 2026-10-15), which fits a fast inherited rate. The gain from the fix is not yet measured on hardware.
+- **Optional receiver gain lock (firmware).** `CONFIG_CSI_GAIN_LOCK` (ESP32-S3, default off) uses `espressif/esp_csi_gain_ctrl` (Apache-2.0). Locked frames set ADR-018 byte 19 bit 7, which the hardware parser decodes.
+- **Activity and zone teaching.** A webcam-supervised k-NN with separately recorded test sessions, a chance baseline and a majority baseline; `/ui/activity.html`, `/api/v1/activity/*`, and `scripts/eval_activity.py`. Method adapted from wifi-sensing-kit (MIT). The same tool learns zone fingerprints from posted place labels (user guide).
+- **CSI ingest from other hardware.** Streaming, bounds-checked readers for Intel 5300, Atheros, Nexmon pcap and ESP32 CSV, plus `csi-convert` to `.csi.jsonl`. FeitCSI and PicoScenes are detected, not decoded (`docs/csi-formats.md`).
+- **AoA library.** Bartlett, MVDR and MUSIC (1-D and 2-D), MDL/AIC source counting, SpotFi-style joint AoA/ToF and multi-array fusion (`docs/aoa.md`). Validated on synthetic plane waves only; the single-antenna ESP32-S3 boards cannot use it.
+- **Upstream sync.** Carries the 2026-10-12 upstream firmware, sensing and toolkit releases. `provision.py` keeps upstream's validated OTA PSK, which is never written to state.
+
 ### Peer-link sensing, LLTF grid, adaptive detection, OTA (fork: RuView-enhance)
 
 Hardware figures are MEASURED on 4x ESP32-S3 (2x 4 MB, 2x 16 MB) with a Raspberry Pi 5 server, unless marked otherwise. Detection thresholds are starting values until empty-vs-occupied data exists.

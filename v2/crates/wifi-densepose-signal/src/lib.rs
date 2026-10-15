@@ -31,6 +31,7 @@
 //! let processor = CsiProcessor::new(config);
 //! ```
 
+pub mod aoa;
 pub mod bvp;
 pub mod csi_processor;
 pub mod csi_ratio;

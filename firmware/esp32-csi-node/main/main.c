@@ -245,6 +245,22 @@ static void wifi_init_sta(void)
         s_reconnect_timer = NULL;
     }
 
+    /* Fix the rate of raw frames (peer beacons, NDPs) so weak links still
+     * decode them; must be set after esp_wifi_init() and before start. */
+#if defined(CONFIG_CSI_PEER_TX_RATE_6M) || defined(CONFIG_CSI_PEER_TX_RATE_MCS0)
+#if defined(CONFIG_CSI_PEER_TX_RATE_6M)
+    const wifi_phy_rate_t raw_rate = WIFI_PHY_RATE_6M;
+#else
+    const wifi_phy_rate_t raw_rate = WIFI_PHY_RATE_MCS0_LGI;
+#endif
+    esp_err_t rate_err = esp_wifi_config_80211_tx_rate(WIFI_IF_STA, raw_rate);
+    if (rate_err != ESP_OK) {
+        ESP_LOGW(TAG, "raw 802.11 tx rate not set: %s", esp_err_to_name(rate_err));
+    } else {
+        ESP_LOGI(TAG, "raw 802.11 tx rate fixed (peer beacons): 0x%02x", (unsigned)raw_rate);
+    }
+#endif
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "WiFi STA initialized, connecting to SSID: %s", g_nvs_config.wifi_ssid);

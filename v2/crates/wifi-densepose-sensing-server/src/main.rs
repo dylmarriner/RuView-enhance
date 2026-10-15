@@ -15,7 +15,13 @@ pub mod csi;
 mod engine_bridge;
 mod presence_fsm;
 mod link_subspace;
+mod presence_features;
+mod occupancy_latch;
+#[cfg(test)]
+mod presence_eval;
 mod link_map;
+mod activity;
+mod activity_api;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -315,6 +321,18 @@ struct Args {
     #[arg(long)]
     calibrate: bool,
 
+    /// How the NBVI/MVS/baseline-shift/breathing peer-link vote is used:
+    /// `off` (not reported), `advisory` (reported under room.advisory only),
+    /// `active` (also merged into room.presence / room.still_presence).
+    #[arg(long, env = "SENSING_PEER_PRESENCE_MODE", default_value = "advisory")]
+    peer_presence_mode: String,
+
+    /// Hold room occupancy this many seconds after the last peer-link motion
+    /// or still-body evidence, so a person sitting still is not reported as
+    /// absent between weak cues. 0 disables (default). See occupancy_latch.rs.
+    #[arg(long, env = "SENSING_OCCUPANCY_HOLD_SECS", default_value_t = 0)]
+    occupancy_hold_secs: u64,
+
     // ---------------------------------------------------------------
     // ADR-102: Edge Module Registry — surface the canonical Cognitum
     // cog catalog via `GET /api/v1/edge/registry`.
@@ -488,6 +506,19 @@ struct CalibratedPresenceEvidence {
     inference_method: String,
     presence: bool,
     person_count: usize,
+    #[serde(skip)]
+    diagnostics: Option<DetectorDiagnostics>,
+}
+
+/// Bounded decision explanation, separate from the strict authority envelope.
+#[derive(Debug, Clone, Serialize)]
+struct DetectorDiagnostics {
+    schema: &'static str,
+    scored_node_id: u8,
+    source_age_ms: u64,
+    source_sequence: u32,
+    required_window_frames: usize,
+    runtime: field_bridge::OccupancyDiagnostics,
 }
 
 /// Sensing update broadcast to WebSocket clients
@@ -509,6 +540,8 @@ struct SensingUpdate {
     /// active model receipt. Omitted when no calibrated result is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     calibrated_presence_evidence: Option<CalibratedPresenceEvidence>,
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    detector_diagnostics: Option<DetectorDiagnostics>,
     // ── ADR-022 Phase 3: Enhanced multi-BSSID pipeline fields ──
     /// Enhanced motion estimate from multi-BSSID pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2230,6 +2263,10 @@ struct AppStateInner {
     node_states: HashMap<u8, NodeState>,
     /// Node-to-node sensing links keyed by (tx node, rx node).
     peer_links: HashMap<(u8, u8), PeerLinkState>,
+    /// Room occupancy latch over the peer-link mesh (`--occupancy-hold-secs`).
+    occupancy_latch: occupancy_latch::OccupancyLatch,
+    /// Webcam-supervised activity recognition (sessions, k-NN model).
+    pub(crate) activity: activity::ActivityEngine,
     /// Persisted empty-room calibration, applied to links as they appear.
     peer_calibration: HashMap<(u8, u8), CalibratedLink>,
     /// Debounced room-level classification state — see
@@ -2880,6 +2917,17 @@ impl AppStateInner {
             inference_method: occupancy.method.wire_name().to_string(),
             presence: occupancy.person_count > 0,
             person_count: occupancy.person_count,
+            diagnostics: self.calibration_grid_binding.and_then(|binding| {
+                let node = self.node_states.get(&binding.source_node_id)?;
+                Some(DetectorDiagnostics {
+                    schema: field_bridge::DETECTOR_DIAGNOSTICS_SCHEMA,
+                    scored_node_id: binding.source_node_id,
+                    source_age_ms: node.field_model_latest_seen?.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    source_sequence: node.field_model_latest_sequence?,
+                    required_window_frames: self.field_model.as_ref()?.modes()?.baseline_runtime_window_size.unwrap_or(50),
+                    runtime: occupancy.diagnostics,
+                })
+            }),
         })
     }
 
@@ -3121,6 +3169,8 @@ impl AppStateInner {
             adaptive_model: None,
             node_states: HashMap::new(),
             peer_links: HashMap::new(),
+            occupancy_latch: occupancy_latch::OccupancyLatch::new(Duration::ZERO),
+            activity: activity::ActivityEngine::default(),
             peer_calibration: HashMap::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
@@ -3322,6 +3372,21 @@ mod calibration_expiry_tests {
         snapshot.modes.baseline_runtime_window_size = Some(50);
         *model = FieldModel::from_snapshot(snapshot, 1_500_000).unwrap();
         state
+    }
+
+    #[test]
+    fn diagnostics_stay_outside_the_strict_calibration_authority_envelope() {
+        let state = state_with_runtime_window();
+        let evidence = state.calibrated_presence_evidence(5, 77, 1_500).unwrap();
+        let diagnostic = evidence.diagnostics.as_ref().expect("bound source diagnostics");
+        assert_eq!(diagnostic.scored_node_id, 5);
+        assert_eq!(diagnostic.runtime.window_frames, 50);
+        let encoded = serde_json::to_value(&evidence).unwrap();
+        assert!(encoded.get("diagnostics").is_none());
+        assert_eq!(encoded.as_object().unwrap().len(), 13);
+        assert_eq!(encoded["person_count"], 0);
+        assert_eq!(serde_json::to_value(diagnostic).unwrap()["schema"],
+            field_bridge::DETECTOR_DIAGNOSTICS_SCHEMA);
     }
 
     #[test]
@@ -3797,6 +3862,8 @@ struct PeerLinkState {
     fsm: presence_fsm::PresenceFsm,
     /// Channel-shape jitter/wander against empty-room templates.
     subspace: link_subspace::LinkSubspace,
+    /// NBVI tone selection, MVS, baseline shift and breathing cue (advisory).
+    features: presence_features::LinkFeatures,
     /// Link RSSI when the empty-room calibration was taken.
     calibration_rssi: Option<f64>,
 }
@@ -3812,6 +3879,7 @@ impl PeerLinkState {
             normalized: VecDeque::with_capacity(PEER_LINK_WINDOW),
             fsm: presence_fsm::PresenceFsm::default(),
             subspace: link_subspace::LinkSubspace::default(),
+            features: presence_features::LinkFeatures::default(),
             calibration_rssi: None,
         }
     }
@@ -3824,6 +3892,10 @@ impl PeerLinkState {
                 l.fsm = presence_fsm::PresenceFsm::with_baseline(b);
             }
             l.subspace.set_templates(&c.templates);
+            l.features = presence_features::LinkFeatures::restored(
+                presence_features::NOMINAL_RATE_HZ,
+                c.features.as_ref(),
+            );
             l.calibration_rssi = Some(c.rssi_dbm);
         }
         l
@@ -3851,7 +3923,9 @@ impl PeerLinkState {
             if self.normalized.len() == PEER_LINK_WINDOW {
                 self.normalized.pop_front();
             }
-            self.normalized.push_back(frame.amplitudes.iter().map(|a| a / mean).collect());
+            let norm: Vec<f64> = frame.amplitudes.iter().map(|a| a / mean).collect();
+            self.features.push(&norm);
+            self.normalized.push_back(norm);
         }
         if self.normalized.len() == PEER_LINK_WINDOW {
             self.fsm.update(self.motion_score());
@@ -3880,13 +3954,60 @@ impl PeerLinkState {
         total / tones as f64
     }
 
-    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
+    fn features_json(&self) -> serde_json::Value {
+        let v = self.features.verdict();
+        let r = self.features.reading();
+        let b = self.features.baseline();
+        serde_json::json!({
+            "trained": v.trained,
+            "selected_tones": b.map(|b| b.tones.clone()),
+            "mvs": r.mvs,
+            "mvs_threshold": b.map(|b| b.mvs_threshold),
+            "shift_z": r.shift_z,
+            "shift_abs": r.shift_abs,
+            "shift_threshold": b.map(|b| b.shift_threshold),
+            "breathing_confidence": r.breathing_conf,
+            "breathing_bpm": self.features.breathing_bpm(),
+            "motion": v.motion,
+            "still": v.still,
+            "breathing": v.breathing,
+        })
+    }
+
+    /// Empty room confirmed: restart the detector and every feature's learning.
+    fn begin_calibration(&mut self) {
+        self.fsm = presence_fsm::PresenceFsm::default();
+        self.subspace.set_learning(true);
+        self.features.set_learning(true);
+    }
+
+    /// Freeze the learned empty-room state and return what to persist.
+    fn finish_calibration(&mut self, tx: u8, rx: u8) -> CalibratedLink {
+        self.subspace.set_learning(false);
+        self.calibration_rssi = Some(self.rssi_dbm);
+        let features = self.features.finish_learning();
+        CalibratedLink {
+            tx,
+            rx,
+            baseline: self.fsm.baseline(),
+            templates: self.subspace.templates(),
+            rssi_dbm: self.rssi_dbm,
+            features,
+        }
+    }
+
+    /// Mean delivered frame rate since the link appeared.
+    fn rate_hz(&self) -> f64 {
         let span = self.last_seen.duration_since(self.first_seen).as_secs_f64();
+        if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 }
+    }
+
+    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
         serde_json::json!({
             "tx": tx,
             "rx": rx,
             "frames": self.frames,
-            "rate_hz": if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 },
+            "rate_hz": self.rate_hz(),
             "rssi_dbm": self.rssi_dbm,
             "subcarrier_count": self.n_subcarriers,
             "motion_score": self.motion_score(),
@@ -3897,6 +4018,7 @@ impl PeerLinkState {
             "jitter": self.subspace.jitter(),
             "wander": self.subspace.wander(),
             "templates": self.subspace.template_count(),
+            "features": self.features_json(),
             "recalibration_recommended": self.recalibration_recommended(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
@@ -3910,7 +4032,9 @@ async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_jso
     let mut keys: Vec<_> = s.peer_links.keys().copied().collect();
     keys.sort_unstable();
     let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
-    Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+    let mut room = peer_room_summary(&s.peer_links, now);
+    room["occupancy"] = serde_json::json!(s.occupancy_latch.status(now));
+    Json(serde_json::json!({ "links": links, "room": room }))
 }
 
 /// One link's persisted empty-room calibration.
@@ -3921,6 +4045,9 @@ struct CalibratedLink {
     baseline: Option<f64>,
     templates: Vec<Vec<f64>>,
     rssi_dbm: f64,
+    /// NBVI tone selection and thresholds; absent in older calibration files.
+    #[serde(default)]
+    features: Option<presence_features::TrainedBaseline>,
 }
 
 fn load_peer_calibration(data_dir: &std::path::Path) -> HashMap<(u8, u8), CalibratedLink> {
@@ -3953,8 +4080,7 @@ fn save_peer_calibration(data_dir: &std::path::Path, links: &[CalibratedLink]) -
 async fn peer_links_calibrate_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut s = state.write().await;
     for l in s.peer_links.values_mut() {
-        l.fsm = presence_fsm::PresenceFsm::default();
-        l.subspace.set_learning(true);
+        l.begin_calibration();
     }
     info!("peer-link empty-room calibration started ({} links)", s.peer_links.len());
     Json(serde_json::json!({ "learning": true, "links": s.peer_links.len() }))
@@ -3966,16 +4092,9 @@ async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<ser
     let mut templates = 0;
     let mut saved = Vec::new();
     for (&(tx, rx), l) in s.peer_links.iter_mut() {
-        l.subspace.set_learning(false);
-        l.calibration_rssi = Some(l.rssi_dbm);
+        let c = l.finish_calibration(tx, rx);
         templates += l.subspace.template_count();
-        saved.push(CalibratedLink {
-            tx,
-            rx,
-            baseline: l.fsm.baseline(),
-            templates: l.subspace.templates(),
-            rssi_dbm: l.rssi_dbm,
-        });
+        saved.push(c);
     }
     let persisted = save_peer_calibration(&s.data_dir, &saved);
     if let Err(e) = &persisted {
@@ -4099,6 +4218,61 @@ fn peer_guard_room_inference(
     }
 }
 
+/// Confidence reported for a room held occupied only by the latch.
+const OCCUPANCY_LATCH_CONFIDENCE: f64 = 0.5;
+/// A single link may keep the latch only if it delivers at least this many
+/// frames/s. Starved links (0.01-0.3 Hz on the real mesh) compute wander
+/// over minutes-old frames and crossed the threshold in an empty room.
+const PEER_LATCH_MIN_RATE_HZ: f64 = 2.0;
+/// A single link's wander must also exceed its own empty-room template
+/// spread by this factor (the room vote's fixed threshold alone let one
+/// noisy link hold the latch forever in the SYNTHETIC latch scenario).
+const PEER_LATCH_WANDER_FLOOR_MULT: f64 = 1.0 + MAP_SIGMA_SCALE;
+
+/// Evidence the occupancy latch sees: the room votes below, plus whether any
+/// single fresh link shows a still-body or breathing cue.
+fn peer_room_evidence(
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> occupancy_latch::Evidence {
+    let room = peer_room_summary(links, now);
+    let still_any_link = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .filter(|l| l.rate_hz() >= PEER_LATCH_MIN_RATE_HZ)
+        .any(|l| {
+            let v = l.features.verdict();
+            let floor = l.subspace.wander_floor().unwrap_or(MAP_DEFAULT_WANDER_FLOOR).max(0.02);
+            let need = PEER_WANDER_THRESHOLD.max(floor * PEER_LATCH_WANDER_FLOOR_MULT);
+            l.subspace.wander().is_some_and(|w| w >= need)
+                // The advisory still/breathing cues drift into false alarms
+                // hours after calibration (SYNTHETIC eval), so they may only
+                // hold occupancy once the operator opted into active mode.
+                || (presence_features::mode() == presence_features::Mode::Active
+                    && (v.still || v.breathing))
+        });
+    occupancy_latch::Evidence {
+        motion: room["presence"].as_bool().unwrap_or(false),
+        still_room: room["still_presence"].as_bool().unwrap_or(false),
+        still_any_link,
+    }
+}
+
+/// A room the latch holds occupied is never reported absent: the person is
+/// assumed to be there and still. Unavailable (no fresh nodes) stays as is,
+/// so an outage is not reported as occupancy either.
+fn apply_occupancy_latch(room: RoomInference, held: bool) -> RoomInference {
+    if held && room.classification == "absent" {
+        RoomInference {
+            classification: "present_still".to_string(),
+            confidence: OCCUPANCY_LATCH_CONFIDENCE,
+            contributing_nodes: room.contributing_nodes,
+        }
+    } else {
+        room
+    }
+}
+
 /// Fuse fresh links into a room-level presence vote.
 fn peer_room_summary(
     links: &HashMap<(u8, u8), PeerLinkState>,
@@ -4119,7 +4293,17 @@ fn peer_room_summary(
     let wandering = wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count();
     let still_presence = !wanders.is_empty()
         && wandering as f64 / wanders.len() as f64 >= PEER_PRESENCE_FRACTION;
-    serde_json::json!({
+    let mut presence = !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION;
+    let mut still_presence = still_presence;
+    // NBVI/MVS/baseline-shift/breathing vote: reported, and merged into the
+    // outputs above only with `--peer-presence-mode active`.
+    let verdicts: Vec<presence_features::Verdict> = fresh.iter().map(|l| l.features.verdict()).collect();
+    let advisory = presence_features::room_advisory(&verdicts);
+    if presence_features::mode() == presence_features::Mode::Active {
+        presence |= advisory.presence;
+        still_presence |= advisory.still_presence;
+    }
+    let mut out = serde_json::json!({
         "templated_links": wanders.len(),
         "wandering_links": wandering,
         "still_presence": still_presence,
@@ -4127,8 +4311,15 @@ fn peer_room_summary(
         "calibrated_links": scored.len(),
         "perturbed_links": perturbed,
         "perturbed_fraction": fraction,
-        "presence": !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION,
-    })
+        "presence": presence,
+    });
+    if presence_features::mode() != presence_features::Mode::Off {
+        out["advisory"] = serde_json::json!(advisory);
+        out["advisory_mode"] = serde_json::json!(
+            if presence_features::mode() == presence_features::Mode::Active { "active" } else { "advisory" }
+        );
+    }
+    out
 }
 
 /// Parse `--privacy-profile`. `raw-research` is refused: its class is
@@ -4413,6 +4604,52 @@ mod peer_link_fusion_tests {
         links.insert((1, 2), active);
         assert_eq!(peer_guard_room_inference(&raw, &links, now), raw);
     }
+
+    #[test]
+    fn latch_turns_a_vetoed_still_person_back_into_presence() {
+        // Someone walked in (motion on 1 of 4 links), then sat still: the
+        // calibrated mesh looks empty and vetoes the weak raw presence. Links
+        // are judged fresh against the real clock; the latch gets simulated
+        // times minutes apart.
+        let fresh = std::time::Instant::now;
+        let t0 = std::time::Instant::now();
+        let mut latch = occupancy_latch::OccupancyLatch::new(Duration::from_secs(300));
+        let mut moving = empty_peer_mesh(4);
+        let mut active = empty_room_link();
+        for _ in 0..10 {
+            active.fsm.update(0.30);
+        }
+        moving.insert((1, 2), active);
+        assert!(latch.observe(peer_room_evidence(&moving, fresh()), t0));
+
+        let still = empty_peer_mesh(4);
+        let later = t0 + Duration::from_secs(60);
+        let raw = RoomInference {
+            classification: "present_still".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        let guarded = peer_guard_room_inference(&raw, &still, fresh());
+        assert_eq!(guarded.classification, "absent", "the guard alone would drop the person");
+        let held = latch.observe(peer_room_evidence(&still, fresh()), later);
+        let room = apply_occupancy_latch(guarded, held);
+        assert_eq!(room.classification, "present_still");
+
+        let gone = t0 + Duration::from_secs(301);
+        let held = latch.observe(peer_room_evidence(&still, fresh()), gone);
+        let raw_gone = RoomInference { classification: "absent".to_string(), ..raw };
+        assert_eq!(apply_occupancy_latch(raw_gone, held).classification, "absent");
+    }
+
+    #[test]
+    fn latch_never_reports_an_outage_as_occupancy() {
+        let unavailable = RoomInference {
+            classification: "unavailable".to_string(),
+            confidence: 0.0,
+            contributing_nodes: 0,
+        };
+        assert_eq!(apply_occupancy_latch(unavailable.clone(), true), unavailable);
+    }
 }
 
 #[cfg(test)]
@@ -4428,6 +4665,7 @@ mod peer_calibration_persistence_tests {
             baseline: Some(0.12),
             templates: vec![vec![0.1; link_subspace::COLUMNS]],
             rssi_dbm: -45.0,
+            features: None,
         }];
         save_peer_calibration(dir.path(), &saved).unwrap();
         let loaded = load_peer_calibration(dir.path());
@@ -4449,7 +4687,7 @@ mod peer_calibration_persistence_tests {
 
     #[test]
     fn moved_node_flags_recalibration() {
-        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0 };
+        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0, features: None };
         let mut l = PeerLinkState::restored(std::time::Instant::now(), Some(&c));
         l.frames = 10;
         l.rssi_dbm = -47.0;
@@ -5872,6 +6110,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
             ),
             vital_signs: None,
             calibrated_presence_evidence: None,
+            detector_diagnostics: None,
             enhanced_motion,
             enhanced_breathing,
             posture: posture_str,
@@ -6042,6 +6281,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         ),
         vital_signs: None,
         calibrated_presence_evidence: None,
+        detector_diagnostics: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -6933,6 +7173,7 @@ mod latest_update_staleness_tests {
             classifier: None,
             activity: None,
             calibrated_presence_evidence: None,
+            detector_diagnostics: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
@@ -10901,12 +11142,14 @@ async fn calibration_promote_bootstrap(
     }
 
     let validation = bootstrap_baseline::evaluate_validation(&samples);
+    let validation_diagnostics = validation.diagnostics();
     if !validation.passed {
         return Json(serde_json::json!({
             "success": false,
             "error_code": "bootstrap_validation_failed",
-            "error": "The held out empty room check did not pass. The model was not stored.",
+            "error": format!("The held out empty room check did not pass: {}. The model was not stored.", validation_diagnostics.failure_summary()),
             "validation": validation,
+            "validation_diagnostics": validation_diagnostics,
         }));
     }
 
@@ -10972,6 +11215,7 @@ async fn calibration_promote_bootstrap(
         "success": true,
         "message": "Validated startup baseline stored locally.",
         "validation": validation,
+        "validation_diagnostics": validation_diagnostics,
         "holdout_window_size": holdout_window_size,
         "bootstrap_baseline": stored,
         "calibrated_evidence_authorized": false,
@@ -11101,6 +11345,12 @@ async fn calibration_refine_bootstrap(
             + Duration::from_millis(BOOTSTRAP_VALIDATION_MIN_SPACING_MS);
     }
 
+    let validation_diagnostics = bootstrap_baseline::validation_diagnostics(
+        residuals.len(),
+        None,
+        stale_sample_count,
+        vital_sign_sample_count,
+    );
     if residuals.len() != BOOTSTRAP_VALIDATION_SAMPLES
         || stale_sample_count != 0
         || vital_sign_sample_count != 0
@@ -11108,12 +11358,13 @@ async fn calibration_refine_bootstrap(
         return Json(serde_json::json!({
             "success": false,
             "error_code": "bootstrap_refinement_validation_failed",
-            "error": "The fresh empty-room refinement gate did not pass. The stored baseline was not changed.",
+            "error": format!("The fresh empty-room refinement gate did not pass: {}. The stored baseline was not changed.", validation_diagnostics.failure_summary()),
             "validation": {
                 "sample_count": residuals.len(),
                 "stale_sample_count": stale_sample_count,
                 "vital_sign_sample_count": vital_sign_sample_count,
             },
+            "validation_diagnostics": validation_diagnostics,
         }));
     }
 
@@ -11200,6 +11451,7 @@ async fn calibration_refine_bootstrap(
     Json(serde_json::json!({
         "success": true,
         "message": "The local empty-room startup baseline was refined.",
+        "validation_diagnostics": validation_diagnostics,
         "validation": {
             "sample_count": residuals.len(),
             "stale_sample_count": stale_sample_count,
@@ -12574,6 +12826,7 @@ fn mediatek_room_update(
         },
         vital_signs: None,
         calibrated_presence_evidence: None,
+        detector_diagnostics: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -13404,6 +13657,9 @@ async fn udp_receiver_task(
                     );
                     let room_inference =
                         peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
+                    let evidence = peer_room_evidence(&s.peer_links, now);
+                    let held = s.occupancy_latch.observe(evidence, now);
+                    let room_inference = apply_occupancy_latch(room_inference, held);
 
                     let features = FeatureInfo {
                         mean_rssi: mean_rssi_dbm,
@@ -13499,6 +13755,7 @@ async fn udp_receiver_task(
                         classification,
                         signal_field,
                         vital_signs: published_vitals,
+                        detector_diagnostics: calibrated_presence_evidence.as_ref().and_then(|e| e.diagnostics.clone()),
                         calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
@@ -13660,9 +13917,11 @@ async fn udp_receiver_task(
                             .entry(key)
                             .or_insert_with(|| PeerLinkState::restored(observed_at, saved.as_ref()))
                             .observe(&frame, observed_at);
+                        s.activity.observe(&format!("{tx}>{}", frame.node_id), &frame.amplitudes, observed_at);
                         continue;
                     }
                     let grid_key = CsiGridKey::from_frame(&frame);
+                    s.activity.observe(&format!("R>{}", frame.node_id), &frame.amplitudes, observed_at);
                     s.node_states
                         .entry(frame.node_id)
                         .or_insert_with(NodeState::new)
@@ -13944,6 +14203,9 @@ async fn udp_receiver_task(
                     );
                     let room_inference =
                         peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
+                    let evidence = peer_room_evidence(&s.peer_links, now);
+                    let held = s.occupancy_latch.observe(evidence, now);
+                    let room_inference = apply_occupancy_latch(room_inference, held);
                     let room_classification = if bootstrap_empty {
                         ClassificationInfo {
                             motion_level: "absent".to_string(),
@@ -13991,6 +14253,7 @@ async fn udp_receiver_task(
                             &sub_variances,
                         ),
                         vital_signs: published_vitals,
+                        detector_diagnostics: calibrated_presence_evidence.as_ref().and_then(|e| e.diagnostics.clone()),
                         calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
@@ -14231,6 +14494,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             ),
             vital_signs: None,
             calibrated_presence_evidence: None,
+            detector_diagnostics: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
@@ -14609,6 +14873,14 @@ async fn main() {
 
     let mut args = Args::parse();
     args.ui_path = coalesce_ui_path(args.ui_path);
+
+    match presence_features::Mode::parse(&args.peer_presence_mode) {
+        Ok(mode) => presence_features::set_mode(mode),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        }
+    }
 
     if let Err(error) = validate_startup_calibration_request(args.calibrate) {
         eprintln!("Error: {error}");
@@ -15562,6 +15834,8 @@ async fn main() {
             }),
         node_states: HashMap::new(),
         peer_links: HashMap::new(),
+        occupancy_latch: occupancy_latch::OccupancyLatch::new(Duration::from_secs(args.occupancy_hold_secs)),
+        activity: activity::ActivityEngine::load(&args.data_dir),
         peer_calibration: load_peer_calibration(&args.data_dir),
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
@@ -16032,6 +16306,7 @@ async fn main() {
         // share `AppStateInner` and `/api/v1/train/*` sits under the bearer gate
         // applied below (like the rest of `/api/v1/*`).
         .merge(training_api::routes())
+        .merge(activity_api::routes())
         // Adaptive classifier endpoints
         .route("/api/v1/adaptive/train", post(adaptive_train))
         .route("/api/v1/adaptive/status", get(adaptive_status))
@@ -16941,6 +17216,7 @@ mod observatory_persons_field_position_tests {
             signal_field,
             vital_signs: None,
             calibrated_presence_evidence: None,
+            detector_diagnostics: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
