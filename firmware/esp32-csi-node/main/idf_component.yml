@@ -11,3 +11,11 @@ dependencies:
 
   ## Onboard WS2812 LED Disabling
   espressif/led_strip: "^3.0.0"
+
+  ## Receiver gain control for the optional CSI gain lock (CONFIG_CSI_GAIN_LOCK).
+  ## Prebuilt, Apache-2.0, ESP32-S3 only; unused code is not linked when the
+  ## option is off.
+  espressif/esp_csi_gain_ctrl:
+    version: ">=0.1.4"
+    rules:
+      - if: "target == esp32s3"

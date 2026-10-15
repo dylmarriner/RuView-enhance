@@ -17,6 +17,7 @@
 #include "edge_processing.h"
 #include "c6_timesync.h"  /* ADR-110: 802.15.4 epoch for cross-node alignment */
 #include "c6_sync_espnow.h" /* ADR-110 §A0.11: mesh-aligned epoch for sync packet */
+#include "csi_gain_lock.h"  /* optional RX gain lock (CONFIG_CSI_GAIN_LOCK) */
 
 #include <string.h>
 #include "esp_log.h"
@@ -287,6 +288,11 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
         buf[19] |= CSI_FLAG_FIRST_WORD_SANITIZED;
     }
 
+    /* ADR-018 byte 19 bit 7: receiver gain was locked (no-op unless enabled). */
+    if (csi_gain_lock_is_locked()) {
+        buf[19] |= CSI_FLAG_GAIN_LOCKED;
+    }
+
     int peer = peer_lookup(info->mac);
     if (peer >= 0 && frame_size < buf_len) {
         buf[19] |= CSI_FLAG_PEER_TX;
@@ -369,6 +375,8 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
     }
 
     s_cb_count++;
+
+    csi_gain_lock_on_frame(&info->rx_ctrl, now_us);
 
     if (s_cb_count <= 3 || (s_cb_count % 100) == 0) {
         ESP_LOGI(TAG, "CSI cb #%lu: len=%d rssi=%d ch=%d",
@@ -952,6 +960,7 @@ void csi_hop_next_channel(void)
      * we use HT20 (no secondary) for sensing.
      */
     esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    csi_gain_lock_reset();  /* a locked gain belongs to one channel */
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Channel hop to %u failed: %s", (unsigned)channel, esp_err_to_name(err));
     } else if ((s_cb_count % 200) == 0) {

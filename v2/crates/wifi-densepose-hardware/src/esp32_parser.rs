@@ -436,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn gain_locked_bit_7_round_trips_and_defaults_off() {
+        let locked = build_test_frame_with_he(6, 1, &[(0, 0); 56], 0, 0x80);
+        let (frame, _) = Esp32CsiParser::parse_frame(&locked).unwrap();
+        assert!(frame.metadata.adr018_flags.gain_locked);
+        assert_eq!(frame.metadata.adr018_flags.to_byte(), 0x80);
+        let plain = build_test_frame_with_he(6, 1, &[(0, 0); 56], 0, 0x20);
+        let (frame, _) = Esp32CsiParser::parse_frame(&plain).unwrap();
+        assert!(!frame.metadata.adr018_flags.gain_locked);
+    }
+
+    #[test]
     fn adr110_ppdu_byte_round_trips_for_known_variants() {
         for v in [PpduType::HtLegacy, PpduType::HeSu, PpduType::HeMu, PpduType::HeTb, PpduType::Unknown] {
             assert_eq!(PpduType::from_byte(v.to_byte()), v, "round-trip failed for {v:?}");

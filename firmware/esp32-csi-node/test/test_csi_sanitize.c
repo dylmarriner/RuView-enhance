@@ -42,6 +42,7 @@ int main(void)
     assert(len == CSI_HEADER_SIZE + sizeof(iq));
     assert(memcmp(&frame[CSI_HEADER_SIZE], iq, sizeof(iq)) == 0);
     assert((frame[19] & CSI_FLAG_FIRST_WORD_SANITIZED) == 0);
+    assert((frame[19] & CSI_FLAG_GAIN_LOCKED) == 0);  /* option off: bit stays clear */
 
     int8_t short_iq[] = {9, 10};
     make_info(&info, short_iq, sizeof(short_iq), true);

@@ -15,6 +15,9 @@ pub mod csi;
 mod engine_bridge;
 mod presence_fsm;
 mod link_subspace;
+mod presence_features;
+#[cfg(test)]
+mod presence_eval;
 mod link_map;
 mod field_bridge;
 mod field_localize;
@@ -314,6 +317,12 @@ struct Args {
     /// Start field model calibration on boot (empty room required)
     #[arg(long)]
     calibrate: bool,
+
+    /// How the NBVI/MVS/baseline-shift/breathing peer-link vote is used:
+    /// `off` (not reported), `advisory` (reported under room.advisory only),
+    /// `active` (also merged into room.presence / room.still_presence).
+    #[arg(long, env = "SENSING_PEER_PRESENCE_MODE", default_value = "advisory")]
+    peer_presence_mode: String,
 
     // ---------------------------------------------------------------
     // ADR-102: Edge Module Registry — surface the canonical Cognitum
@@ -3797,6 +3806,8 @@ struct PeerLinkState {
     fsm: presence_fsm::PresenceFsm,
     /// Channel-shape jitter/wander against empty-room templates.
     subspace: link_subspace::LinkSubspace,
+    /// NBVI tone selection, MVS, baseline shift and breathing cue (advisory).
+    features: presence_features::LinkFeatures,
     /// Link RSSI when the empty-room calibration was taken.
     calibration_rssi: Option<f64>,
 }
@@ -3812,6 +3823,7 @@ impl PeerLinkState {
             normalized: VecDeque::with_capacity(PEER_LINK_WINDOW),
             fsm: presence_fsm::PresenceFsm::default(),
             subspace: link_subspace::LinkSubspace::default(),
+            features: presence_features::LinkFeatures::default(),
             calibration_rssi: None,
         }
     }
@@ -3824,6 +3836,10 @@ impl PeerLinkState {
                 l.fsm = presence_fsm::PresenceFsm::with_baseline(b);
             }
             l.subspace.set_templates(&c.templates);
+            l.features = presence_features::LinkFeatures::restored(
+                presence_features::NOMINAL_RATE_HZ,
+                c.features.as_ref(),
+            );
             l.calibration_rssi = Some(c.rssi_dbm);
         }
         l
@@ -3851,7 +3867,9 @@ impl PeerLinkState {
             if self.normalized.len() == PEER_LINK_WINDOW {
                 self.normalized.pop_front();
             }
-            self.normalized.push_back(frame.amplitudes.iter().map(|a| a / mean).collect());
+            let norm: Vec<f64> = frame.amplitudes.iter().map(|a| a / mean).collect();
+            self.features.push(&norm);
+            self.normalized.push_back(norm);
         }
         if self.normalized.len() == PEER_LINK_WINDOW {
             self.fsm.update(self.motion_score());
@@ -3880,6 +3898,48 @@ impl PeerLinkState {
         total / tones as f64
     }
 
+    fn features_json(&self) -> serde_json::Value {
+        let v = self.features.verdict();
+        let r = self.features.reading();
+        let b = self.features.baseline();
+        serde_json::json!({
+            "trained": v.trained,
+            "selected_tones": b.map(|b| b.tones.clone()),
+            "mvs": r.mvs,
+            "mvs_threshold": b.map(|b| b.mvs_threshold),
+            "shift_z": r.shift_z,
+            "shift_abs": r.shift_abs,
+            "shift_threshold": b.map(|b| b.shift_threshold),
+            "breathing_confidence": r.breathing_conf,
+            "breathing_bpm": self.features.breathing_bpm(),
+            "motion": v.motion,
+            "still": v.still,
+            "breathing": v.breathing,
+        })
+    }
+
+    /// Empty room confirmed: restart the detector and every feature's learning.
+    fn begin_calibration(&mut self) {
+        self.fsm = presence_fsm::PresenceFsm::default();
+        self.subspace.set_learning(true);
+        self.features.set_learning(true);
+    }
+
+    /// Freeze the learned empty-room state and return what to persist.
+    fn finish_calibration(&mut self, tx: u8, rx: u8) -> CalibratedLink {
+        self.subspace.set_learning(false);
+        self.calibration_rssi = Some(self.rssi_dbm);
+        let features = self.features.finish_learning();
+        CalibratedLink {
+            tx,
+            rx,
+            baseline: self.fsm.baseline(),
+            templates: self.subspace.templates(),
+            rssi_dbm: self.rssi_dbm,
+            features,
+        }
+    }
+
     fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
         let span = self.last_seen.duration_since(self.first_seen).as_secs_f64();
         serde_json::json!({
@@ -3897,6 +3957,7 @@ impl PeerLinkState {
             "jitter": self.subspace.jitter(),
             "wander": self.subspace.wander(),
             "templates": self.subspace.template_count(),
+            "features": self.features_json(),
             "recalibration_recommended": self.recalibration_recommended(),
             "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
         })
@@ -3921,6 +3982,9 @@ struct CalibratedLink {
     baseline: Option<f64>,
     templates: Vec<Vec<f64>>,
     rssi_dbm: f64,
+    /// NBVI tone selection and thresholds; absent in older calibration files.
+    #[serde(default)]
+    features: Option<presence_features::TrainedBaseline>,
 }
 
 fn load_peer_calibration(data_dir: &std::path::Path) -> HashMap<(u8, u8), CalibratedLink> {
@@ -3953,8 +4017,7 @@ fn save_peer_calibration(data_dir: &std::path::Path, links: &[CalibratedLink]) -
 async fn peer_links_calibrate_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let mut s = state.write().await;
     for l in s.peer_links.values_mut() {
-        l.fsm = presence_fsm::PresenceFsm::default();
-        l.subspace.set_learning(true);
+        l.begin_calibration();
     }
     info!("peer-link empty-room calibration started ({} links)", s.peer_links.len());
     Json(serde_json::json!({ "learning": true, "links": s.peer_links.len() }))
@@ -3966,16 +4029,9 @@ async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<ser
     let mut templates = 0;
     let mut saved = Vec::new();
     for (&(tx, rx), l) in s.peer_links.iter_mut() {
-        l.subspace.set_learning(false);
-        l.calibration_rssi = Some(l.rssi_dbm);
+        let c = l.finish_calibration(tx, rx);
         templates += l.subspace.template_count();
-        saved.push(CalibratedLink {
-            tx,
-            rx,
-            baseline: l.fsm.baseline(),
-            templates: l.subspace.templates(),
-            rssi_dbm: l.rssi_dbm,
-        });
+        saved.push(c);
     }
     let persisted = save_peer_calibration(&s.data_dir, &saved);
     if let Err(e) = &persisted {
@@ -4119,7 +4175,17 @@ fn peer_room_summary(
     let wandering = wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count();
     let still_presence = !wanders.is_empty()
         && wandering as f64 / wanders.len() as f64 >= PEER_PRESENCE_FRACTION;
-    serde_json::json!({
+    let mut presence = !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION;
+    let mut still_presence = still_presence;
+    // NBVI/MVS/baseline-shift/breathing vote: reported, and merged into the
+    // outputs above only with `--peer-presence-mode active`.
+    let verdicts: Vec<presence_features::Verdict> = fresh.iter().map(|l| l.features.verdict()).collect();
+    let advisory = presence_features::room_advisory(&verdicts);
+    if presence_features::mode() == presence_features::Mode::Active {
+        presence |= advisory.presence;
+        still_presence |= advisory.still_presence;
+    }
+    let mut out = serde_json::json!({
         "templated_links": wanders.len(),
         "wandering_links": wandering,
         "still_presence": still_presence,
@@ -4127,8 +4193,15 @@ fn peer_room_summary(
         "calibrated_links": scored.len(),
         "perturbed_links": perturbed,
         "perturbed_fraction": fraction,
-        "presence": !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION,
-    })
+        "presence": presence,
+    });
+    if presence_features::mode() != presence_features::Mode::Off {
+        out["advisory"] = serde_json::json!(advisory);
+        out["advisory_mode"] = serde_json::json!(
+            if presence_features::mode() == presence_features::Mode::Active { "active" } else { "advisory" }
+        );
+    }
+    out
 }
 
 /// Parse `--privacy-profile`. `raw-research` is refused: its class is
@@ -4428,6 +4501,7 @@ mod peer_calibration_persistence_tests {
             baseline: Some(0.12),
             templates: vec![vec![0.1; link_subspace::COLUMNS]],
             rssi_dbm: -45.0,
+            features: None,
         }];
         save_peer_calibration(dir.path(), &saved).unwrap();
         let loaded = load_peer_calibration(dir.path());
@@ -4449,7 +4523,7 @@ mod peer_calibration_persistence_tests {
 
     #[test]
     fn moved_node_flags_recalibration() {
-        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0 };
+        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0, features: None };
         let mut l = PeerLinkState::restored(std::time::Instant::now(), Some(&c));
         l.frames = 10;
         l.rssi_dbm = -47.0;
@@ -14609,6 +14683,14 @@ async fn main() {
 
     let mut args = Args::parse();
     args.ui_path = coalesce_ui_path(args.ui_path);
+
+    match presence_features::Mode::parse(&args.peer_presence_mode) {
+        Ok(mode) => presence_features::set_mode(mode),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        }
+    }
 
     if let Err(error) = validate_startup_calibration_request(args.calibrate) {
         eprintln!("Error: {error}");
