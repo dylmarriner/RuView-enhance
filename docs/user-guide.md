@@ -468,11 +468,10 @@ Each node reboots into the other slot and must pass its health check, or the boo
 - `--occupancy-hold-secs <s>` (or `SENSING_OCCUPANCY_HOLD_SECS`, default 0 = off) keeps the room occupied after someone walks in. Each piece of still-body evidence restarts the hold time, and the room is released only after `<s>` seconds with no evidence. While held, the room reports `present_still` instead of `absent`. `GET /api/v1/peer-links` shows the state under `room.occupancy`. One link's still cue can only keep an occupancy, never start one. With `advisory` mode, only the channel-shape wander keeps it.
 
 ```bash
-sensing-server ... --occupancy-hold-secs 300          # hold 5 min after the last evidence
-sensing-server ... --occupancy-hold-secs 300 --peer-presence-mode active
+sensing-server ... --occupancy-hold-secs 180          # hold 3 min after the last evidence
 ```
 
-The cost is a tail: after you leave, the room stays occupied for up to the hold time. Pick the shortest hold that covers how long you sit without moving, and verify it with labelled periods (`eval_peer_links.py`). Evaluation of these options so far is SYNTHETIC only.
+Still evidence has to persist for 3 s before it counts, so isolated noisy frames do not keep the room. The cost is a tail: after you leave, the room stays occupied for up to the hold time. In a simulated 10-minute sit (SYNTHETIC, advisory mode), a still person was reported 19% of the time without the hold and 65% with 180 s, which released about a minute after leaving on average. Do not combine the hold with `--peer-presence-mode active` unless you recalibrate regularly: its cues drift and held a simulated empty room almost permanently. Verify on your own room with labelled periods (`eval_peer_links.py`).
 
 **Optional receiver gain lock (firmware).** `CONFIG_CSI_GAIN_LOCK=y` (ESP32-S3, off by default) holds the receiver's AGC/FFT gain at its median after a short warm-up, so amplitudes stay comparable between frames. Locked frames carry ADR-018 byte 19 bit 7. The server already cancels gain steps by normalising each frame, so enable this only to test whether it helps your weak links.
 

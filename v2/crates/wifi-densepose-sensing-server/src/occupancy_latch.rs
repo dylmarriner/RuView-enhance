@@ -9,11 +9,19 @@
 //!
 //! Entering needs motion or a room-level still vote; one link's still cue may
 //! only *refresh* an existing occupancy, so a single noisy link cannot create
-//! one. The cost is a tail of up to `hold` after the last evidence when a
-//! person has left. `hold == 0` disables the latch.
+//! one. Still evidence (room vote or one link) counts only after it has
+//! persisted for [`STILL_CONFIRM`]: in the SYNTHETIC latch scenario, isolated
+//! false cues on a few percent of frames otherwise refreshed the hold every
+//! few seconds and the latch never released. Motion counts at once (the
+//! motion detectors are already debounced). The cost is a tail of up to
+//! `hold` after the last evidence when a person has left. `hold == 0`
+//! disables the latch.
 
 use serde::Serialize;
 use std::time::{Duration, Instant};
+
+/// How long still evidence must persist before it enters or refreshes.
+pub const STILL_CONFIRM: Duration = Duration::from_secs(3);
 
 /// Evidence for one room update.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,6 +40,9 @@ pub struct OccupancyLatch {
     occupied: bool,
     entered_at: Option<Instant>,
     last_evidence: Option<Instant>,
+    /// Start of the current unbroken run of room still votes / any still cue.
+    still_room_since: Option<Instant>,
+    still_any_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -47,7 +58,14 @@ pub struct LatchStatus {
 
 impl OccupancyLatch {
     pub fn new(hold: Duration) -> Self {
-        Self { hold, occupied: false, entered_at: None, last_evidence: None }
+        Self {
+            hold,
+            occupied: false,
+            entered_at: None,
+            last_evidence: None,
+            still_room_since: None,
+            still_any_since: None,
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -63,8 +81,19 @@ impl OccupancyLatch {
         if !self.enabled() {
             return false;
         }
-        let enters = e.motion || e.still_room;
-        if enters || (self.occupied && e.still_any_link) {
+        let confirmed = |since: &mut Option<Instant>, on: bool| {
+            if on {
+                let t = *since.get_or_insert(now);
+                now.saturating_duration_since(t) >= STILL_CONFIRM
+            } else {
+                *since = None;
+                false
+            }
+        };
+        let still_room = confirmed(&mut self.still_room_since, e.still_room);
+        let still_any = confirmed(&mut self.still_any_since, e.still_room || e.still_any_link);
+        let enters = e.motion || still_room;
+        if enters || (self.occupied && still_any) {
             self.last_evidence = Some(now);
             if !self.occupied {
                 self.occupied = true;
@@ -124,13 +153,16 @@ mod tests {
         let mut l = OccupancyLatch::new(HOLD);
         assert!(!l.observe(ONE_LINK, t0), "one link must not enter");
         l.observe(MOTION, t0);
-        // A person sits still for 20 minutes; one link sees them every 4 min.
+        // A person sits still for 20 minutes; one link sees them for 5 s
+        // every 4 min.
         for m in (4..=20).step_by(4) {
             assert!(l.observe(NOTHING, at(t0, m * 60 - 1)));
-            assert!(l.observe(ONE_LINK, at(t0, m * 60)));
+            for s in 0..=5 {
+                assert!(l.observe(ONE_LINK, at(t0, m * 60 + s)));
+            }
         }
-        assert!(l.status(at(t0, 1200)).occupied_for_s.unwrap() >= 1200.0);
-        assert!(!l.observe(NOTHING, at(t0, 1200 + 300)));
+        assert!(l.status(at(t0, 1205)).occupied_for_s.unwrap() >= 1200.0);
+        assert!(!l.observe(NOTHING, at(t0, 1205 + 300)));
     }
 
     #[test]
@@ -139,7 +171,22 @@ mod tests {
         let t0 = Instant::now();
         let mut l = OccupancyLatch::new(HOLD);
         let e = Evidence { still_room: true, ..NOTHING };
-        assert!(l.observe(e, t0));
+        assert!(!l.observe(e, t0), "must persist for STILL_CONFIRM first");
+        assert!(l.observe(e, t0 + STILL_CONFIRM));
+    }
+
+    #[test]
+    fn isolated_still_cues_do_not_keep_the_room() {
+        // False cues on single updates, a few seconds apart, never persist.
+        let t0 = Instant::now();
+        let mut l = OccupancyLatch::new(HOLD);
+        l.observe(MOTION, t0);
+        let mut held = true;
+        for s in 1..=400u64 {
+            let e = if s % 3 == 0 { ONE_LINK } else { NOTHING };
+            held = l.observe(e, at(t0, s));
+        }
+        assert!(!held, "sparse cues must not refresh the hold");
     }
 
     #[test]

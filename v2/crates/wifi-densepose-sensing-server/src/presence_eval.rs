@@ -415,6 +415,10 @@ const LATCH_GONE: usize = 6000; // 10 min
 /// (fraction of the sitting phase reported present without the latch, with
 /// it, seconds until release after leaving, fraction of the drifted empty
 /// phase held occupied).
+/// Fractions of the after-leaving and drifted-empty phases in which each
+/// evidence kind fired: [motion, room still vote, one-link still cue].
+static LATCH_EVIDENCE: std::sync::Mutex<[[usize; 3]; 2]> = std::sync::Mutex::new([[0; 3]; 2]);
+
 fn run_latch_trial(seed: u64, holds_s: &[u64]) -> Vec<(f64, f64, Option<f64>, f64)> {
     let mut rng = Rng::new(seed);
     let mut sims: Vec<LinkSim> = Vec::new();
@@ -483,6 +487,13 @@ fn run_latch_trial(seed: u64, holds_s: &[u64]) -> Vec<(f64, f64, Option<f64>, f6
                 links.get_mut(&(s.tx, s.rx)).unwrap().observe(&frame_with(amps), t);
             }
             let ev = peer_room_evidence(&links, t);
+            if phase >= 2 {
+                let mut e = LATCH_EVIDENCE.lock().unwrap();
+                let row = &mut e[phase - 2];
+                row[0] += usize::from(ev.motion);
+                row[1] += usize::from(ev.still_room);
+                row[2] += usize::from(ev.still_any_link);
+            }
             if phase == 1 && (ev.motion || ev.still_room) {
                 sit_raw += 1;
             }
@@ -537,6 +548,16 @@ fn synthetic_latch_report() {
     println!("\nSYNTHETIC occupancy latch: {trials} trials, mode {mode}. Walk in 10 s, sit still 10 min,");
     println!("leave for 10 min, then 10 min empty after environment drift. NOT hardware data.");
     let raw: f64 = results.iter().map(|r| r[0].0).sum::<f64>() / results.len() as f64;
+    let e = *LATCH_EVIDENCE.lock().unwrap();
+    let frames = (trials * LATCH_GONE) as f64;
+    for (name, row) in ["after leaving", "drifted empty"].iter().zip(e) {
+        println!(
+            "  evidence while {name}: motion {:5.1}% | room still vote {:5.1}% | one-link still cue {:5.1}%",
+            100.0 * row[0] as f64 / frames,
+            100.0 * row[1] as f64 / frames,
+            100.0 * row[2] as f64 / frames
+        );
+    }
     println!("  sitting, reported present without latch (room motion or still vote): {:5.1}%", 100.0 * raw);
     for (j, h) in holds.iter().enumerate() {
         let n = results.len() as f64;

@@ -4224,6 +4224,10 @@ const OCCUPANCY_LATCH_CONFIDENCE: f64 = 0.5;
 /// frames/s. Starved links (0.01-0.3 Hz on the real mesh) compute wander
 /// over minutes-old frames and crossed the threshold in an empty room.
 const PEER_LATCH_MIN_RATE_HZ: f64 = 2.0;
+/// A single link's wander must also exceed its own empty-room template
+/// spread by this factor (the room vote's fixed threshold alone let one
+/// noisy link hold the latch forever in the SYNTHETIC latch scenario).
+const PEER_LATCH_WANDER_FLOOR_MULT: f64 = 1.0 + MAP_SIGMA_SCALE;
 
 /// Evidence the occupancy latch sees: the room votes below, plus whether any
 /// single fresh link shows a still-body or breathing cue.
@@ -4238,7 +4242,9 @@ fn peer_room_evidence(
         .filter(|l| l.rate_hz() >= PEER_LATCH_MIN_RATE_HZ)
         .any(|l| {
             let v = l.features.verdict();
-            l.subspace.wander().is_some_and(|w| w >= PEER_WANDER_THRESHOLD)
+            let floor = l.subspace.wander_floor().unwrap_or(MAP_DEFAULT_WANDER_FLOOR).max(0.02);
+            let need = PEER_WANDER_THRESHOLD.max(floor * PEER_LATCH_WANDER_FLOOR_MULT);
+            l.subspace.wander().is_some_and(|w| w >= need)
                 // The advisory still/breathing cues drift into false alarms
                 // hours after calibration (SYNTHETIC eval), so they may only
                 // hold occupancy once the operator opted into active mode.

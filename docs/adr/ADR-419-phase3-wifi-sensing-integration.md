@@ -48,8 +48,21 @@ cached in state, replaces the fork's version.
   `presence_eval.rs`) or unit-level. Hardware evidence needs labelled
   empty/occupied periods on the real mesh, scored with
   `scripts/eval_peer_links.py`.
-- The latch trades detection for a release tail. After a person leaves, the
-  room stays occupied for up to the hold time.
+- The latch trades detection for a release tail, and still evidence must
+  persist for 3 s before it counts. SYNTHETIC latch scenario (8 trials: walk
+  in, sit still 10 min, leave, then a drifted empty room), advisory mode.
+  Without the latch, the sitting person is reported 19% of the time:
+
+  | hold | sitting reported | mean release after leaving | drifted empty held |
+  |---|---|---|---|
+  | 60 s | 37% | 10 s | 1% |
+  | 180 s | 65% | 63 s | 4% |
+  | 300 s | 82% | 119 s (1/8 never) | 11% |
+
+  In active mode the drifted empty room is held 98% of the time, so do not
+  combine the latch with `--peer-presence-mode active` without regular
+  recalibration. Reproduce:
+  `PRESENCE_EVAL_TRIALS=8 PRESENCE_EVAL_MODE=advisory cargo test -p wifi-densepose-sensing-server --bin sensing-server presence_eval::synthetic_latch_report -- --ignored --nocapture`
 - RTI localisation is limited by link geometry with about 6 usable links.
   Position fingerprinting through the activity teacher (zone labels instead
   of movement labels) is the documented alternative. It needs no new code.
