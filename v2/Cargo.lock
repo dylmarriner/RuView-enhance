@@ -13528,6 +13528,7 @@ dependencies = [
  "criterion",
  "midstreamer-attractor",
  "midstreamer-temporal-compare",
+ "nalgebra 0.34.2",
  "ndarray 0.17.2",
  "ndarray-linalg",
  "num-complex",
