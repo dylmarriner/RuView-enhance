@@ -16,6 +16,8 @@ mod engine_bridge;
 mod presence_fsm;
 mod link_subspace;
 mod link_map;
+mod activity;
+mod activity_api;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -2245,6 +2247,8 @@ struct AppStateInner {
     node_states: HashMap<u8, NodeState>,
     /// Node-to-node sensing links keyed by (tx node, rx node).
     peer_links: HashMap<(u8, u8), PeerLinkState>,
+    /// Webcam-supervised activity recognition (sessions, k-NN model).
+    pub(crate) activity: activity::ActivityEngine,
     /// Persisted empty-room calibration, applied to links as they appear.
     peer_calibration: HashMap<(u8, u8), CalibratedLink>,
     /// Debounced room-level classification state — see
@@ -3147,6 +3151,7 @@ impl AppStateInner {
             adaptive_model: None,
             node_states: HashMap::new(),
             peer_links: HashMap::new(),
+            activity: activity::ActivityEngine::default(),
             peer_calibration: HashMap::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
@@ -13717,9 +13722,11 @@ async fn udp_receiver_task(
                             .entry(key)
                             .or_insert_with(|| PeerLinkState::restored(observed_at, saved.as_ref()))
                             .observe(&frame, observed_at);
+                        s.activity.observe(&format!("{tx}>{}", frame.node_id), &frame.amplitudes, observed_at);
                         continue;
                     }
                     let grid_key = CsiGridKey::from_frame(&frame);
+                    s.activity.observe(&format!("R>{}", frame.node_id), &frame.amplitudes, observed_at);
                     s.node_states
                         .entry(frame.node_id)
                         .or_insert_with(NodeState::new)
@@ -15621,6 +15628,7 @@ async fn main() {
             }),
         node_states: HashMap::new(),
         peer_links: HashMap::new(),
+        activity: activity::ActivityEngine::load(&args.data_dir),
         peer_calibration: load_peer_calibration(&args.data_dir),
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
@@ -16091,6 +16099,7 @@ async fn main() {
         // share `AppStateInner` and `/api/v1/train/*` sits under the bearer gate
         // applied below (like the rest of `/api/v1/*`).
         .merge(training_api::routes())
+        .merge(activity_api::routes())
         // Adaptive classifier endpoints
         .route("/api/v1/adaptive/train", post(adaptive_train))
         .route("/api/v1/adaptive/status", get(adaptive_status))

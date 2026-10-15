@@ -21,6 +21,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [Windows WiFi (RSSI Only)](#windows-wifi-rssi-only)
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
+   - [Activity recognition with a webcam teacher](#activity-recognition-with-a-webcam-teacher)
    - [MediaTek Router CSI (Experimental)](#mediatek-router-csi-experimental)
    - [Connect Mesh Data to the Dashboard and Observatory](#connect-mesh-data-to-the-dashboard-and-observatory)
    - [Cognitum Spaces activation](#cognitum-spaces-activation)
@@ -462,6 +463,27 @@ scripts/ota_update_nodes.sh build/esp32-csi-node.bin 192.168.1.71 192.168.1.72
 Each node reboots into the other slot and must pass its health check, or the bootloader rolls back. Uploads without the key are rejected (HTTP 403).
 
 **Privacy profile.** In a private home, `--privacy-profile care-with-consent` (or `RUVIEW_PRIVACY_PROFILE`) keeps per-node amplitudes published when the trust engine demotes one step. The default `private-home` withholds them at `Restricted`.
+
+### Activity recognition with a webcam teacher
+
+A browser webcam can label what you are doing (walking, sitting, squatting, ...) while the node links stream CSI, so a WiFi-only classifier learns your room. Method adapted from [wifi-sensing-kit](https://github.com/andrisgauracs/wifi-sensing-kit) (MIT). Open `/ui/activity.html` (linked as **Activity** in the dashboard tab bar).
+
+1. Click **Start camera**. MediaPipe Pose (pinned `@mediapipe/tasks-vision@0.10.14` from cdn.jsdelivr.net, plus the Google-hosted pose model file) runs in the browser; only the label string is sent to the server, never video or landmarks.
+2. **Record training**, perform each movement in turn, then **Stop recording**. Windows where the camera is unsure are not saved.
+3. Press **Train model** (k-NN, default k=7, fitted on training sessions only).
+4. Later, **Record test** as a *separate* session, then **Evaluate**. Only test-session windows are scored, against a model that never saw them. The result shows accuracy next to the chance baseline (1/classes) and the majority-class baseline, a confusion table, and a leave-one-link-out importance table.
+5. The "WiFi only thinks" panel shows the live prediction smoothed over 3 s.
+
+Features are computed every 0.5 s per link (transmitter to receiver) over the last 1.5 s: gain-normalised mean amplitude shape over the 52 LLTF tones, per-tone std and per-tone mean frame-to-frame change. A session uses the links streaming at 5 frames/s or more when it starts (up to 8); later sessions must use the same links. Sessions are stored as JSONL under `<data-dir>/activity/sessions/` and the model at `<data-dir>/activity/model.json`; both are reloaded at startup.
+
+```bash
+# offline re-score of the saved sessions (reproducer for the dashboard's numbers)
+python3 scripts/eval_activity.py data/activity/sessions --k 7
+```
+
+API (all under the usual bearer gate): `GET /api/v1/activity/status`, `POST .../session/start` (`{"kind":"train"|"test"}`), `POST .../session/stop`, `DELETE .../sessions/{id}`, `POST .../label` (`{"label":"walking"}`), `POST .../train`, `POST .../evaluate`, `GET .../live`.
+
+Accuracy is `MEASURED` only for the room, links and person that recorded the sessions; it says nothing about other rooms, and WiFi sensing is not camera-grade. The wifi-sensing-kit author reports 79.5% over 8 movements in one room (`CLAIMED`, theirs, not reproduced here).
 
 ### MediaTek Router CSI (Experimental)
 

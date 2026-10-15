@@ -1,0 +1,128 @@
+/* RuView - Activity (webcam teacher) page. Dark theme matching pose-fusion.
+   Layout adapted in spirit from the wifi-sensing-kit movement page (MIT,
+   https://github.com/andrisgauracs/wifi-sensing-kit). */
+
+:root {
+  --bg-deep: #080c14;
+  --bg-panel: rgba(8, 16, 28, 0.92);
+  --border: rgba(0, 210, 120, 0.25);
+  --green: #00d878;
+  --amber: #ffb020;
+  --red: #ff3040;
+  --cyan: #00e5ff;
+  --text: #e8ece0;
+  --text-2: rgba(232, 236, 224, 0.6);
+  --text-3: rgba(232, 236, 224, 0.35);
+  --radius: 8px;
+  --font: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg-deep);
+  color: var(--text);
+  font-family: var(--font);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.logo { font-weight: 700; font-size: 22px; color: var(--green); }
+.header-title { color: var(--text-2); font-size: 14px; margin-left: 12px; }
+.header-left { display: flex; align-items: baseline; }
+.back-link { color: var(--text-2); text-decoration: none; font-size: 13px; margin-left: 16px; }
+.back-link:hover { color: var(--green); }
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px 24px;
+}
+@media (max-width: 960px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.panel + .panel { margin-top: 16px; }
+.panel-title {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 12px;
+}
+
+.stage { position: relative; aspect-ratio: 4 / 3; background: #000; border-radius: var(--radius); overflow: hidden; }
+.stage video, .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+.stage.covered video, .stage.covered canvas { visibility: hidden; }
+.cam-label {
+  position: absolute; left: 12px; top: 12px; z-index: 2;
+  padding: 6px 12px; border-radius: var(--radius);
+  background: rgba(8, 10, 18, 0.75); font-size: 16px; color: var(--text-2);
+}
+.cam-label b { color: var(--text); }
+.cam-status { position: absolute; right: 12px; bottom: 10px; z-index: 2; font-family: var(--mono); font-size: 12px; color: var(--text-2); }
+
+.privacy-note { margin-top: 8px; font-size: 12px; color: var(--text-3); }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+.btn {
+  font: inherit; font-size: 14px; color: var(--text);
+  padding: 8px 14px; border-radius: var(--radius);
+  background: #151a2c; border: 1px solid var(--border); cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--green); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.rec { border-color: var(--amber); color: var(--amber); }
+.btn.live { border-color: var(--red); color: var(--red); }
+.btn.small { padding: 3px 8px; font-size: 12px; }
+.field { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.field input { width: 56px; padding: 6px; border-radius: 6px; border: 1px solid var(--border); background: #0c1220; color: var(--text); font: inherit; }
+
+.big-answer { font-size: 44px; font-weight: 700; color: var(--cyan); line-height: 1.1; }
+.big-answer.unsure { color: var(--text-3); }
+.sub { margin-top: 6px; font-family: var(--mono); font-size: 13px; color: var(--text-2); min-height: 18px; }
+
+.bar-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) 44px; gap: 10px; align-items: center; margin: 6px 0; font-size: 13px; }
+.bar-row .name { color: var(--text-2); text-align: right; }
+.bar-row.top .name { color: var(--text); }
+.bar-row .val { font-family: var(--mono); color: var(--text-2); }
+progress { width: 100%; height: 12px; appearance: none; border: 0; border-radius: 6px; overflow: hidden; background: rgba(255, 255, 255, 0.06); }
+progress::-webkit-progress-bar { background: rgba(255, 255, 255, 0.06); }
+progress::-webkit-progress-value { background: var(--text-3); }
+progress::-moz-progress-bar { background: var(--text-3); }
+.bar-row.top progress::-webkit-progress-value { background: var(--cyan); }
+.bar-row.top progress::-moz-progress-bar { background: var(--cyan); }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-3); font-weight: 500; }
+td.hit { color: var(--green); font-weight: 600; }
+td.miss { color: var(--amber); }
+td.zero { color: var(--text-3); }
+.table-wrap { overflow-x: auto; }
+
+.verdict { font-family: var(--mono); font-size: 14px; line-height: 1.7; margin-bottom: 12px; }
+.verdict b { color: var(--cyan); font-size: 22px; }
+.tag { display: inline-block; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--amber); color: var(--amber); font-size: 11px; font-family: var(--mono); }
+.note { margin-top: 10px; font-size: 12px; color: var(--text-3); line-height: 1.5; }
+.error { color: var(--red); font-size: 13px; margin-top: 8px; min-height: 18px; }
+.muted { color: var(--text-3); font-size: 13px; }
+.rec-banner { margin-top: 10px; font-family: var(--mono); font-size: 13px; color: var(--amber); min-height: 18px; }
+.hidden { display: none; }

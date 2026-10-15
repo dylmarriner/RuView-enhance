@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RuView — Activity (Webcam Teacher)</title>
+  <!-- Adapted from the wifi-sensing-kit movement page by Andris Gauracs (MIT):
+       https://github.com/andrisgauracs/wifi-sensing-kit -->
+  <link rel="stylesheet" href="activity/css/activity.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">&pi; RuView</div>
+      <div class="header-title">Activity recognition — webcam teaches, WiFi learns</div>
+    </div>
+    <div>
+      <a href="index.html" class="back-link">&larr; Dashboard</a>
+      <a href="pose-fusion.html" class="back-link">Pose Fusion &rarr;</a>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section>
+      <div class="panel">
+        <div class="panel-title">Camera teacher (runs in this browser)</div>
+        <div class="stage" id="stage">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="skeleton"></canvas>
+          <div class="cam-label">Camera sees: <b id="cam-label">-</b></div>
+          <div class="cam-status" id="cam-status">camera off</div>
+        </div>
+        <p class="privacy-note">Pose estimation runs locally in your browser. Only the movement label
+          (e.g. "walking") is sent to the server; video and landmarks never leave this page.</p>
+        <div class="controls">
+          <button class="btn" id="btn-camera">Start camera</button>
+          <button class="btn" id="btn-cover">Cover camera</button>
+        </div>
+        <div class="error" id="cam-error" role="alert"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Record sessions</div>
+        <p class="muted">Record a <b>training</b> session first, doing each movement in turn. Later, record a
+          <b>separate test</b> session (new recording, ideally another time of day). Only the test session is scored.
+          Windows where the camera is unsure are not saved.</p>
+        <div class="controls">
+          <button class="btn rec" id="btn-train">Record training</button>
+          <button class="btn rec" id="btn-test">Record test</button>
+          <button class="btn live" id="btn-stop" disabled>Stop recording</button>
+        </div>
+        <div class="rec-banner" id="rec-banner" role="status"></div>
+        <div class="error" id="session-error" role="alert"></div>
+        <div class="table-wrap">
+          <table id="sessions">
+            <thead><tr><th>Session</th><th>Kind</th><th>Windows</th><th>Labels</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="controls">
+          <label class="field">k <input type="number" id="k" min="1" max="51" value="7"></label>
+          <button class="btn" id="btn-model">Train model</button>
+          <button class="btn" id="btn-eval">Evaluate on test session</button>
+        </div>
+        <div class="error" id="model-error" role="alert"></div>
+        <p class="muted" id="links-info"></p>
+      </div>
+    </section>
+
+    <section>
+      <div class="panel">
+        <div class="panel-title">WiFi only thinks</div>
+        <div class="big-answer unsure" id="wifi-answer">-</div>
+        <div class="sub" id="wifi-sub">no model yet</div>
+        <div id="wifi-bars"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Held-out evaluation</div>
+        <div id="eval-empty" class="muted">Train a model, then record a separate test session and press Evaluate.</div>
+        <div id="eval" class="hidden">
+          <div class="verdict" id="eval-verdict"></div>
+          <div class="table-wrap"><table id="confusion"></table></div>
+          <div class="panel-title eval-links-title">Per-link importance (leave-one-link-out)</div>
+          <div class="table-wrap"><table id="link-importance"></table></div>
+          <p class="note" id="eval-note"></p>
+        </div>
+        <div class="error" id="eval-error" role="alert"></div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="activity/js/main.js"></script>
+</body>
+</html>
