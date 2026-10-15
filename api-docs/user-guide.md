@@ -21,6 +21,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [Windows WiFi (RSSI Only)](#windows-wifi-rssi-only)
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
+   - [Activity recognition with a webcam teacher](#activity-recognition-with-a-webcam-teacher)
    - [MediaTek Router CSI (Experimental)](#mediatek-router-csi-experimental)
    - [Connect Mesh Data to the Dashboard and Observatory](#connect-mesh-data-to-the-dashboard-and-observatory)
    - [Cognitum Spaces activation](#cognitum-spaces-activation)
@@ -366,7 +367,8 @@ Real Channel State Information at 20 Hz with 56-192 subcarriers. Required for po
 
 ```bash
 # From source
-./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
+./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001 \
+  --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>
 
 # Docker (use CSI_SOURCE environment variable)
 docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
@@ -375,6 +377,8 @@ docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
 ```
 
 The ESP32 nodes stream binary CSI frames over UDP to port 5005. See [Hardware Setup](#esp32-s3-mesh) for flashing instructions.
+
+The server only listens for those frames on `127.0.0.1` unless you tell it otherwise (ADR-296), so a native run needs `--udp-bind 0.0.0.0` to hear nodes on your network, plus `--udp-allow` with their IP or subnet (for example `192.168.1.0/24`). Without them the server starts fine but no node ever shows up. If you'd rather accept frames from any source on a trusted network, use `--udp-insecure-lan` instead of `--udp-allow`.
 
 #### Receiving ESP32 frames in Docker
 
@@ -408,7 +412,8 @@ For higher accuracy with through-wall tracking, deploy 3-6 ESP32-S3 nodes in a *
 
 ```bash
 # Start the aggregator with multistatic mode
-./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
+./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001 \
+  --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>
 ```
 
 The mesh uses a **Time-Division Multiplexing (TDM)** protocol so nodes take turns transmitting, avoiding self-interference. Key features:
@@ -422,6 +427,89 @@ The mesh uses a **Time-Division Multiplexing (TDM)** protocol so nodes take turn
 | Attention-weighted fusion | Cross-viewpoint attention with geometric diversity bias |
 
 See [ADR-029](adr/ADR-029-ruvsense-multistatic-sensing-mode.md) and [ADR-032](adr/ADR-032-multistatic-mesh-security-hardening.md) for the full design.
+
+### ESP32 node-to-node links, calibration and OTA
+
+With four or more ESP32-S3 nodes on firmware with peer beacons, each node also senses every other node, not only the router. The server keeps one stream per transmitter→receiver pair (12 for 4 nodes):
+
+```bash
+curl http://<server>:<http-port>/api/v1/peer-links      # per-link rate, RSSI, motion, wander + room vote
+```
+
+**Empty-room calibration (after the nodes are in their permanent places).** With the room empty:
+
+```bash
+curl -X POST http://<server>:<http-port>/api/v1/peer-links/calibrate/start
+sleep 120
+curl -X POST http://<server>:<http-port>/api/v1/peer-links/calibrate/stop   # saved to <data-dir>/peer_link_calibration.json
+```
+
+The calibration survives restarts and firmware updates. Moving a node changes its links, so recalibrate after moving. Links whose RSSI moved more than 6 dB report `recalibration_recommended: true`.
+
+**Thresholds from data.** Label empty and occupied periods in a link log and sweep thresholds:
+
+```bash
+python scripts/eval_peer_links.py links.jsonl --empty <start>-<end> --occupied <start>-<end>
+```
+
+**Over-the-air updates.** Provision every node once over USB with a shared key (64 hex characters), then update over WiFi:
+
+```bash
+openssl rand -hex 32 > ~/.config/ruview/ota_psk && chmod 600 ~/.config/ruview/ota_psk
+python firmware/esp32-csi-node/provision.py --port /dev/ttyACM0 ... --ota-psk "$(cat ~/.config/ruview/ota_psk)"
+scripts/ota_update_nodes.sh build/esp32-csi-node.bin 192.168.1.71 192.168.1.72
+```
+
+Each node reboots into the other slot and must pass its health check, or the bootloader rolls back. Uploads without the key are rejected (HTTP 403).
+
+**Still people: extra cues and an occupancy hold.** Motion detectors lose a person who sits still. Two server options help, and both are off or advisory by default:
+
+- `--peer-presence-mode advisory|active|off` (default `advisory`) adds per-link still-person cues: stable-tone selection, moving variance, baseline shift and a breathing cue. They are trained by the same empty-room calibration. In `advisory` mode they appear under `room.advisory` only; `active` also merges them into `room.presence` / `room.still_presence`.
+- `--occupancy-hold-secs <s>` (or `SENSING_OCCUPANCY_HOLD_SECS`, default 0 = off) keeps the room occupied after someone walks in. Each piece of still-body evidence restarts the hold time, and the room is released only after `<s>` seconds with no evidence. While held, the room reports `present_still` instead of `absent`. `GET /api/v1/peer-links` shows the state under `room.occupancy`. One link's still cue can only keep an occupancy, never start one. With `advisory` mode, only the channel-shape wander keeps it.
+
+```bash
+sensing-server ... --occupancy-hold-secs 180          # hold 3 min after the last evidence
+```
+
+Still evidence has to persist for 3 s before it counts, so isolated noisy frames do not keep the room. The cost is a tail: after you leave, the room stays occupied for up to the hold time. In a simulated 10-minute sit (SYNTHETIC, advisory mode), a still person was reported 19% of the time without the hold and 65% with 180 s, which released about a minute after leaving on average. Do not combine the hold with `--peer-presence-mode active` unless you recalibrate regularly: its cues drift and held a simulated empty room almost permanently. Verify on your own room with labelled periods (`eval_peer_links.py`).
+
+**Optional receiver gain lock (firmware).** `CONFIG_CSI_GAIN_LOCK=y` (ESP32-S3, off by default) holds the receiver's AGC/FFT gain at its median after a short warm-up, so amplitudes stay comparable between frames. Locked frames carry ADR-018 byte 19 bit 7. The server already cancels gain steps by normalising each frame, so enable this only to test whether it helps your weak links.
+
+**Privacy profile.** In a private home, `--privacy-profile care-with-consent` (or `RUVIEW_PRIVACY_PROFILE`) keeps per-node amplitudes published when the trust engine demotes one step. The default `private-home` withholds them at `Restricted`.
+
+### Activity recognition with a webcam teacher
+
+A browser webcam can label what you are doing (walking, sitting, squatting, ...) while the node links stream CSI, so a WiFi-only classifier learns your room. Method adapted from [wifi-sensing-kit](https://github.com/andrisgauracs/wifi-sensing-kit) (MIT). Open `/ui/activity.html` (linked as **Activity** in the dashboard tab bar).
+
+1. Click **Start camera**. MediaPipe Pose (pinned `@mediapipe/tasks-vision@0.10.14` from cdn.jsdelivr.net, plus the Google-hosted pose model file) runs in the browser; only the label string is sent to the server, never video or landmarks.
+2. **Record training**, perform each movement in turn, then **Stop recording**. Windows where the camera is unsure are not saved.
+3. Press **Train model** (k-NN, default k=7, fitted on training sessions only).
+4. Later, **Record test** as a *separate* session, then **Evaluate**. Only test-session windows are scored, against a model that never saw them. The result shows accuracy next to the chance baseline (1/classes) and the majority-class baseline, a confusion table, and a leave-one-link-out importance table.
+5. The "WiFi only thinks" panel shows the live prediction smoothed over 3 s.
+
+Features are computed every 0.5 s per link (transmitter to receiver) over the last 1.5 s: gain-normalised mean amplitude shape over the 52 LLTF tones, per-tone std and per-tone mean frame-to-frame change. A session uses the links streaming at 5 frames/s or more when it starts (up to 8); later sessions must use the same links. Sessions are stored as JSONL under `<data-dir>/activity/sessions/` and the model at `<data-dir>/activity/model.json`; both are reloaded at startup.
+
+```bash
+# offline re-score of the saved sessions (reproducer for the dashboard's numbers)
+python3 scripts/eval_activity.py data/activity/sessions --k 7
+```
+
+API (all under the usual bearer gate): `GET /api/v1/activity/status`, `POST .../session/start` (`{"kind":"train"|"test"}`), `POST .../session/stop`, `DELETE .../sessions/{id}`, `POST .../label` (`{"label":"walking"}`), `POST .../train`, `POST .../evaluate`, `GET .../live`.
+
+Accuracy is `MEASURED` only for the room, links and person that recorded the sessions; it says nothing about other rooms, and WiFi sensing is not camera-grade. The wifi-sensing-kit author reports 79.5% over 8 movements in one room (`CLAIMED`, theirs, not reproduced here).
+
+**Where am I? Zone fingerprints with the same tool.** With only a few usable links, the RTI map cannot place a person reliably. The activity teacher accepts any label made of `a-z`, `0-9`, `_` and `-`, so you can teach places instead of movements. No camera is needed. Start a training session, stand or sit in one spot while a loop posts its name, then move to the next spot:
+
+```bash
+H="Authorization: Bearer $RUVIEW_API_TOKEN"; U=http://<server>:<http-port>/api/v1/activity
+curl -s -X POST -H "$H" -H 'Content-Type: application/json' $U/session/start -d '{"kind":"train"}'
+for i in $(seq 240); do   # ~60 s at 4 labels/s; repeat per zone (couch, desk, door, ...)
+  curl -s -X POST -H "$H" -H 'Content-Type: application/json' $U/label -d '{"label":"couch"}' >/dev/null; sleep 0.25
+done
+curl -s -X POST -H "$H" $U/session/stop
+```
+
+Train, then record a separate test session the same way on another day before trusting the numbers. Fingerprints break when furniture or nodes move; re-record after changes.
 
 ### MediaTek Router CSI (Experimental)
 
@@ -443,9 +531,11 @@ cd v2
 cargo run -p wifi-densepose-sensing-server -- \
   --source esp32 \
   --udp-port 5005 \
+  --udp-bind 0.0.0.0 \
+  --udp-allow <node-ip-or-cidr> \
   --http-port 3000 \
   --ws-port 3001 \
-  --ui-path ../../ui
+  --ui-path ../ui
 
 # Docker
 docker run --rm \
@@ -912,11 +1002,7 @@ Presence, motion, person count, zones and the coarse posture label are still ser
 
 ### Matter Bridge (Apple Home / Google Home / Alexa / SmartThings)
 
-```bash
-sensing-server --matter --matter-setup-file /var/run/ruview-matter.txt
-```
-
-Open `/var/run/ruview-matter.txt` for the Matter pairing QR / 11-digit setup code. Scan it from Apple Home / Google Home / your HA Matter integration. RuView appears as a Bridged Device with one occupancy endpoint per node + per zone, plus a momentary switch for fall events.
+Not available yet. The `--matter` and `--matter-setup-file` flags from ADR-115 are defined in the crate's library CLI, but the `sensing-server` binary doesn't accept them (`error: unexpected argument '--matter' found`), so there's no way to start the Matter bridge today. Use the MQTT integration above for Home Assistant in the meantime.
 
 Detailed entity reference, blueprint catalog, troubleshooting recipe matrix: see [`docs/integrations/home-assistant.md`](integrations/home-assistant.md).
 
@@ -1346,8 +1432,11 @@ The Rust sensing server binary accepts the following flags:
 | `--http-port` | `8080` | HTTP port for REST API and UI |
 | `--ws-port` | `8765` | WebSocket port |
 | `--udp-port` | `5005` | UDP port for ESP32 CSI frames |
-| `--ui-path` | (none) | Path to UI static files directory |
-| `--tick-ms` | `50` | Simulated frame interval (milliseconds) |
+| `--udp-bind` | `127.0.0.1` | Address the UDP receiver listens on. Use `0.0.0.0` to receive frames from nodes on your network; that also needs `--udp-allow` or `--udp-insecure-lan` |
+| `--udp-allow` | (none) | Comma-separated IPs/CIDRs allowed to send CSI frames, e.g. `192.168.1.0/24` |
+| `--udp-insecure-lan` | off | Accept frames from any source on a routable bind (the UDP data plane is not authenticated) |
+| `--ui-path` | `../ui` | Path to UI static files directory (falls back to `./ui` or `../../ui` if it doesn't exist) |
+| `--tick-ms` | `100` | Simulated frame interval (milliseconds) |
 | `--benchmark` | off | Run vital sign benchmark (1000 frames) and exit |
 | `--train` | off | Train a model from dataset |
 | `--dataset` | (none) | Path to dataset directory (MM-Fi or Wi-Pose) |
@@ -1363,10 +1452,11 @@ The Rust sensing server binary accepts the following flags:
 
 ```bash
 # Simulated mode with UI (development)
-./target/release/sensing-server --source simulate --http-port 3000 --ws-port 3001 --ui-path ../../ui
+./target/release/sensing-server --source simulate --http-port 3000 --ws-port 3001 --ui-path ../ui
 
 # ESP32 hardware mode
-./target/release/sensing-server --source esp32 --udp-port 5005
+./target/release/sensing-server --source esp32 --udp-port 5005 \
+  --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>
 
 # Windows WiFi RSSI
 ./target/release/sensing-server --source wifi --tick-ms 500
@@ -1711,7 +1801,8 @@ The pipeline runs 10 phases:
 ### Step 3: Use the Trained Model
 
 ```bash
-./target/release/sensing-server --model model.rvf --progressive --source esp32
+./target/release/sensing-server --model model.rvf --progressive --source esp32 \
+  --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>
 ```
 
 Progressive loading enables instant startup (Layer A loads in <5ms with basic inference), with full model loading in the background.
@@ -1911,31 +2002,51 @@ A 3-6 node ESP32-S3 mesh provides full CSI at 20 Hz. Total cost: ~$54 for a 3-no
 
 **Flashing firmware:**
 
-Pre-built binaries are available at [Releases](https://github.com/ruvnet/RuView/releases):
+Use versioned bundles from [Releases](https://github.com/ruvnet/RuView/releases),
+not the historical binaries in `firmware/esp32-csi-node/release_bins/`.
+The 0.8.14 prerelease fixes USB device identity and adds OTA key provisioning.
+It has CI build/host-test coverage; new physical-board qualification remains
+pending. The previous stable firmware is 0.8.8.
 
 | Release | What It Includes | Tag |
 |---------|-----------------|-----|
-| [v0.7.0](https://github.com/ruvnet/RuView/releases/tag/v0.7.0-esp32) | **Latest — ADR-110 firmware-side substrate closed.** Adds ESP-NOW mesh substrate with quantified ≤100 µs alignment (104.1 µs smoothed stdev, 3.95× suppression, 99.56 % cross-board match measured live), 32-byte sync-packet UDP emission with operator-tunable cadence, ADR-018 byte 19 bit 4 wire-fix sourced from working ESP-NOW path, Python SyncPacketParser stub for host wiring ([WITNESS-LOG-110 §A0.7-§A0.13](WITNESS-LOG-110.md)) | `v0.7.0-esp32` |
+| [v0.8.14](https://github.com/ruvnet/RuView/releases/tag/v0.8.14-esp32) | **Prerelease:** corrected C6 base-MAC identity, OTA key provisioning without a host key cache; physical qualification pending | `v0.8.14-esp32` |
+| [v0.8.8](https://github.com/ruvnet/RuView/releases/tag/v0.8.8-esp32) | Previous stable firmware: consistent occupancy and rate-aware C6 processing; see [release evidence](releases/v0.8.8-esp32.md) | `v0.8.8-esp32` |
+| [v0.7.0](https://github.com/ruvnet/RuView/releases/tag/v0.7.0-esp32) | Historical ADR-110 firmware-side substrate: ESP-NOW synchronization and sync-packet UDP emission ([WITNESS-LOG-110 §A0.7-§A0.13](WITNESS-LOG-110.md)) | `v0.7.0-esp32` |
 | [v0.6.9](https://github.com/ruvnet/RuView/releases/tag/v0.6.9-esp32) | Sync-packet UDP emission, `CONFIG_C6_SYNC_EVERY_N_FRAMES` tunable cadence | `v0.6.9-esp32` |
 | [v0.6.8](https://github.com/ruvnet/RuView/releases/tag/v0.6.8-esp32) | ESP-NOW EMA-smoothed cross-board offset (3.95× suppression, 104 µs stdev) | `v0.6.8-esp32` |
 | [v0.6.7](https://github.com/ruvnet/RuView/releases/tag/v0.6.7-esp32) | Real LP-core motion-gate RISC-V program (B4 code path complete) + Wi-Fi 6 soft-AP with TWT Responder for two-board iTWT benches (B1/B2 unblock) | `v0.6.7-esp32` |
-| [v0.5.0](https://github.com/ruvnet/RuView/releases/tag/v0.5.0-esp32) | **Stable (S3 mesh, recommended)** — mmWave sensor fusion (MR60BHA2/LD2410 auto-detect), 48-byte fused vitals, all v0.4.3.1 fixes | `v0.5.0-esp32` |
+| [v0.5.0](https://github.com/ruvnet/RuView/releases/tag/v0.5.0-esp32) | Historical S3 mesh release — mmWave sensor fusion (MR60BHA2/LD2410 auto-detect), 48-byte fused vitals, all v0.4.3.1 fixes | `v0.5.0-esp32` |
 | [v0.4.3.1](https://github.com/ruvnet/RuView/releases/tag/v0.4.3.1-esp32) | Fall detection fix ([#263](https://github.com/ruvnet/RuView/issues/263)), 4MB flash ([#265](https://github.com/ruvnet/RuView/issues/265)), watchdog fix ([#266](https://github.com/ruvnet/RuView/issues/266)) | `v0.4.3.1-esp32` |
 | [v0.4.1](https://github.com/ruvnet/RuView/releases/tag/v0.4.1-esp32) | CSI build fix, compile guard, AMOLED display, edge intelligence ([ADR-057](../docs/adr/ADR-057-firmware-csi-build-guard.md)) | `v0.4.1-esp32` |
 | [v0.3.0-alpha](https://github.com/ruvnet/RuView/releases/tag/v0.3.0-alpha-esp32) | Alpha — adds on-device edge intelligence (ADR-039) | `v0.3.0-alpha-esp32` |
 | [v0.2.0](https://github.com/ruvnet/RuView/releases/tag/v0.2.0-esp32) | Raw CSI streaming, TDM, channel hopping, QUIC mesh | `v0.2.0-esp32` |
 
-> **Important:** Always use **v0.4.3.1 or later**. Earlier versions have false fall detection alerts (v0.4.2 and below) and CSI disabled in the build config (pre-v0.4.1).
+For 0.8.14, select the correct archive, verify its release `SHA256SUMS.txt`,
+extract into a separate directory, then verify the enclosed checksums:
+
+| Archive | Board configuration |
+|---------|---------------------|
+| `esp32-csi-node-firmware-8mb.tar.gz` | ESP32-S3 display build, 8 MB flash |
+| `esp32-csi-node-firmware-4mb.tar.gz` | ESP32-S3 headless build, 4 MB layout |
+| `esp32-csi-node-firmware-c6-4mb.tar.gz` | ESP32-C6 research target, 4 MB layout |
+
+Bare 8 MB DevKitC boards need the source `sdkconfig.defaults.devkitc` overlay;
+do not use the display build. See the [firmware guide](../firmware/esp32-csi-node/README.md#0-download-a-versioned-firmware-bundle)
+for board selection, C6 filenames, backup and OTA guidance.
 
 ```bash
-# Flash an ESP32-S3 with 8MB flash (most boards)
+# From the extracted ESP32-S3 display / 8 MB bundle:
 python -m esptool --chip esp32s3 --port COM7 --baud 460800 \
   write-flash --flash-mode dio --flash-size 8MB --flash-freq 80m \
   0x0 bootloader.bin 0x8000 partition-table.bin \
   0xf000 ota_data_initial.bin 0x20000 esp32-csi-node.bin
 ```
 
-**4MB flash boards** (e.g. ESP32-S3 SuperMini 4MB): download `esp32-csi-node-s3-4mb.bin` + `partition-table-s3-4mb.bin` from the [v0.6.7 release](https://github.com/ruvnet/RuView/releases/tag/v0.6.7-esp32) (882 KB binary, 52 % partition slack) and use `--flash-size 4MB`:
+**4 MB headless S3 boards:** use the matching application and partition table
+from `esp32-csi-node-firmware-4mb.tar.gz` on the
+[0.8.14 prerelease](https://github.com/ruvnet/RuView/releases/tag/v0.8.14-esp32)
+and select `--flash-size 4MB`:
 
 ```bash
 python -m esptool --chip esp32s3 --port COM7 --baud 460800 \
@@ -1952,18 +2063,11 @@ python firmware/esp32-csi-node/provision.py --port COM7 \
 ```
 
 Replace `192.168.1.20` with the IP of the machine running the sensing server.
+To enable authenticated OTA updates, add `--ota-psk-file` with a private
+64-hex key file. The key must be resupplied on later NVS writes; it is never
+cached in host state. See [OTA key provisioning](../firmware/esp32-csi-node/README.md#ota-key-provisioning).
 
-**Mesh key provisioning (secure mode):**
-
-For multistatic mesh deployments with authenticated beacons (ADR-032), provision a shared mesh key:
-
-```bash
-python firmware/esp32-csi-node/provision.py --port COM7 \
-  --ssid "YourWiFi" --password "YourPassword" --target-ip 192.168.1.20 \
-  --mesh-key "$(openssl rand -hex 32)"
-```
-
-All nodes in a mesh must share the same 256-bit mesh key for HMAC-SHA256 beacon authentication. The key is stored in ESP32 NVS flash and zeroed on firmware erase.
+**Mesh key provisioning:** ADR-032 describes giving every node in a multistatic mesh a shared mesh key, but that isn't wired up yet. `provision.py` has no `--mesh-key` option and the firmware doesn't read a mesh key from NVS, so there's nothing to provision for now.
 
 ### ESP32-C6 (Wi-Fi 6 + 802.15.4 research target — ADR-110)
 
@@ -2109,8 +2213,9 @@ Binary size: 990 KB (8MB flash, 52% free) or 773 KB (4MB flash). v0.5.0 adds mmW
 **Start the aggregator:**
 
 ```bash
-# From source
-./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
+# From source (--udp-bind/--udp-allow let it hear nodes on your network)
+./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001 \
+  --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>
 
 # Docker (see "Receiving ESP32 frames in Docker" for the UDP source guard)
 docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
@@ -2378,19 +2483,19 @@ WiFi sensing can monitor health metrics without any wearable or camera:
 
 ```bash
 # Sleep quality monitoring (run overnight)
-node scripts/sleep-monitor.js --port 5006 --bind 192.168.1.20
+node scripts/sleep-monitor.js --port 5006
 
 # Breathing disorder pre-screening
-node scripts/apnea-detector.js --port 5006 --bind 192.168.1.20
+node scripts/apnea-detector.js --port 5006
 
 # Stress detection via heart rate variability
-node scripts/stress-monitor.js --port 5006 --bind 192.168.1.20
+node scripts/stress-monitor.js --port 5006
 
 # Walking analysis + tremor detection
-node scripts/gait-analyzer.js --port 5006 --bind 192.168.1.20
+node scripts/gait-analyzer.js --port 5006
 
-# Replay on recorded data (no live hardware needed)
-node scripts/sleep-monitor.js --replay data/recordings/*.csi.jsonl
+# Replay one recording (no live hardware needed)
+node scripts/sleep-monitor.js --replay data/recordings/<recording>.csi.jsonl
 ```
 
 > **Note:** These are pre-screening tools, not medical devices. Consult a healthcare professional for diagnosis.
@@ -2837,7 +2942,8 @@ The server applies a 3-stage smoothing pipeline (ADR-048). If readings are still
 
 - Verify the sensing server is running: `curl http://localhost:3000/health`
 - Access Observatory via the server URL: `http://localhost:3000/ui/observatory.html` (not a file:// URL)
-- If a standalone `aggregator` command is already listening on UDP `:5005`, stop it and run `sensing-server --source esp32 --udp-port 5005` instead; the Observatory reads the server WebSocket, not the standalone aggregator output
+- If a standalone `aggregator` command is already listening on UDP `:5005`, stop it and run `sensing-server --source esp32 --udp-port 5005 --udp-bind 0.0.0.0 --udp-allow <node-ip-or-cidr>` instead; the Observatory reads the server WebSocket, not the standalone aggregator output
+- On a native run, make sure the server was started with `--udp-bind 0.0.0.0` and `--udp-allow` (or `--udp-insecure-lan`). It listens on `127.0.0.1` by default, so frames from your nodes never reach it otherwise
 - Verify the ESP32 nodes are provisioned to the IP address of the machine running `sensing-server`
 - Hard refresh with Ctrl+Shift+R to clear cached settings
 - The auto-detect probes `/health` on the same origin — cross-origin won't work
