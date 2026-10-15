@@ -405,6 +405,158 @@ fn synthetic_report() {
     }
 }
 
+/// Frames per phase of the occupancy-latch scenario (10 Hz).
+const LATCH_WALK_IN: usize = 100; // 10 s
+const LATCH_SIT: usize = 6000; // 10 min
+const LATCH_GONE: usize = 6000; // 10 min
+
+/// One latch trial: calibrate, walk in, sit still 10 min, leave for 10 min,
+/// then 10 min of an empty room after environment drift. Returns, per hold:
+/// (fraction of the sitting phase reported present without the latch, with
+/// it, seconds until release after leaving, fraction of the drifted empty
+/// phase held occupied).
+fn run_latch_trial(seed: u64, holds_s: &[u64]) -> Vec<(f64, f64, Option<f64>, f64)> {
+    let mut rng = Rng::new(seed);
+    let mut sims: Vec<LinkSim> = Vec::new();
+    for tx in 0..4 {
+        for rx in 0..4 {
+            if tx != rx {
+                sims.push(LinkSim::new(tx, rx, &mut rng));
+            }
+        }
+    }
+    // A running clock at the 10 Hz frame rate, so link freshness and
+    // delivery rate behave as on the real mesh.
+    let start = std::time::Instant::now();
+    let mut frame = 0u64;
+    let mut tick = || {
+        frame += 1;
+        start + std::time::Duration::from_millis(100 * frame)
+    };
+    let mut links: HashMap<(u8, u8), PeerLinkState> = HashMap::new();
+    for s in &sims {
+        links.insert((s.tx, s.rx), PeerLinkState::new(start));
+    }
+    for l in links.values_mut() {
+        l.begin_calibration();
+    }
+    for _ in 0..CAL_FRAMES {
+        let t = tick();
+        for s in sims.iter_mut() {
+            let amps = s.frame(Scene::Empty, &mut rng);
+            links.get_mut(&(s.tx, s.rx)).unwrap().observe(&frame_with(amps), t);
+        }
+    }
+    let keys: Vec<(u8, u8)> = links.keys().copied().collect();
+    for k in keys {
+        links.get_mut(&k).unwrap().finish_calibration(k.0, k.1);
+    }
+    let pos = [rng.range(0.5, 3.5), rng.range(0.5, 3.5)];
+    for s in sims.iter_mut() {
+        s.place_person(pos);
+    }
+
+    let mut latches: Vec<occupancy_latch::OccupancyLatch> = holds_s
+        .iter()
+        .map(|&h| occupancy_latch::OccupancyLatch::new(std::time::Duration::from_secs(h)))
+        .collect();
+    let mut sit_raw = 0usize;
+    let mut sit_held = vec![0usize; holds_s.len()];
+    let mut release: Vec<Option<usize>> = vec![None; holds_s.len()];
+    let mut aged_held = vec![0usize; holds_s.len()];
+    let plan = [
+        (Scene::Moving, LATCH_WALK_IN, false),
+        (Scene::StillBreathing, LATCH_SIT, false),
+        (Scene::Empty, LATCH_GONE, false),
+        (Scene::Empty, LATCH_GONE, true),
+    ];
+    for (phase, (scene, n, aged)) in plan.into_iter().enumerate() {
+        if aged {
+            for s in sims.iter_mut() {
+                s.age(&mut rng);
+            }
+        }
+        for i in 0..n {
+            let t = tick();
+            for s in sims.iter_mut() {
+                let amps = s.frame(scene, &mut rng);
+                links.get_mut(&(s.tx, s.rx)).unwrap().observe(&frame_with(amps), t);
+            }
+            let ev = peer_room_evidence(&links, t);
+            if phase == 1 && (ev.motion || ev.still_room) {
+                sit_raw += 1;
+            }
+            for (j, l) in latches.iter_mut().enumerate() {
+                let held = l.observe(ev, t);
+                match phase {
+                    1 => sit_held[j] += usize::from(held),
+                    2 if !held && release[j].is_none() => release[j] = Some(i),
+                    2 if held => release[j] = None,
+                    3 => aged_held[j] += usize::from(held),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (0..holds_s.len())
+        .map(|j| {
+            (
+                sit_raw as f64 / LATCH_SIT as f64,
+                sit_held[j] as f64 / LATCH_SIT as f64,
+                release[j].map(|f| f as f64 / 10.0),
+                aged_held[j] as f64 / LATCH_GONE as f64,
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "SYNTHETIC occupancy-latch report; run with --ignored --nocapture"]
+fn synthetic_latch_report() {
+    let trials: usize =
+        std::env::var("PRESENCE_EVAL_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let mode = std::env::var("PRESENCE_EVAL_MODE").unwrap_or_else(|_| "advisory".into());
+    presence_features::set_mode(presence_features::Mode::parse(&mode).unwrap());
+    let holds = [60u64, 180, 300];
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).min(8);
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let seed = next.fetch_add(1, Ordering::Relaxed);
+                if seed >= trials as u64 {
+                    break;
+                }
+                let r = run_latch_trial(2000 + seed, &holds);
+                results.lock().unwrap().push(r);
+            });
+        }
+    });
+    let results = results.into_inner().unwrap();
+    println!("\nSYNTHETIC occupancy latch: {trials} trials, mode {mode}. Walk in 10 s, sit still 10 min,");
+    println!("leave for 10 min, then 10 min empty after environment drift. NOT hardware data.");
+    let raw: f64 = results.iter().map(|r| r[0].0).sum::<f64>() / results.len() as f64;
+    println!("  sitting, reported present without latch (room motion or still vote): {:5.1}%", 100.0 * raw);
+    for (j, h) in holds.iter().enumerate() {
+        let n = results.len() as f64;
+        let held: f64 = results.iter().map(|r| r[j].1).sum::<f64>() / n;
+        let rel: Vec<f64> = results.iter().filter_map(|r| r[j].2).collect();
+        let never = results.iter().filter(|r| r[j].2.is_none()).count();
+        let mean_rel = rel.iter().sum::<f64>() / rel.len().max(1) as f64;
+        let aged: f64 = results.iter().map(|r| r[j].3).sum::<f64>() / n;
+        let aged_any = results.iter().filter(|r| r[j].3 > 0.0).count();
+        println!(
+            "  hold {h:>3} s: sitting held {:5.1}% | release after leaving mean {:6.1} s (never released in {never}/{}) | drifted empty held {:5.1}% (any in {aged_any}/{})",
+            100.0 * held,
+            mean_rel,
+            results.len(),
+            100.0 * aged,
+            results.len()
+        );
+    }
+}
+
 #[test]
 fn smoke_one_trial_runs_and_empty_room_is_quiet_for_the_new_vote() {
     presence_features::set_mode(presence_features::Mode::Advisory);

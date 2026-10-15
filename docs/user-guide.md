@@ -462,6 +462,20 @@ scripts/ota_update_nodes.sh build/esp32-csi-node.bin 192.168.1.71 192.168.1.72
 
 Each node reboots into the other slot and must pass its health check, or the bootloader rolls back. Uploads without the key are rejected (HTTP 403).
 
+**Still people: extra cues and an occupancy hold.** Motion detectors lose a person who sits still. Two server options help, and both are off or advisory by default:
+
+- `--peer-presence-mode advisory|active|off` (default `advisory`) adds per-link still-person cues: stable-tone selection, moving variance, baseline shift and a breathing cue. They are trained by the same empty-room calibration. In `advisory` mode they appear under `room.advisory` only; `active` also merges them into `room.presence` / `room.still_presence`.
+- `--occupancy-hold-secs <s>` (or `SENSING_OCCUPANCY_HOLD_SECS`, default 0 = off) keeps the room occupied after someone walks in. Each piece of still-body evidence restarts the hold time, and the room is released only after `<s>` seconds with no evidence. While held, the room reports `present_still` instead of `absent`. `GET /api/v1/peer-links` shows the state under `room.occupancy`. One link's still cue can only keep an occupancy, never start one. With `advisory` mode, only the channel-shape wander keeps it.
+
+```bash
+sensing-server ... --occupancy-hold-secs 300          # hold 5 min after the last evidence
+sensing-server ... --occupancy-hold-secs 300 --peer-presence-mode active
+```
+
+The cost is a tail: after you leave, the room stays occupied for up to the hold time. Pick the shortest hold that covers how long you sit without moving, and verify it with labelled periods (`eval_peer_links.py`). Evaluation of these options so far is SYNTHETIC only.
+
+**Optional receiver gain lock (firmware).** `CONFIG_CSI_GAIN_LOCK=y` (ESP32-S3, off by default) holds the receiver's AGC/FFT gain at its median after a short warm-up, so amplitudes stay comparable between frames. Locked frames carry ADR-018 byte 19 bit 7. The server already cancels gain steps by normalising each frame, so enable this only to test whether it helps your weak links.
+
 **Privacy profile.** In a private home, `--privacy-profile care-with-consent` (or `RUVIEW_PRIVACY_PROFILE`) keeps per-node amplitudes published when the trust engine demotes one step. The default `private-home` withholds them at `Restricted`.
 
 ### Activity recognition with a webcam teacher
@@ -484,6 +498,19 @@ python3 scripts/eval_activity.py data/activity/sessions --k 7
 API (all under the usual bearer gate): `GET /api/v1/activity/status`, `POST .../session/start` (`{"kind":"train"|"test"}`), `POST .../session/stop`, `DELETE .../sessions/{id}`, `POST .../label` (`{"label":"walking"}`), `POST .../train`, `POST .../evaluate`, `GET .../live`.
 
 Accuracy is `MEASURED` only for the room, links and person that recorded the sessions; it says nothing about other rooms, and WiFi sensing is not camera-grade. The wifi-sensing-kit author reports 79.5% over 8 movements in one room (`CLAIMED`, theirs, not reproduced here).
+
+**Where am I? Zone fingerprints with the same tool.** With only a few usable links, the RTI map cannot place a person reliably. The activity teacher accepts any label made of `a-z`, `0-9`, `_` and `-`, so you can teach places instead of movements. No camera is needed. Start a training session, stand or sit in one spot while a loop posts its name, then move to the next spot:
+
+```bash
+H="Authorization: Bearer $RUVIEW_API_TOKEN"; U=http://<server>:<http-port>/api/v1/activity
+curl -s -X POST -H "$H" -H 'Content-Type: application/json' $U/session/start -d '{"kind":"train"}'
+for i in $(seq 240); do   # ~60 s at 4 labels/s; repeat per zone (couch, desk, door, ...)
+  curl -s -X POST -H "$H" -H 'Content-Type: application/json' $U/label -d '{"label":"couch"}' >/dev/null; sleep 0.25
+done
+curl -s -X POST -H "$H" $U/session/stop
+```
+
+Train, then record a separate test session the same way on another day before trusting the numbers. Fingerprints break when furniture or nodes move; re-record after changes.
 
 ### MediaTek Router CSI (Experimental)
 

@@ -16,6 +16,7 @@ mod engine_bridge;
 mod presence_fsm;
 mod link_subspace;
 mod presence_features;
+mod occupancy_latch;
 #[cfg(test)]
 mod presence_eval;
 mod link_map;
@@ -325,6 +326,12 @@ struct Args {
     /// `active` (also merged into room.presence / room.still_presence).
     #[arg(long, env = "SENSING_PEER_PRESENCE_MODE", default_value = "advisory")]
     peer_presence_mode: String,
+
+    /// Hold room occupancy this many seconds after the last peer-link motion
+    /// or still-body evidence, so a person sitting still is not reported as
+    /// absent between weak cues. 0 disables (default). See occupancy_latch.rs.
+    #[arg(long, env = "SENSING_OCCUPANCY_HOLD_SECS", default_value_t = 0)]
+    occupancy_hold_secs: u64,
 
     // ---------------------------------------------------------------
     // ADR-102: Edge Module Registry — surface the canonical Cognitum
@@ -2256,6 +2263,8 @@ struct AppStateInner {
     node_states: HashMap<u8, NodeState>,
     /// Node-to-node sensing links keyed by (tx node, rx node).
     peer_links: HashMap<(u8, u8), PeerLinkState>,
+    /// Room occupancy latch over the peer-link mesh (`--occupancy-hold-secs`).
+    occupancy_latch: occupancy_latch::OccupancyLatch,
     /// Webcam-supervised activity recognition (sessions, k-NN model).
     pub(crate) activity: activity::ActivityEngine,
     /// Persisted empty-room calibration, applied to links as they appear.
@@ -3160,6 +3169,7 @@ impl AppStateInner {
             adaptive_model: None,
             node_states: HashMap::new(),
             peer_links: HashMap::new(),
+            occupancy_latch: occupancy_latch::OccupancyLatch::new(Duration::ZERO),
             activity: activity::ActivityEngine::default(),
             peer_calibration: HashMap::new(),
             room_debounced_level: "absent".to_string(),
@@ -3986,13 +3996,18 @@ impl PeerLinkState {
         }
     }
 
-    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
+    /// Mean delivered frame rate since the link appeared.
+    fn rate_hz(&self) -> f64 {
         let span = self.last_seen.duration_since(self.first_seen).as_secs_f64();
+        if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 }
+    }
+
+    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
         serde_json::json!({
             "tx": tx,
             "rx": rx,
             "frames": self.frames,
-            "rate_hz": if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 },
+            "rate_hz": self.rate_hz(),
             "rssi_dbm": self.rssi_dbm,
             "subcarrier_count": self.n_subcarriers,
             "motion_score": self.motion_score(),
@@ -4017,7 +4032,9 @@ async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_jso
     let mut keys: Vec<_> = s.peer_links.keys().copied().collect();
     keys.sort_unstable();
     let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
-    Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+    let mut room = peer_room_summary(&s.peer_links, now);
+    room["occupancy"] = serde_json::json!(s.occupancy_latch.status(now));
+    Json(serde_json::json!({ "links": links, "room": room }))
 }
 
 /// One link's persisted empty-room calibration.
@@ -4198,6 +4215,55 @@ fn peer_guard_room_inference(
         classification: "absent".to_string(),
         confidence: (1.0 - perturbed_fraction.max(wandering_fraction)).clamp(0.0, 1.0),
         contributing_nodes: raw.contributing_nodes,
+    }
+}
+
+/// Confidence reported for a room held occupied only by the latch.
+const OCCUPANCY_LATCH_CONFIDENCE: f64 = 0.5;
+/// A single link may keep the latch only if it delivers at least this many
+/// frames/s. Starved links (0.01-0.3 Hz on the real mesh) compute wander
+/// over minutes-old frames and crossed the threshold in an empty room.
+const PEER_LATCH_MIN_RATE_HZ: f64 = 2.0;
+
+/// Evidence the occupancy latch sees: the room votes below, plus whether any
+/// single fresh link shows a still-body or breathing cue.
+fn peer_room_evidence(
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> occupancy_latch::Evidence {
+    let room = peer_room_summary(links, now);
+    let still_any_link = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .filter(|l| l.rate_hz() >= PEER_LATCH_MIN_RATE_HZ)
+        .any(|l| {
+            let v = l.features.verdict();
+            l.subspace.wander().is_some_and(|w| w >= PEER_WANDER_THRESHOLD)
+                // The advisory still/breathing cues drift into false alarms
+                // hours after calibration (SYNTHETIC eval), so they may only
+                // hold occupancy once the operator opted into active mode.
+                || (presence_features::mode() == presence_features::Mode::Active
+                    && (v.still || v.breathing))
+        });
+    occupancy_latch::Evidence {
+        motion: room["presence"].as_bool().unwrap_or(false),
+        still_room: room["still_presence"].as_bool().unwrap_or(false),
+        still_any_link,
+    }
+}
+
+/// A room the latch holds occupied is never reported absent: the person is
+/// assumed to be there and still. Unavailable (no fresh nodes) stays as is,
+/// so an outage is not reported as occupancy either.
+fn apply_occupancy_latch(room: RoomInference, held: bool) -> RoomInference {
+    if held && room.classification == "absent" {
+        RoomInference {
+            classification: "present_still".to_string(),
+            confidence: OCCUPANCY_LATCH_CONFIDENCE,
+            contributing_nodes: room.contributing_nodes,
+        }
+    } else {
+        room
     }
 }
 
@@ -4531,6 +4597,52 @@ mod peer_link_fusion_tests {
         }
         links.insert((1, 2), active);
         assert_eq!(peer_guard_room_inference(&raw, &links, now), raw);
+    }
+
+    #[test]
+    fn latch_turns_a_vetoed_still_person_back_into_presence() {
+        // Someone walked in (motion on 1 of 4 links), then sat still: the
+        // calibrated mesh looks empty and vetoes the weak raw presence. Links
+        // are judged fresh against the real clock; the latch gets simulated
+        // times minutes apart.
+        let fresh = std::time::Instant::now;
+        let t0 = std::time::Instant::now();
+        let mut latch = occupancy_latch::OccupancyLatch::new(Duration::from_secs(300));
+        let mut moving = empty_peer_mesh(4);
+        let mut active = empty_room_link();
+        for _ in 0..10 {
+            active.fsm.update(0.30);
+        }
+        moving.insert((1, 2), active);
+        assert!(latch.observe(peer_room_evidence(&moving, fresh()), t0));
+
+        let still = empty_peer_mesh(4);
+        let later = t0 + Duration::from_secs(60);
+        let raw = RoomInference {
+            classification: "present_still".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        let guarded = peer_guard_room_inference(&raw, &still, fresh());
+        assert_eq!(guarded.classification, "absent", "the guard alone would drop the person");
+        let held = latch.observe(peer_room_evidence(&still, fresh()), later);
+        let room = apply_occupancy_latch(guarded, held);
+        assert_eq!(room.classification, "present_still");
+
+        let gone = t0 + Duration::from_secs(301);
+        let held = latch.observe(peer_room_evidence(&still, fresh()), gone);
+        let raw_gone = RoomInference { classification: "absent".to_string(), ..raw };
+        assert_eq!(apply_occupancy_latch(raw_gone, held).classification, "absent");
+    }
+
+    #[test]
+    fn latch_never_reports_an_outage_as_occupancy() {
+        let unavailable = RoomInference {
+            classification: "unavailable".to_string(),
+            confidence: 0.0,
+            contributing_nodes: 0,
+        };
+        assert_eq!(apply_occupancy_latch(unavailable.clone(), true), unavailable);
     }
 }
 
@@ -13539,6 +13651,9 @@ async fn udp_receiver_task(
                     );
                     let room_inference =
                         peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
+                    let evidence = peer_room_evidence(&s.peer_links, now);
+                    let held = s.occupancy_latch.observe(evidence, now);
+                    let room_inference = apply_occupancy_latch(room_inference, held);
 
                     let features = FeatureInfo {
                         mean_rssi: mean_rssi_dbm,
@@ -14082,6 +14197,9 @@ async fn udp_receiver_task(
                     );
                     let room_inference =
                         peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
+                    let evidence = peer_room_evidence(&s.peer_links, now);
+                    let held = s.occupancy_latch.observe(evidence, now);
+                    let room_inference = apply_occupancy_latch(room_inference, held);
                     let room_classification = if bootstrap_empty {
                         ClassificationInfo {
                             motion_level: "absent".to_string(),
@@ -15710,6 +15828,7 @@ async fn main() {
             }),
         node_states: HashMap::new(),
         peer_links: HashMap::new(),
+        occupancy_latch: occupancy_latch::OccupancyLatch::new(Duration::from_secs(args.occupancy_hold_secs)),
         activity: activity::ActivityEngine::load(&args.data_dir),
         peer_calibration: load_peer_calibration(&args.data_dir),
         room_debounced_level: "absent".to_string(),
