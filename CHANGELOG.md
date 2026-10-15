@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Peer-link sensing, LLTF grid, adaptive detection, OTA (fork: RuView-enhance)
+
+Hardware figures are MEASURED on 4x ESP32-S3 (2x 4 MB, 2x 16 MB) with a Raspberry Pi 5 server, unless marked otherwise. Detection thresholds are starting values until empty-vs-occupied data exists.
+
+- **Server stability.** Recording frame counts are streamed in 64 KiB chunks instead of loading the whole file (an 11.9 GB recording OOM-killed a Pi 5). Recordings are capped at 2 GiB, and a self-stopped recording clears its state.
+- **52-tone LLTF grid.** ESP32 HT/legacy frames are reduced to the 52 LLTF tones. The layout (with or without a secondary channel) is detected per frame, so HT20, HT40 and STBC nodes share one grid (layout table from esp-radar, Apache-2.0).
+- **Node-to-node links.** Firmware broadcasts a 10 Hz peer beacon staggered by TDM slot and tags CSI measured on peers (byte-19 bit 6 + trailing tx node id; backward compatible). The server keeps 12 per-(tx,rx) streams: `GET /api/v1/peer-links`.
+- **Adaptive detection.** Each link has a port of Espressif's esp_wifi_sensing state machine (`presence_fsm.rs`, Apache-2.0), a gain-invariant motion score, and clean-room channel-shape jitter/wander against empty-room templates (`link_subspace.rs`). There is a room-level vote for presence and still presence.
+- **Persistent empty-room calibration.** `POST /api/v1/peer-links/calibrate/{start,stop}` is saved to `<data-dir>/peer_link_calibration.json` and survives restarts. A >6 dB RSSI shift flags the link for recalibration (moved node).
+- **Firmware.** The edge DSP gets one transmitter and one 64-bin grid (rate 9 -> 15 Hz). Presence calibration is rolling instead of a one-shot at boot. AP-path CSI comes only from the associated AP's BSSID.
+- **OTA for installed nodes.** `provision.py --ota-psk`, bootloader rollback in the 4 MB build, and `scripts/ota_update_nodes.sh` (health-confirmed, one node at a time). An unauthenticated upload is rejected (403).
+- **API and UI.** Per-node subcarrier count is always exposed; amplitudes respect the ADR-141 gate. `--privacy-profile` / `RUVIEW_PRIVACY_PROFILE` selects the trust-engine base profile (default unchanged). The dashboard has a live sensing panel and a node-to-node link matrix.
+- **Tooling.** `scripts/eval_peer_links.py` sweeps detection and false-alarm rates over labelled empty/occupied periods.
+
 ### Community batch (PRs #2100-#2157 by aepod, reviewed and integrated)
 
 Integrated as one set: conflicts resolved, review findings fixed, validated on the integrated branch. Hardware figures cited by the PRs are the author's own live runs on ESP32-S3 nodes and were not independently reproduced here.

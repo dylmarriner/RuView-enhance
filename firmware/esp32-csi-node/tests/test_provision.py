@@ -61,3 +61,18 @@ class ProvisionConfigValueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_ota_psk_written_to_security_namespace():
+    """ADR-050: the OTA server reads security/ota_psk; provisioning must write it there."""
+    import argparse
+    import csv
+    import io
+    import provision
+
+    args = argparse.Namespace(**{name: None for name in provision.MERGEABLE_ATTRS})
+    args.ssid, args.password, args.node_id = "net", "password123", 4
+    args.ota_psk = "a" * 64
+    rows = list(csv.reader(io.StringIO(provision.build_nvs_csv(args))))
+    i = rows.index(["security", "namespace", "", ""])
+    assert rows[i + 1] == ["ota_psk", "data", "string", "a" * 64]

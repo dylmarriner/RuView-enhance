@@ -31,3 +31,8 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # ADR-081: adaptive_controller runs emit_feature_state + stream_sender
 # network I/O inside Timer Svc callbacks, exceeding the 2 KiB default.
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
+
+# Safe OTA for installed nodes: an image that fails its health check rolls
+# back to the previous slot (ota_health.c). Bootloader-level, so it must be
+# flashed over USB once; it cannot be added later over the air.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

@@ -3,6 +3,7 @@
 import { healthService } from '../services/health.service.js';
 import { poseService } from '../services/pose.service.js';
 import { sensingService } from '../services/sensing.service.js';
+import { apiService } from '../services/api.service.js';
 
 export class DashboardTab {
   static STREAM_HEALTH_REFRESH_DELAY_MS = 500;
@@ -78,6 +79,8 @@ export class DashboardTab {
     });
     // Mark the panel stale when frames stop arriving
     this._freshnessInterval = setInterval(() => this.updateFreshness(), 1000);
+    // Node-to-node link matrix (GET /api/v1/peer-links)
+    this._linksInterval = setInterval(() => this.updatePeerLinks(), 1000);
     // Initial update
     this.updateDataSourceIndicator();
 
@@ -215,6 +218,44 @@ export class DashboardTab {
       i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
     });
     ctx.stroke();
+  }
+
+  // Render tx -> rx links as a matrix: cell shade = activity above baseline.
+  async updatePeerLinks() {
+    let data;
+    try {
+      data = await apiService.get('/api/v1/peer-links');
+    } catch {
+      return; // older server without peer links
+    }
+    const links = data?.links || [];
+    const room = data?.room || {};
+    const table = this.container.querySelector('#lsLinkMatrix');
+    if (!table || links.length === 0) return;
+
+    const ids = [...new Set(links.flatMap(l => [l.tx, l.rx]))].sort((a, b) => a - b);
+    const byKey = new Map(links.map(l => [`${l.tx}-${l.rx}`, l]));
+    table.textContent = '';
+    const head = table.insertRow();
+    head.appendChild(document.createElement('th')).textContent = 'tx \\ rx';
+    ids.forEach(id => { head.appendChild(document.createElement('th')).textContent = id; });
+    for (const tx of ids) {
+      const row = table.insertRow();
+      row.appendChild(document.createElement('th')).textContent = tx;
+      for (const rx of ids) {
+        const cell = row.insertCell();
+        const l = byKey.get(`${tx}-${rx}`);
+        if (tx === rx || !l) { cell.className = 'ls-cell-none'; continue; }
+        const excess = Math.max(0, l.excess ?? 0);
+        cell.className = l.active ? 'ls-cell-active' : (l.stage === 'stable' ? 'ls-cell-quiet' : 'ls-cell-learning');
+        cell.style.setProperty('--level', Math.min(1, excess).toFixed(2));
+        cell.textContent = l.stage === 'stable' ? `${Math.round(l.rate_hz)}Hz` : 'learning';
+        cell.title = `${tx}→${rx}: ${l.rssi_dbm.toFixed(0)} dBm, ${l.rate_hz.toFixed(1)} Hz, excess ${(l.excess ?? 0).toFixed(2)}, ${l.stage}`;
+      }
+    }
+    this.setText('lsLinksSummary',
+      `${room.perturbed_links ?? 0}/${room.calibrated_links ?? 0} links active · ` +
+      (room.presence ? 'presence' : 'quiet'));
   }
 
   setText(id, text) {
@@ -543,6 +584,7 @@ export class DashboardTab {
       clearInterval(this.statsInterval);
     }
     if (this._freshnessInterval) clearInterval(this._freshnessInterval);
+    if (this._linksInterval) clearInterval(this._linksInterval);
 
     healthService.stopHealthMonitoring();
   }

@@ -13,6 +13,9 @@ mod adaptive_classifier;
 pub mod cli;
 pub mod csi;
 mod engine_bridge;
+mod presence_fsm;
+mod link_subspace;
+mod link_map;
 mod field_bridge;
 mod field_localize;
 mod model_format;
@@ -215,6 +218,14 @@ struct Args {
     #[arg(long, env = "RUVIEW_PRIVACY_MODE", value_parser = cli::parse_env_bool)]
     privacy_mode: bool,
 
+    /// Base ADR-141 privacy profile for the trust engine: private-home
+    /// (default, Anonymous), care-with-consent (Derived), enterprise-anonymous,
+    /// strict-no-identity (Restricted). A quality contradiction demotes one step;
+    /// per-node raw amplitudes are withheld only at Restricted.
+    #[arg(long, env = "RUVIEW_PRIVACY_PROFILE", default_value = "private-home",
+          value_parser = parse_privacy_profile)]
+    privacy_profile: wifi_densepose_bfld::PrivacyMode,
+
     /// MQTT publisher (HA auto-discovery) flags (ADR-115).
     /// Flattened so `--mqtt*` reach the binary's parser and the publisher
     /// in `mqtt::` is actually started (fixes #872). Uses the *lib* crate's
@@ -376,6 +387,9 @@ struct Esp32Frame {
     /// ADR-110 byte 19 metadata, including whether this frame was captured
     /// while the node had a valid IEEE 802.15.4 mesh-time solution.
     adr018_flags: wifi_densepose_hardware::Adr018Flags,
+    /// Peer-link CSI: the transmitting node, when byte-19 bit 6 is set and a
+    /// trailing tx node_id byte follows the I/Q data. `None` = AP/router frame.
+    peer_tx: Option<u8>,
     amplitudes: Vec<f64>,
     phases: Vec<f64>,
 }
@@ -1164,6 +1178,24 @@ struct BoundingBox {
 /// Per-node sensing state for multi-node deployments (issue #249).
 /// Each ESP32 node gets its own frame history, smoothing buffers, and vital
 /// sign detector so that data from different nodes is never mixed.
+/// Last CSI frame's amplitudes for a node, as exposed on `nodes[].amplitude`
+/// (empty when raw outputs are suppressed or no CSI frame has arrived).
+fn node_raw_amplitude(n: &NodeState, suppress_raw: bool) -> Vec<f64> {
+    if suppress_raw {
+        return vec![];
+    }
+    n.frame_history
+        .back()
+        .map(|a| a.iter().take(adaptive_classifier::RECORDED_AMPLITUDE_LEN).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Tone count of the node's last CSI frame. Grid metadata, not signal, so it
+/// stays visible even when the ADR-141 gate withholds the amplitudes.
+fn node_subcarrier_count(n: &NodeState) -> usize {
+    n.frame_history.back().map_or(0, |a| a.len())
+}
+
 struct NodeState {
     pub(crate) frame_history: VecDeque<Vec<f64>>,
     smoothed_person_score: f64,
@@ -2196,6 +2228,10 @@ struct AppStateInner {
     /// Per-node sensing state for multi-node deployments.
     /// Keyed by `node_id` from the ESP32 frame header.
     node_states: HashMap<u8, NodeState>,
+    /// Node-to-node sensing links keyed by (tx node, rx node).
+    peer_links: HashMap<(u8, u8), PeerLinkState>,
+    /// Persisted empty-room calibration, applied to links as they appear.
+    peer_calibration: HashMap<(u8, u8), CalibratedLink>,
     /// Debounced room-level classification state — see
     /// `debounce_room_classification`. `fuse_room` is a fresh, memoryless
     /// plurality vote every cycle with no debounce of its own (unlike each
@@ -3084,6 +3120,8 @@ impl AppStateInner {
             training_progress_tx: broadcast::channel::<String>(256).0,
             adaptive_model: None,
             node_states: HashMap::new(),
+            peer_links: HashMap::new(),
+            peer_calibration: HashMap::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
             room_debounce_since: None,
@@ -3718,6 +3756,447 @@ mod issue_928_magic_collision_tests {
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
 
+/// Byte-19 bit 6 (firmware `CSI_FLAG_PEER_TX`): CSI measured on a peer
+/// node's beacon; the tx node_id trails the I/Q data.
+const ESP32_FLAG_PEER_TX: u8 = 1 << 6;
+
+/// Frames kept per peer link for the motion statistic (~5 s at 10 Hz).
+const PEER_LINK_WINDOW: usize = 50;
+/// Room presence needs at least this fraction of fresh links perturbed.
+const PEER_PRESENCE_FRACTION: f64 = 0.25;
+/// A link's channel shape counts as changed beyond this wander (1 - best
+/// template similarity).
+// ponytail: starting value; set from empty-vs-occupied wander distributions.
+const PEER_WANDER_THRESHOLD: f64 = 0.15;
+/// RSSI shift (dB) from the calibration value that flags a moved node.
+const PEER_RELOCATION_DB: f64 = 6.0;
+/// File (under --data-dir) holding the persisted empty-room calibration.
+const PEER_CALIBRATION_FILE: &str = "peer_link_calibration.json";
+/// A link with no frame for this long is ignored.
+const PEER_LINK_FRESH_MS: u128 = 3000;
+/// Minimum independent, stable peer links required before the calibrated mesh
+/// is allowed to contradict the raw per-node room vote.
+const PEER_ABSENCE_MIN_STABLE_LINKS: usize = 4;
+/// Never let the mesh absence guard suppress a strong raw presence signal.
+/// The guard exists to reject marginal activity-energy false positives after
+/// an explicit empty-room calibration, not to overrule decisive detections.
+const PEER_ABSENCE_MAX_RAW_CONFIDENCE: f64 = 0.65;
+
+/// Rolling state for one node-to-node link.
+struct PeerLinkState {
+    first_seen: std::time::Instant,
+    last_seen: std::time::Instant,
+    frames: u64,
+    rssi_dbm: f64,
+    n_subcarriers: u16,
+    /// Gain-normalised LLTF amplitudes per frame (each divided by its own
+    /// mean). Receiver AGC steps scale every tone equally and cancel out; a
+    /// body reshaping the multipath does not.
+    normalized: VecDeque<Vec<f64>>,
+    /// Espressif-style adaptive detector fed with `motion_score` (ADR: Phase 1 #3).
+    fsm: presence_fsm::PresenceFsm,
+    /// Channel-shape jitter/wander against empty-room templates.
+    subspace: link_subspace::LinkSubspace,
+    /// Link RSSI when the empty-room calibration was taken.
+    calibration_rssi: Option<f64>,
+}
+
+impl PeerLinkState {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            first_seen: now,
+            last_seen: now,
+            frames: 0,
+            rssi_dbm: 0.0,
+            n_subcarriers: 0,
+            normalized: VecDeque::with_capacity(PEER_LINK_WINDOW),
+            fsm: presence_fsm::PresenceFsm::default(),
+            subspace: link_subspace::LinkSubspace::default(),
+            calibration_rssi: None,
+        }
+    }
+
+    /// New link state, seeded from a persisted empty-room calibration.
+    fn restored(now: std::time::Instant, saved: Option<&CalibratedLink>) -> Self {
+        let mut l = Self::new(now);
+        if let Some(c) = saved {
+            if let Some(b) = c.baseline {
+                l.fsm = presence_fsm::PresenceFsm::with_baseline(b);
+            }
+            l.subspace.set_templates(&c.templates);
+            l.calibration_rssi = Some(c.rssi_dbm);
+        }
+        l
+    }
+
+    /// The link's RSSI moved far from its calibration value: a node was
+    /// probably moved, so the empty-room calibration no longer applies.
+    fn recalibration_recommended(&self) -> bool {
+        self.frames > 0
+            && self.calibration_rssi.is_some_and(|c| (self.rssi_dbm - c).abs() > PEER_RELOCATION_DB)
+    }
+
+    fn observe(&mut self, frame: &Esp32Frame, now: std::time::Instant) {
+        self.last_seen = now;
+        self.frames += 1;
+        let rssi = f64::from(frame.rssi);
+        self.rssi_dbm = if self.frames == 1 { rssi } else { 0.9 * self.rssi_dbm + 0.1 * rssi };
+        self.n_subcarriers = frame.n_subcarriers;
+        let mean = if frame.amplitudes.is_empty() {
+            0.0
+        } else {
+            frame.amplitudes.iter().sum::<f64>() / frame.amplitudes.len() as f64
+        };
+        if mean > 1e-9 {
+            if self.normalized.len() == PEER_LINK_WINDOW {
+                self.normalized.pop_front();
+            }
+            self.normalized.push_back(frame.amplitudes.iter().map(|a| a / mean).collect());
+        }
+        if self.normalized.len() == PEER_LINK_WINDOW {
+            self.fsm.update(self.motion_score());
+        }
+        self.subspace.push(&frame.amplitudes);
+    }
+
+    /// Mean over tones of the temporal standard deviation of gain-normalised
+    /// amplitude: ~0 for a still path, rising as a body reshapes it. Invariant
+    /// to receiver gain steps (esp-csi gain compensation, done without the
+    /// closed esp_csi_gain_ctrl blob).
+    fn motion_score(&self) -> f64 {
+        let n = self.normalized.len();
+        let Some(tones) = self.normalized.iter().map(Vec::len).min().filter(|&t| t > 0) else {
+            return 0.0;
+        };
+        if n < 2 {
+            return 0.0;
+        }
+        let mut total = 0.0;
+        for k in 0..tones {
+            let mean = self.normalized.iter().map(|f| f[k]).sum::<f64>() / n as f64;
+            let var = self.normalized.iter().map(|f| (f[k] - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+            total += var.sqrt();
+        }
+        total / tones as f64
+    }
+
+    fn to_json(&self, tx: u8, rx: u8, now: std::time::Instant) -> serde_json::Value {
+        let span = self.last_seen.duration_since(self.first_seen).as_secs_f64();
+        serde_json::json!({
+            "tx": tx,
+            "rx": rx,
+            "frames": self.frames,
+            "rate_hz": if span > 0.0 { (self.frames.saturating_sub(1)) as f64 / span } else { 0.0 },
+            "rssi_dbm": self.rssi_dbm,
+            "subcarrier_count": self.n_subcarriers,
+            "motion_score": self.motion_score(),
+            "baseline": self.fsm.baseline(),
+            "excess": self.fsm.excess(),
+            "active": self.fsm.is_active(),
+            "stage": format!("{:?}", self.fsm.stage()).to_lowercase(),
+            "jitter": self.subspace.jitter(),
+            "wander": self.subspace.wander(),
+            "templates": self.subspace.template_count(),
+            "recalibration_recommended": self.recalibration_recommended(),
+            "age_ms": now.duration_since(self.last_seen).as_millis() as u64,
+        })
+    }
+}
+
+/// GET /api/v1/peer-links — node-to-node sensing links (tx -> rx).
+async fn peer_links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let mut keys: Vec<_> = s.peer_links.keys().copied().collect();
+    keys.sort_unstable();
+    let links: Vec<_> = keys.iter().map(|&(tx, rx)| s.peer_links[&(tx, rx)].to_json(tx, rx, now)).collect();
+    Json(serde_json::json!({ "links": links, "room": peer_room_summary(&s.peer_links, now) }))
+}
+
+/// One link's persisted empty-room calibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedLink {
+    tx: u8,
+    rx: u8,
+    baseline: Option<f64>,
+    templates: Vec<Vec<f64>>,
+    rssi_dbm: f64,
+}
+
+fn load_peer_calibration(data_dir: &std::path::Path) -> HashMap<(u8, u8), CalibratedLink> {
+    let path = data_dir.join(PEER_CALIBRATION_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<Vec<CalibratedLink>>(&text) {
+        Ok(links) => {
+            info!("loaded empty-room calibration for {} peer links", links.len());
+            links.into_iter().map(|c| ((c.tx, c.rx), c)).collect()
+        }
+        Err(e) => {
+            warn!("ignoring unreadable {PEER_CALIBRATION_FILE}: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Write atomically (temp file + rename) so a crash never leaves half a file.
+fn save_peer_calibration(data_dir: &std::path::Path, links: &[CalibratedLink]) -> std::io::Result<()> {
+    let path = data_dir.join(PEER_CALIBRATION_FILE);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(links)?)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// POST /api/v1/peer-links/calibrate/start — the room is empty: clear
+/// templates and re-learn every link's baseline from now.
+async fn peer_links_calibrate_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    for l in s.peer_links.values_mut() {
+        l.fsm = presence_fsm::PresenceFsm::default();
+        l.subspace.set_learning(true);
+    }
+    info!("peer-link empty-room calibration started ({} links)", s.peer_links.len());
+    Json(serde_json::json!({ "learning": true, "links": s.peer_links.len() }))
+}
+
+/// POST /api/v1/peer-links/calibrate/stop — freeze the learned templates.
+async fn peer_links_calibrate_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    let mut templates = 0;
+    let mut saved = Vec::new();
+    for (&(tx, rx), l) in s.peer_links.iter_mut() {
+        l.subspace.set_learning(false);
+        l.calibration_rssi = Some(l.rssi_dbm);
+        templates += l.subspace.template_count();
+        saved.push(CalibratedLink {
+            tx,
+            rx,
+            baseline: l.fsm.baseline(),
+            templates: l.subspace.templates(),
+            rssi_dbm: l.rssi_dbm,
+        });
+    }
+    let persisted = save_peer_calibration(&s.data_dir, &saved);
+    if let Err(e) = &persisted {
+        warn!("failed to persist peer-link calibration: {e}");
+    }
+    s.peer_calibration = saved.into_iter().map(|c| ((c.tx, c.rx), c)).collect();
+    info!("peer-link empty-room calibration stopped ({templates} templates)");
+    Json(serde_json::json!({ "learning": false, "templates": templates, "persisted": persisted.is_ok() }))
+}
+
+/// Map weights are in units of "sigmas over the link's own noise" / this
+/// scale, so 1.0 = a 3-sigma event on one link.
+const MAP_SIGMA_SCALE: f64 = 3.0;
+/// Minimum strongest-link weight before the map reports a peak (a 3-sigma
+/// event on at least one link).
+const MAP_MIN_LINK_WEIGHT: f64 = 1.0;
+/// Wander floor used when a link has fewer than 2 empty-room templates.
+const MAP_DEFAULT_WANDER_FLOOR: f64 = 0.05;
+
+/// Per-link map weight, normalised by that link's own empty-room variability
+/// so noisy links (or links sharing a busy node) do not dominate:
+/// motion z-score from the detector's noise envelope, plus wander beyond the
+/// link's natural template spread in units of that spread.
+fn link_map_weight(l: &PeerLinkState) -> f64 {
+    let motion = l.fsm.z_score().unwrap_or(0.0).max(0.0);
+    let wander = l.subspace.wander().map_or(0.0, |w| {
+        let floor = l.subspace.wander_floor().unwrap_or(MAP_DEFAULT_WANDER_FLOOR).max(0.02);
+        ((w - floor) / floor).max(0.0)
+    });
+    (motion + wander) / MAP_SIGMA_SCALE
+}
+
+/// GET /api/v1/peer-links/map — RTI activity image over the room from the
+/// fresh peer links and the configured `--node-positions`.
+async fn peer_links_map(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let pos = |id: u8| s.node_positions_config.get(&id).map(|p| [f64::from(p[0]), f64::from(p[1])]);
+    let nodes: Vec<[f64; 2]> = {
+        let mut ids: Vec<_> = s.node_positions_config.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().filter_map(pos).collect()
+    };
+    let mut used = Vec::new();
+    let mut links = Vec::new();
+    for (&(tx, rx), l) in &s.peer_links {
+        if now.duration_since(l.last_seen).as_millis() > PEER_LINK_FRESH_MS {
+            continue;
+        }
+        let (Some(a), Some(b)) = (pos(tx), pos(rx)) else { continue };
+        let w = link_map_weight(l);
+        used.push(serde_json::json!({ "tx": tx, "rx": rx, "weight": w }));
+        links.push((a, b, w));
+    }
+    // The image is normalised, so it always has a maximum; only call it a
+    // location when some link is actually perturbed.
+    let strongest = links.iter().map(|l| l.2).fold(0.0, f64::max);
+    match link_map::build(&nodes, &links) {
+        Some(m) => Json(serde_json::json!({
+            "origin": m.origin, "cell_m": m.cell_m, "width": m.width, "height": m.height,
+            "cells": m.cells,
+            "peak": if strongest >= MAP_MIN_LINK_WEIGHT { m.peak } else { None },
+            "strongest_link_weight": strongest,
+            "links": used,
+            "node_positions": s.node_positions_config.iter().map(|(id, p)| (id.to_string(), p.to_vec())).collect::<std::collections::BTreeMap<_, _>>(),
+        })),
+        None => Json(serde_json::json!({ "error": "need --node-positions for at least 2 nodes" })),
+    }
+}
+
+/// Reconcile the raw per-node room inference with the explicitly calibrated
+/// peer-link mesh. The peer mesh may only veto a *low-confidence* raw presence
+/// when it has enough fresh stable motion links and enough fresh channel-shape
+/// templates to independently support "nothing changed from empty room".
+fn peer_guard_room_inference(
+    raw: &RoomInference,
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> RoomInference {
+    if matches!(raw.classification.as_str(), "absent" | "unavailable")
+        || raw.confidence >= PEER_ABSENCE_MAX_RAW_CONFIDENCE
+    {
+        return raw.clone();
+    }
+
+    let fresh: Vec<&PeerLinkState> = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .collect();
+
+    let stable: Vec<&PeerLinkState> = fresh
+        .iter()
+        .copied()
+        .filter(|l| l.fsm.stage() == presence_fsm::Stage::Stable)
+        .collect();
+    if stable.len() < PEER_ABSENCE_MIN_STABLE_LINKS {
+        return raw.clone();
+    }
+
+    let perturbed_fraction =
+        stable.iter().filter(|l| l.fsm.is_active()).count() as f64 / stable.len() as f64;
+
+    let wanders: Vec<f64> = fresh.iter().filter_map(|l| l.subspace.wander()).collect();
+    if wanders.len() < PEER_ABSENCE_MIN_STABLE_LINKS {
+        return raw.clone();
+    }
+    let wandering_fraction =
+        wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count() as f64
+            / wanders.len() as f64;
+
+    if perturbed_fraction >= PEER_PRESENCE_FRACTION
+        || wandering_fraction >= PEER_PRESENCE_FRACTION
+    {
+        return raw.clone();
+    }
+
+    RoomInference {
+        classification: "absent".to_string(),
+        confidence: (1.0 - perturbed_fraction.max(wandering_fraction)).clamp(0.0, 1.0),
+        contributing_nodes: raw.contributing_nodes,
+    }
+}
+
+/// Fuse fresh links into a room-level presence vote.
+fn peer_room_summary(
+    links: &HashMap<(u8, u8), PeerLinkState>,
+    now: std::time::Instant,
+) -> serde_json::Value {
+    let fresh: Vec<&PeerLinkState> = links
+        .values()
+        .filter(|l| now.duration_since(l.last_seen).as_millis() <= PEER_LINK_FRESH_MS)
+        .collect();
+    let scored: Vec<bool> = fresh
+        .iter()
+        .filter(|l| l.fsm.stage() == presence_fsm::Stage::Stable)
+        .map(|l| l.fsm.is_active())
+        .collect();
+    let perturbed = scored.iter().filter(|&&a| a).count();
+    let fraction = if scored.is_empty() { 0.0 } else { perturbed as f64 / scored.len() as f64 };
+    let wanders: Vec<f64> = fresh.iter().filter_map(|l| l.subspace.wander()).collect();
+    let wandering = wanders.iter().filter(|&&w| w >= PEER_WANDER_THRESHOLD).count();
+    let still_presence = !wanders.is_empty()
+        && wandering as f64 / wanders.len() as f64 >= PEER_PRESENCE_FRACTION;
+    serde_json::json!({
+        "templated_links": wanders.len(),
+        "wandering_links": wandering,
+        "still_presence": still_presence,
+        "fresh_links": fresh.len(),
+        "calibrated_links": scored.len(),
+        "perturbed_links": perturbed,
+        "perturbed_fraction": fraction,
+        "presence": !scored.is_empty() && fraction >= PEER_PRESENCE_FRACTION,
+    })
+}
+
+/// Parse `--privacy-profile`. `raw-research` is refused: its class is
+/// local-only and would block every networked output.
+fn parse_privacy_profile(v: &str) -> Result<wifi_densepose_bfld::PrivacyMode, String> {
+    use wifi_densepose_bfld::PrivacyMode as M;
+    match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "private-home" => Ok(M::PrivateHome),
+        "care-with-consent" => Ok(M::CareWithConsent),
+        "enterprise-anonymous" => Ok(M::EnterpriseAnonymous),
+        "strict-no-identity" => Ok(M::StrictNoIdentity),
+        other => Err(format!(
+            "unknown privacy profile '{other}' (private-home, care-with-consent, enterprise-anonymous, strict-no-identity)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod privacy_profile_tests {
+    use super::parse_privacy_profile;
+    use wifi_densepose_bfld::PrivacyMode;
+
+    #[test]
+    fn parses_profiles_and_refuses_raw() {
+        assert_eq!(parse_privacy_profile("care_with_consent").unwrap(), PrivacyMode::CareWithConsent);
+        assert_eq!(parse_privacy_profile("private-home").unwrap(), PrivacyMode::PrivateHome);
+        assert!(parse_privacy_profile("raw-research").is_err());
+    }
+}
+
+/// Valid LLTF tones in a 20 MHz legacy training field (-26..-1, 1..26).
+const LLTF_TONES: usize = 52;
+
+/// LLTF byte ranges inside the first 128 CSI bytes of an ESP32/S2/S3/C3 frame,
+/// for the two layouts the driver emits. Ported from esp-radar
+/// `csi_sub_carrier_table.c` (SPDX-FileCopyrightText: 2025 Espressif Systems
+/// (Shanghai) CO LTD, Apache-2.0; modified: table reduced to LLTF ranges).
+/// - no secondary channel (HT20): tones stored 0..31, -32..-1
+/// - secondary channel above/below (HT40): tones stored contiguously
+const LLTF_LAYOUT_NO_SECONDARY: [(usize, usize); 2] = [(76, 128), (2, 54)];
+const LLTF_LAYOUT_SECONDARY: [(usize, usize); 2] = [(12, 64), (66, 118)];
+
+/// Extract the 52 LLTF tones as (I, Q) pairs ordered -26..-1, 1..26.
+/// The frame header does not say which layout was used, so pick the one whose
+/// own guard bins are quietest. Returns `None` for frames shorter than 128 bytes.
+fn lltf_iq_pairs(iq: &[u8]) -> Option<Vec<(i8, i8)>> {
+    if iq.len() < 128 {
+        return None;
+    }
+    let energy = |r: std::ops::Range<usize>| -> u32 {
+        iq[r].iter().map(|&b| (b as i8).unsigned_abs() as u32).sum()
+    };
+    // Bytes that are guard/DC under one layout but data under the other.
+    let guards_if_no_secondary = energy(54..76) + energy(0..2);
+    let guards_if_secondary = energy(0..12) + energy(118..128) + energy(64..66);
+    let layout = if guards_if_secondary < guards_if_no_secondary {
+        LLTF_LAYOUT_SECONDARY
+    } else {
+        LLTF_LAYOUT_NO_SECONDARY
+    };
+    let pairs: Vec<(i8, i8)> = layout
+        .iter()
+        .flat_map(|&(a, b)| iq[a..b].chunks_exact(2).map(|c| (c[0] as i8, c[1] as i8)))
+        .collect();
+    debug_assert_eq!(pairs.len(), LLTF_TONES);
+    Some(pairs)
+}
+
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     if buf.len() < 20 {
         return None;
@@ -3779,12 +4258,29 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         return None;
     }
 
-    let mut amplitudes = Vec::with_capacity(n_pairs);
-    let mut phases = Vec::with_capacity(n_pairs);
-
-    for k in 0..n_pairs {
-        let i_val = buf[iq_start + k * 2] as i8 as f64;
-        let q_val = buf[iq_start + k * 2 + 1] as i8 as f64;
+    let iq = &buf[iq_start..expected_len];
+    let peer_tx = (buf[19] & ESP32_FLAG_PEER_TX != 0 && buf.len() > expected_len)
+        .then(|| buf[expected_len]);
+    // HT/legacy single-antenna frames carry the 52-tone LLTF in their first
+    // 128 bytes regardless of HT20/HT40/STBC. Using only those tones gives
+    // every node the same grid and drops guard/DC bins (Phase 1 / esp-radar).
+    // 256 bins is an HE20 grid even when old C6 firmware labels it HtLegacy.
+    let lltf = (ppdu_type == wifi_densepose_hardware::PpduType::HtLegacy
+        && n_antennas == 1
+        && n_subcarriers < 256)
+        .then(|| lltf_iq_pairs(iq))
+        .flatten();
+    let (pairs, n_subcarriers): (Vec<(i8, i8)>, u16) = match lltf {
+        Some(p) => (p, LLTF_TONES as u16),
+        None => (
+            iq.chunks_exact(2).map(|c| (c[0] as i8, c[1] as i8)).collect(),
+            n_subcarriers,
+        ),
+    };
+    let mut amplitudes = Vec::with_capacity(pairs.len());
+    let mut phases = Vec::with_capacity(pairs.len());
+    for (i, q) in pairs {
+        let (i_val, q_val) = (i as f64, q as f64);
         amplitudes.push((i_val * i_val + q_val * q_val).sqrt());
         phases.push(q_val.atan2(i_val));
     }
@@ -3800,9 +4296,273 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         noise_floor,
         ppdu_type,
         adr018_flags,
+        peer_tx,
         amplitudes,
         phases,
     })
+}
+
+#[cfg(test)]
+mod peer_link_fusion_tests {
+    use super::*;
+
+    fn link(active: bool) -> PeerLinkState {
+        let now = std::time::Instant::now();
+        let mut l = PeerLinkState::new(now);
+        for i in 0..presence_fsm::INIT_SAMPLES + 20 {
+            l.fsm.update(0.10 + f64::from(i % 3) * 0.005);
+        }
+        if active {
+            for _ in 0..10 {
+                l.fsm.update(0.30);
+            }
+        }
+        l
+    }
+
+    #[test]
+    fn room_presence_needs_enough_active_links() {
+        let now = std::time::Instant::now();
+        let mut links = HashMap::new();
+        for k in 0..4u8 {
+            links.insert((k, k + 1), link(k == 0));
+        }
+        let r = peer_room_summary(&links, now);
+        assert_eq!((r["calibrated_links"].as_u64(), r["perturbed_links"].as_u64()), (Some(4), Some(1)));
+        assert_eq!(r["presence"], true, "1 of 4 = 25% meets the threshold");
+        links.insert((0, 1), link(false));
+        assert_eq!(peer_room_summary(&links, now)["presence"], false);
+    }
+
+    #[test]
+    fn uncalibrated_links_do_not_vote() {
+        let now = std::time::Instant::now();
+        let mut links = HashMap::new();
+        links.insert((1, 2), PeerLinkState::new(now));
+        let r = peer_room_summary(&links, now);
+        assert_eq!(r["calibrated_links"], 0);
+        assert_eq!(r["presence"], false);
+    }
+
+    fn empty_room_link() -> PeerLinkState {
+        let mut l = link(false);
+        l.subspace.set_learning(true);
+        for i in 0..(link_subspace::WINDOW + 8) {
+            let gain = ((i as f64) * 0.37).sin();
+            let amps: Vec<f64> = (0..52)
+                .map(|k| 10.0 + gain * ((k as f64) / 7.0).sin())
+                .collect();
+            l.subspace.push(&amps);
+        }
+        l.subspace.set_learning(false);
+        l
+    }
+
+    fn empty_peer_mesh(n: u8) -> HashMap<(u8, u8), PeerLinkState> {
+        (0..n).map(|k| ((k + 1, k + 2), empty_room_link())).collect()
+    }
+
+    #[test]
+    fn calibrated_empty_peer_mesh_vetoes_low_confidence_raw_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.52,
+            contributing_nodes: 4,
+        };
+        let guarded = peer_guard_room_inference(&raw, &empty_peer_mesh(4), now);
+        assert_eq!(guarded.classification, "absent");
+        assert!(guarded.confidence > 0.5);
+    }
+
+    #[test]
+    fn strong_raw_presence_is_not_vetoed_by_empty_peer_mesh() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.90,
+            contributing_nodes: 4,
+        };
+        assert_eq!(peer_guard_room_inference(&raw, &empty_peer_mesh(4), now), raw);
+    }
+
+    #[test]
+    fn sparse_peer_mesh_cannot_veto_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_still".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        assert_eq!(peer_guard_room_inference(&raw, &empty_peer_mesh(3), now), raw);
+    }
+
+    #[test]
+    fn perturbed_peer_mesh_cannot_veto_presence() {
+        let now = std::time::Instant::now();
+        let raw = RoomInference {
+            classification: "present_moving".to_string(),
+            confidence: 0.50,
+            contributing_nodes: 4,
+        };
+        let mut links = empty_peer_mesh(4);
+        let mut active = empty_room_link();
+        for _ in 0..10 {
+            active.fsm.update(0.30);
+        }
+        links.insert((1, 2), active);
+        assert_eq!(peer_guard_room_inference(&raw, &links, now), raw);
+    }
+}
+
+#[cfg(test)]
+mod peer_calibration_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_round_trips_and_restores_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = vec![CalibratedLink {
+            tx: 1,
+            rx: 2,
+            baseline: Some(0.12),
+            templates: vec![vec![0.1; link_subspace::COLUMNS]],
+            rssi_dbm: -45.0,
+        }];
+        save_peer_calibration(dir.path(), &saved).unwrap();
+        let loaded = load_peer_calibration(dir.path());
+        let c = loaded.get(&(1, 2)).expect("persisted link must load");
+
+        let l = PeerLinkState::restored(std::time::Instant::now(), Some(c));
+        assert_eq!(l.fsm.stage(), presence_fsm::Stage::Stable, "restored link needs no re-learning");
+        assert_eq!(l.fsm.baseline(), Some(0.12));
+        assert_eq!(l.subspace.template_count(), 1);
+    }
+
+    #[test]
+    fn missing_or_corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_peer_calibration(dir.path()).is_empty());
+        std::fs::write(dir.path().join(PEER_CALIBRATION_FILE), b"{not json").unwrap();
+        assert!(load_peer_calibration(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn moved_node_flags_recalibration() {
+        let c = CalibratedLink { tx: 1, rx: 2, baseline: Some(0.1), templates: vec![], rssi_dbm: -45.0 };
+        let mut l = PeerLinkState::restored(std::time::Instant::now(), Some(&c));
+        l.frames = 10;
+        l.rssi_dbm = -47.0;
+        assert!(!l.recalibration_recommended(), "small RSSI change is normal");
+        l.rssi_dbm = -60.0;
+        assert!(l.recalibration_recommended(), "15 dB shift means the node moved");
+    }
+}
+
+#[cfg(test)]
+mod peer_link_gain_tests {
+    use super::*;
+
+    fn frame_with(amps: Vec<f64>) -> Esp32Frame {
+        let mut f = parse_esp32_frame(&{
+            let mut b = vec![0u8; 20 + 128];
+            b[0..4].copy_from_slice(&0xC511_0001u32.to_le_bytes());
+            b[5] = 1;
+            b[6..8].copy_from_slice(&64u16.to_le_bytes());
+            b
+        })
+        .unwrap();
+        f.amplitudes = amps;
+        f
+    }
+
+    fn score(gain: impl Fn(usize) -> f64, shape: impl Fn(usize, usize) -> f64) -> f64 {
+        let now = std::time::Instant::now();
+        let mut l = PeerLinkState::new(now);
+        for t in 0..PEER_LINK_WINDOW {
+            let amps = (0..52).map(|k| gain(t) * shape(t, k)).collect();
+            l.observe(&frame_with(amps), now);
+        }
+        l.motion_score()
+    }
+
+    #[test]
+    fn gain_steps_do_not_look_like_motion_but_reshaping_does() {
+        let still = |_t: usize, k: usize| 10.0 + (k as f64 / 5.0).sin();
+        let quiet = score(|_| 1.0, still);
+        let agc_steps = score(|t| if t % 10 < 5 { 1.0 } else { 1.6 }, still);
+        let body = score(|_| 1.0, |t: usize, k: usize| 10.0 + ((k as f64 + t as f64) / 5.0).sin());
+        assert!(agc_steps < quiet + 1e-9, "AGC steps must cancel ({agc_steps} vs {quiet})");
+        assert!(body > 0.02, "multipath reshaping must register ({body})");
+    }
+}
+
+#[cfg(test)]
+mod peer_tx_parse_tests {
+    use super::{parse_esp32_frame, ESP32_FLAG_PEER_TX};
+
+    fn frame(flags: u8, trailer: Option<u8>) -> Vec<u8> {
+        let mut b = vec![0u8; 20 + 128];
+        b[0..4].copy_from_slice(&0xC511_0001u32.to_le_bytes());
+        b[4] = 3; // rx node
+        b[5] = 1;
+        b[6..8].copy_from_slice(&64u16.to_le_bytes());
+        b[19] = flags;
+        for (k, v) in b[20..].iter_mut().enumerate() {
+            *v = (k % 50 + 1) as u8;
+        }
+        b.extend(trailer);
+        b
+    }
+
+    #[test]
+    fn flagged_frame_with_trailer_carries_tx_node() {
+        let f = parse_esp32_frame(&frame(ESP32_FLAG_PEER_TX, Some(2))).unwrap();
+        assert_eq!((f.peer_tx, f.node_id), (Some(2), 3));
+    }
+
+    #[test]
+    fn unflagged_or_truncated_frames_are_ap_frames() {
+        assert_eq!(parse_esp32_frame(&frame(0, Some(2))).unwrap().peer_tx, None);
+        assert_eq!(parse_esp32_frame(&frame(ESP32_FLAG_PEER_TX, None)).unwrap().peer_tx, None);
+    }
+}
+
+#[cfg(test)]
+mod lltf_extraction_tests {
+    use super::{lltf_iq_pairs, LLTF_TONES};
+
+    /// Fill `ranges` with distinct non-zero I/Q, everything else zero.
+    fn frame(len: usize, ranges: [(usize, usize); 2]) -> Vec<u8> {
+        let mut iq = vec![0u8; len];
+        for (a, b) in ranges {
+            for (k, byte) in iq[a..b].iter_mut().enumerate() {
+                *byte = (k % 60 + 10) as u8;
+            }
+        }
+        iq
+    }
+
+    #[test]
+    fn ht20_layout_yields_52_tones_from_both_halves() {
+        let iq = frame(256, super::LLTF_LAYOUT_NO_SECONDARY);
+        let p = lltf_iq_pairs(&iq).unwrap();
+        assert_eq!(p.len(), LLTF_TONES);
+        assert!(p.iter().all(|&(i, q)| i != 0 || q != 0), "no guard/DC zeros leak in");
+    }
+
+    #[test]
+    fn ht40_layout_is_detected_and_yields_52_tones() {
+        let iq = frame(384, super::LLTF_LAYOUT_SECONDARY);
+        let p = lltf_iq_pairs(&iq).unwrap();
+        assert_eq!(p.len(), LLTF_TONES);
+        assert!(p.iter().all(|&(i, q)| i != 0 || q != 0));
+    }
+
+    #[test]
+    fn short_frames_are_left_alone() {
+        assert!(lltf_iq_pairs(&[1u8; 112]).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3860,8 +4620,9 @@ mod issue_1009_n_subcarriers_u16_tests {
         // Regression guard for the common single-byte (≤255) case.
         let buf = build_csi_frame(64);
         let frame = parse_esp32_frame(&buf).expect("64-bin HT20 frame must parse");
-        assert_eq!(frame.n_subcarriers, 64);
-        assert_eq!(frame.amplitudes.len(), 64);
+        // Phase 1: HT/legacy frames are reduced to the 52 LLTF tones.
+        assert_eq!(frame.n_subcarriers, super::LLTF_TONES as u16);
+        assert_eq!(frame.amplitudes.len(), super::LLTF_TONES);
     }
 }
 
@@ -3918,8 +4679,9 @@ mod esp32_frame_structure_tests {
     fn well_formed_frame_still_parses() {
         let parsed = parse_esp32_frame(&frame(64)).expect("HT20 frame parses");
         assert_eq!(parsed.n_antennas, 1);
-        assert_eq!(parsed.n_subcarriers, 64);
-        assert_eq!(parsed.amplitudes.len(), 64);
+        // Phase 1: HT/legacy frames are reduced to the 52 LLTF tones.
+        assert_eq!(parsed.n_subcarriers, super::LLTF_TONES as u16);
+        assert_eq!(parsed.amplitudes.len(), super::LLTF_TONES);
     }
 }
 
@@ -5000,6 +5762,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
             noise_floor: -90,
             ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
             adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+            peer_tx: None,
             amplitudes: multi_ap_frame.amplitudes.clone(),
             phases: multi_ap_frame.phases.clone(),
         };
@@ -5194,6 +5957,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         noise_floor: -90,
         ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
         adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+        peer_tx: None,
         amplitudes: vec![signal_pct],
         phases: vec![0.0],
     };
@@ -5798,6 +6562,7 @@ fn generate_simulated_frame(tick: u64) -> Esp32Frame {
         noise_floor: -90,
         ppdu_type: wifi_densepose_hardware::PpduType::HtLegacy,
         adr018_flags: wifi_densepose_hardware::Adr018Flags::default(),
+        peer_tx: None,
         amplitudes,
         phases,
     }
@@ -12604,6 +13369,7 @@ async fn udp_receiver_task(
                             now,
                         );
                     }
+                    let suppress_raw = s.engine_bridge.suppress_raw_outputs();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -12616,8 +13382,10 @@ async fn udp_receiver_task(
                                 .get(&id)
                                 .copied()
                                 .unwrap_or(DEFAULT_NODE_POSITION),
-                            amplitude: vec![],
-                            subcarrier_count: 0,
+                            // Vitals packets interleave with CSI frames; report the
+                            // node's last CSI frame so `latest` does not flap to empty.
+                            amplitude: node_raw_amplitude(n, suppress_raw),
+                            subcarrier_count: node_subcarrier_count(n),
                             // Vitals-only path; still expose the sync snapshot
                             // if the node also speaks ESP-NOW.
                             sync: n.sync_snapshot(),
@@ -12630,10 +13398,12 @@ async fn udp_receiver_task(
                     // ADR-297 — explicit, deterministic room aggregate over the
                     // per-node inferences (freshness-weighted vote). Not the
                     // latest-writer classification (issue #1555).
-                    let room_inference = fuse_room(
+                    let raw_room_inference = fuse_room(
                         active_nodes.iter().filter_map(|ni| ni.node_inference.as_ref()),
                         NODE_STALE_AFTER_MS,
                     );
+                    let room_inference =
+                        peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
 
                     let features = FeatureInfo {
                         mean_rssi: mean_rssi_dbm,
@@ -12881,6 +13651,17 @@ async fn udp_receiver_task(
                     s.source = "esp32".to_string();
                     let observed_at = std::time::Instant::now();
                     s.last_esp32_frame = Some(observed_at);
+                    // Peer links have their own geometry; keep them out of the
+                    // receiving node's AP-path statistics.
+                    if let Some(tx) = frame.peer_tx {
+                        let key = (tx, frame.node_id);
+                        let saved = s.peer_calibration.get(&key).cloned();
+                        s.peer_links
+                            .entry(key)
+                            .or_insert_with(|| PeerLinkState::restored(observed_at, saved.as_ref()))
+                            .observe(&frame, observed_at);
+                        continue;
+                    }
                     let grid_key = CsiGridKey::from_frame(&frame);
                     s.node_states
                         .entry(frame.node_id)
@@ -13145,24 +13926,8 @@ async fn udp_receiver_task(
                                 .get(&id)
                                 .copied()
                                 .unwrap_or(DEFAULT_NODE_POSITION),
-                            amplitude: if suppress_raw {
-                                vec![]
-                            } else {
-                                n.frame_history
-                                    .back()
-                                    .map(|a| {
-                                        a.iter()
-                                            .take(adaptive_classifier::RECORDED_AMPLITUDE_LEN)
-                                            .cloned()
-                                            .collect()
-                                    })
-                                    .unwrap_or_default()
-                            },
-                            subcarrier_count: if suppress_raw {
-                                0
-                            } else {
-                                n.frame_history.back().map_or(0, |a| a.len())
-                            },
+                            amplitude: node_raw_amplitude(n, suppress_raw),
+                            subcarrier_count: node_subcarrier_count(n),
                             // ADR-110 iter 23 / iter 30 — single source of truth.
                             sync: n.sync_snapshot(),
                             // ADR-297 — each node carries its own inference.
@@ -13173,10 +13938,12 @@ async fn udp_receiver_task(
 
                     // ADR-297 — explicit deterministic room aggregate over the
                     // per-node inferences (not last-writer; issue #1555).
-                    let room_inference = fuse_room(
+                    let raw_room_inference = fuse_room(
                         active_nodes.iter().filter_map(|ni| ni.node_inference.as_ref()),
                         NODE_STALE_AFTER_MS,
                     );
+                    let room_inference =
+                        peer_guard_room_inference(&raw_room_inference, &s.peer_links, now);
                     let room_classification = if bootstrap_empty {
                         ClassificationInfo {
                             motion_level: "absent".to_string(),
@@ -14794,6 +15561,8 @@ async fn main() {
                 );
             }),
         node_states: HashMap::new(),
+        peer_links: HashMap::new(),
+        peer_calibration: load_peer_calibration(&args.data_dir),
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
         room_debounce_since: None,
@@ -14858,7 +15627,7 @@ async fn main() {
         node_positions_config,
         default_position_noted: std::collections::HashSet::new(),
         engine_bridge: engine_bridge::EngineBridge::new(
-            wifi_densepose_bfld::PrivacyMode::PrivateHome,
+            args.privacy_profile,
             1,
             "default",
             "Default Room",
@@ -15185,6 +15954,10 @@ async fn main() {
         .route("/api/v1/rf/vendors/:vendor/events", post(ingest_vendor_events))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
+        .route("/api/v1/peer-links", get(peer_links_endpoint))
+        .route("/api/v1/peer-links/map", get(peer_links_map))
+        .route("/api/v1/peer-links/calibrate/start", post(peer_links_calibrate_start))
+        .route("/api/v1/peer-links/calibrate/stop", post(peer_links_calibrate_stop))
         // ADR-110 iter 29 — per-node mesh sync state for HTTP clients.
         .route("/api/v1/nodes/:id/sync", get(node_sync_endpoint))
         .route("/api/v1/mesh", get(mesh_endpoint))

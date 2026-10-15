@@ -4343,3 +4343,48 @@ a:focus-visible,
     grid-column: auto;
   }
 }
+
+/* Node-to-node link matrix */
+.ls-links {
+  margin-top: var(--space-16);
+}
+
+.ls-link-matrix {
+  border-collapse: separate;
+  border-spacing: var(--space-4);
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+  margin-top: var(--space-8);
+}
+
+.ls-link-matrix th {
+  color: var(--color-text-secondary);
+  font-weight: var(--font-weight-medium);
+  padding: var(--space-4) var(--space-8);
+}
+
+.ls-link-matrix td {
+  min-width: 56px;
+  padding: var(--space-8);
+  text-align: center;
+  border-radius: var(--radius-base);
+  border: 1px solid var(--color-card-border);
+}
+
+.ls-cell-quiet {
+  background: rgba(var(--color-success-rgb), calc(0.06 + var(--level, 0) * 0.3));
+}
+
+.ls-cell-active {
+  background: rgba(var(--color-warning-rgb), calc(0.25 + var(--level, 0) * 0.5));
+  font-weight: var(--font-weight-bold);
+}
+
+.ls-cell-learning {
+  color: var(--color-text-secondary);
+  font-style: italic;
+}
+
+.ls-cell-none {
+  border-style: dashed !important;
+}
